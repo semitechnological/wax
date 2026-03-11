@@ -2,6 +2,7 @@ use crate::api::ApiClient;
 use crate::cache::Cache;
 use crate::cask::CaskState;
 use crate::commands::{install, uninstall};
+use crate::deps::find_installed_reverse_dependencies;
 use crate::error::{Result, WaxError};
 use crate::install::{InstallMode, InstallState};
 use crate::signal::{check_cancelled, CriticalSection};
@@ -9,6 +10,7 @@ use crate::ui::{create_spinner, PROGRESS_BAR_CHARS};
 use crate::version::is_same_or_newer;
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashSet;
 use tracing::instrument;
 
 #[derive(Debug)]
@@ -146,6 +148,17 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                     style(&pkg.latest_version).green()
                 );
                 success_count += 1;
+
+                if !pkg.is_cask {
+                    if let Err(e) = reinstall_dependents(cache, &pkg.name).await {
+                        eprintln!(
+                            "{} failed to reinstall dependents of {}: {}",
+                            style("!").yellow(),
+                            style(&pkg.name).magenta(),
+                            e
+                        );
+                    }
+                }
             }
             Err(e) => {
                 fail_count += 1;
@@ -303,6 +316,83 @@ async fn upgrade_formula_internal(
         global_flag,
     )
     .await?;
+
+    reinstall_dependents(cache, formula_name).await?;
+
+    Ok(())
+}
+
+async fn reinstall_dependents(cache: &Cache, upgraded_package: &str) -> Result<()> {
+    let formulae = cache.load_all_formulae().await?;
+    let state = InstallState::new()?;
+    let installed_packages = state.load().await?;
+    let installed_names: HashSet<String> = installed_packages.keys().cloned().collect();
+
+    let reverse_deps =
+        find_installed_reverse_dependencies(upgraded_package, &formulae, &installed_names);
+
+    if reverse_deps.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "  {} reinstalling {} dependent{}: {}",
+        style("→").cyan(),
+        reverse_deps.len(),
+        if reverse_deps.len() == 1 { "" } else { "s" },
+        reverse_deps
+            .iter()
+            .map(|s| style(s).magenta().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    for dep_name in &reverse_deps {
+        let dep_mode = installed_packages
+            .get(dep_name)
+            .map(|p| p.install_mode);
+
+        let spinner = create_spinner(&format!("reinstalling {}", dep_name));
+
+        let (user_flag, global_flag) = match dep_mode {
+            Some(InstallMode::User) => (true, false),
+            Some(InstallMode::Global) => (false, true),
+            _ => (false, false),
+        };
+
+        let result = async {
+            uninstall::uninstall_quiet(cache, dep_name, false).await?;
+            install::install_quiet(
+                cache,
+                &[dep_name.clone()],
+                false,
+                user_flag,
+                global_flag,
+            )
+            .await
+        }
+        .await;
+
+        spinner.finish_and_clear();
+
+        match result {
+            Ok(()) => {
+                println!(
+                    "  {} {} reinstalled",
+                    style("✓").green(),
+                    style(dep_name).magenta()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} {} reinstall failed: {}",
+                    style("✗").red(),
+                    style(dep_name).magenta(),
+                    e
+                );
+            }
+        }
+    }
 
     Ok(())
 }
