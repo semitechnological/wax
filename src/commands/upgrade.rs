@@ -1,4 +1,5 @@
 use crate::api::ApiClient;
+use crate::bottle::detect_platform;
 use crate::cache::Cache;
 use crate::cask::CaskState;
 use crate::commands::{install, uninstall};
@@ -222,10 +223,10 @@ async fn upgrade_single(cache: &Cache, formula_name: &str, dry_run: bool) -> Res
         .find(|f| f.name == formula_name || f.full_name == formula_name)
         .ok_or_else(|| WaxError::FormulaNotFound(formula_name.to_string()))?;
 
-    let latest_version = &formula.versions.stable;
+    let latest_version = formula.full_version();
     let installed_version = &installed.version;
 
-    if is_same_or_newer(installed_version, latest_version) {
+    if is_same_or_newer(installed_version, &latest_version) {
         println!(
             "{}@{} is already up to date",
             style(formula_name).magenta(),
@@ -239,7 +240,7 @@ async fn upgrade_single(cache: &Cache, formula_name: &str, dry_run: bool) -> Res
             "{}: {} → {}",
             style(formula_name).magenta(),
             style(installed_version).dim(),
-            style(latest_version).magenta()
+            style(&latest_version).magenta()
         );
         println!("\ndry run - no changes made");
         return Ok(());
@@ -348,9 +349,7 @@ async fn reinstall_dependents(cache: &Cache, upgraded_package: &str) -> Result<(
     );
 
     for dep_name in &reverse_deps {
-        let dep_mode = installed_packages
-            .get(dep_name)
-            .map(|p| p.install_mode);
+        let dep_mode = installed_packages.get(dep_name).map(|p| p.install_mode);
 
         let spinner = create_spinner(&format!("reinstalling {}", dep_name));
 
@@ -362,14 +361,7 @@ async fn reinstall_dependents(cache: &Cache, upgraded_package: &str) -> Result<(
 
         let result = async {
             uninstall::uninstall_quiet(cache, dep_name, false).await?;
-            install::install_quiet(
-                cache,
-                &[dep_name.clone()],
-                false,
-                user_flag,
-                global_flag,
-            )
-            .await
+            install::install_quiet(cache, &[dep_name.clone()], false, user_flag, global_flag).await
         }
         .await;
 
@@ -420,14 +412,36 @@ pub async fn get_outdated_packages(cache: &Cache) -> Result<Vec<OutdatedPackage>
 
     let mut outdated = Vec::new();
 
+    let platform = detect_platform();
     for (name, installed) in &installed_packages {
         if let Some(formula) = formulae.iter().find(|f| &f.name == name) {
-            let latest = &formula.versions.stable;
-            if !is_same_or_newer(&installed.version, latest) {
+            let latest = formula.full_version();
+            let version_outdated = !is_same_or_newer(&installed.version, &latest);
+
+            let rebuild_outdated = !version_outdated
+                && installed.version == latest
+                && installed.bottle_rebuild < formula.bottle_rebuild();
+
+            let sha_outdated = !version_outdated
+                && !rebuild_outdated
+                && installed.bottle_sha256.is_some()
+                && formula
+                    .bottle
+                    .as_ref()
+                    .and_then(|b| b.stable.as_ref())
+                    .and_then(|s| s.files.get(&platform).or_else(|| s.files.get("all")))
+                    .map(|f| Some(&f.sha256) != installed.bottle_sha256.as_ref())
+                    .unwrap_or(false);
+
+            if version_outdated || rebuild_outdated || sha_outdated {
                 outdated.push(OutdatedPackage {
                     name: name.clone(),
                     installed_version: installed.version.clone(),
-                    latest_version: latest.clone(),
+                    latest_version: if rebuild_outdated {
+                        format!("{} (rebuild {})", latest, formula.bottle_rebuild())
+                    } else {
+                        latest
+                    },
                     is_cask: false,
                     install_mode: Some(installed.install_mode),
                 });

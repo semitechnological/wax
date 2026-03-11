@@ -188,6 +188,8 @@ pub async fn sync(cache: &Cache) -> Result<()> {
                 .as_secs() as i64,
             install_mode,
             from_source: false,
+            bottle_rebuild: 0,
+            bottle_sha256: None,
         };
         state.add(package).await?;
 

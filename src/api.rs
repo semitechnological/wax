@@ -12,6 +12,8 @@ pub struct Formula {
     pub desc: Option<String>,
     pub homepage: String,
     pub versions: Versions,
+    #[serde(default)]
+    pub revision: u32,
     pub installed: Option<Vec<InstalledVersion>>,
     pub dependencies: Option<Vec<String>>,
     pub build_dependencies: Option<Vec<String>>,
@@ -25,6 +27,8 @@ pub struct BottleInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BottleStable {
+    #[serde(default)]
+    pub rebuild: u32,
     pub files: std::collections::HashMap<String, BottleFile>,
 }
 
@@ -76,6 +80,24 @@ pub enum CaskArtifact {
     Uninstall { uninstall: Vec<serde_json::Value> },
     Preflight { preflight: Option<String> },
     Other(serde_json::Value),
+}
+
+impl Formula {
+    pub fn full_version(&self) -> String {
+        if self.revision > 0 {
+            format!("{}_{}", self.versions.stable, self.revision)
+        } else {
+            self.versions.stable.clone()
+        }
+    }
+
+    pub fn bottle_rebuild(&self) -> u32 {
+        self.bottle
+            .as_ref()
+            .and_then(|b| b.stable.as_ref())
+            .map(|s| s.rebuild)
+            .unwrap_or(0)
+    }
 }
 
 pub struct ApiClient {

@@ -116,6 +116,8 @@ async fn install_from_source_task(
             .as_secs() as i64,
         install_mode,
         from_source: true,
+        bottle_rebuild: 0,
+        bottle_sha256: None,
     };
     state.add(package).await?;
 
@@ -401,7 +403,7 @@ async fn install_impl(
 
     let semaphore = Arc::new(Semaphore::new(8));
     let mut tasks = Vec::new();
-    let mut inline_extracted: Vec<(String, String, std::path::PathBuf)> = Vec::new();
+    let mut inline_extracted: Vec<(String, String, std::path::PathBuf, String)> = Vec::new();
     let mut source_install_count = 0usize;
 
     let temp_dir = Arc::new(TempDir::new()?);
@@ -460,7 +462,7 @@ async fn install_impl(
             let extract_dir = temp_dir.path().join(&name);
             BottleDownloader::extract(&tarball_path, &extract_dir)?;
 
-            inline_extracted.push((name, version, extract_dir));
+            inline_extracted.push((name, version, extract_dir, sha256));
             continue;
         }
 
@@ -494,7 +496,7 @@ async fn install_impl(
             let extract_dir = temp_dir.path().join(&name);
             BottleDownloader::extract(&tarball_path, &extract_dir)?;
 
-            Ok::<_, WaxError>((name, version, extract_dir))
+            Ok::<_, WaxError>((name, version, extract_dir, sha256))
         });
 
         tasks.push(task);
@@ -502,7 +504,7 @@ async fn install_impl(
 
     let results = futures::future::join_all(tasks).await;
 
-    let mut extracted_packages: Vec<(String, String, std::path::PathBuf)> = Vec::new();
+    let mut extracted_packages: Vec<(String, String, std::path::PathBuf, String)> = Vec::new();
     let mut failed_packages = Vec::new();
 
     for result in results {
@@ -536,17 +538,17 @@ async fn install_impl(
     if !quiet {
         println!();
     }
-    for (name, version, extract_dir) in extracted_packages {
+    for (name, version, extract_dir, bottle_sha) in extracted_packages {
         let _critical = CriticalSection::new();
         let formula_cellar = cellar.join(&name).join(&version);
         if formula_cellar.exists() {
-            tokio::fs::remove_dir_all(&formula_cellar).await.or_else(|_| {
-                crate::sudo::sudo_remove(&formula_cellar).map(|_| ())
-            })?;
+            tokio::fs::remove_dir_all(&formula_cellar)
+                .await
+                .or_else(|_| crate::sudo::sudo_remove(&formula_cellar).map(|_| ()))?;
         }
-        tokio::fs::create_dir_all(&formula_cellar).await.or_else(|_| {
-            crate::sudo::sudo_mkdir(&formula_cellar)
-        })?;
+        tokio::fs::create_dir_all(&formula_cellar)
+            .await
+            .or_else(|_| crate::sudo::sudo_mkdir(&formula_cellar))?;
 
         let actual_content_dir = extract_dir.join(&name).join(&version);
         if actual_content_dir.exists() {
@@ -601,6 +603,8 @@ async fn install_impl(
                 .as_secs() as i64,
             install_mode,
             from_source: false,
+            bottle_rebuild: 0,
+            bottle_sha256: Some(bottle_sha),
         };
         state.add(package).await?;
 
