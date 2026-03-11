@@ -312,14 +312,7 @@ async fn upgrade_cask_internal(cache: &Cache, cask_name: &str) -> Result<()> {
 
     uninstall::uninstall_quiet(cache, cask_name, true).await?;
 
-    install::install_quiet(
-        cache,
-        &[cask_name.to_string()],
-        true,
-        false,
-        false,
-    )
-    .await?;
+    install::install_quiet(cache, &[cask_name.to_string()], true, false, false).await?;
 
     Ok(())
 }

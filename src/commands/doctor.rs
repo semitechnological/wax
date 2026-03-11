@@ -222,7 +222,10 @@ async fn check_cache(cache: &Cache, d: &mut DiagResult) {
             let age_hours = age_secs / 3600;
             if age_hours > 168 {
                 if d.fix {
-                    d.warn(&format!("cache is {} days old — refreshing...", age_hours / 24));
+                    d.warn(&format!(
+                        "cache is {} days old — refreshing...",
+                        age_hours / 24
+                    ));
                     let api_client = ApiClient::new();
                     match super::update::update(&api_client, cache).await {
                         Ok(_) => d.fixed("cache refreshed"),
@@ -263,18 +266,19 @@ async fn check_install_state(d: &mut DiagResult) {
     match InstallState::new() {
         Ok(state) => match state.load().await {
             Ok(packages) => {
-                d.pass(&format!("install state: {} packages tracked", packages.len()));
+                d.pass(&format!(
+                    "install state: {} packages tracked",
+                    packages.len()
+                ));
             }
             Err(e) => {
                 if d.fix {
                     d.warn(&format!("install state corrupt: {}", e));
                     match state.save(&std::collections::HashMap::new()).await {
-                        Ok(_) => {
-                            match state.sync_from_cellar().await {
-                                Ok(_) => d.fixed("install state rebuilt from cellar"),
-                                Err(_) => d.fixed("install state reset to empty"),
-                            }
-                        }
+                        Ok(_) => match state.sync_from_cellar().await {
+                            Ok(_) => d.fixed("install state rebuilt from cellar"),
+                            Err(_) => d.fixed("install state reset to empty"),
+                        },
                         Err(e2) => d.fail(&format!("cannot reset install state: {}", e2)),
                     }
                 } else {
@@ -346,11 +350,7 @@ async fn check_broken_symlinks(d: &mut DiagResult) {
                         }
                     }
                     Err(e) => {
-                        d.fail(&format!(
-                            "cannot remove {}: {}",
-                            rel.display(),
-                            e
-                        ));
+                        d.fail(&format!("cannot remove {}: {}", rel.display(), e));
                     }
                 }
             } else if total_broken <= 5 {

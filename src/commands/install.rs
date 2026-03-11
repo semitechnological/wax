@@ -140,7 +140,18 @@ pub async fn install(
     global: bool,
     build_from_source: bool,
 ) -> Result<()> {
-    install_impl(cache, package_names, dry_run, cask, user, global, build_from_source, false, None).await
+    install_impl(
+        cache,
+        package_names,
+        dry_run,
+        cask,
+        user,
+        global,
+        build_from_source,
+        false,
+        None,
+    )
+    .await
 }
 
 pub async fn install_quiet(
@@ -150,7 +161,18 @@ pub async fn install_quiet(
     user: bool,
     global: bool,
 ) -> Result<()> {
-    install_impl(cache, package_names, false, cask, user, global, false, true, None).await
+    install_impl(
+        cache,
+        package_names,
+        false,
+        cask,
+        user,
+        global,
+        false,
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn install_quiet_with_progress(
@@ -161,7 +183,18 @@ pub async fn install_quiet_with_progress(
     global: bool,
     pb: &ProgressBar,
 ) -> Result<()> {
-    install_impl(cache, package_names, false, cask, user, global, false, true, Some(pb)).await
+    install_impl(
+        cache,
+        package_names,
+        false,
+        cask,
+        user,
+        global,
+        false,
+        true,
+        Some(pb),
+    )
+    .await
 }
 
 async fn install_impl(
@@ -418,7 +451,9 @@ async fn install_impl(
         if let Some(ext_pb) = external_pb {
             let tarball_path = temp_dir.path().join(format!("{}-{}.tar.gz", name, version));
 
-            downloader.download(&url, &tarball_path, Some(ext_pb)).await?;
+            downloader
+                .download(&url, &tarball_path, Some(ext_pb))
+                .await?;
 
             BottleDownloader::verify_checksum(&tarball_path, &sha256)?;
 

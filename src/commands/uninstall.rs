@@ -17,11 +17,7 @@ pub async fn uninstall(
     uninstall_impl(cache, formula_name, dry_run, cask, yes, false).await
 }
 
-pub async fn uninstall_quiet(
-    cache: &Cache,
-    formula_name: &str,
-    cask: bool,
-) -> Result<()> {
+pub async fn uninstall_quiet(cache: &Cache, formula_name: &str, cask: bool) -> Result<()> {
     uninstall_impl(cache, formula_name, false, cask, true, true).await
 }
 
