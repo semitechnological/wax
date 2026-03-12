@@ -2,6 +2,7 @@ use crate::bottle::homebrew_prefix;
 use crate::error::{Result, WaxError};
 use crate::install::InstallState;
 use console::style;
+#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::instrument;
@@ -489,6 +490,29 @@ async fn get_service_pid(formula_name: &str) -> Option<u32> {
         None
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let unit = format!("homebrew.{}.service", formula_name);
+        let output = Command::new("systemctl")
+            .args(["--user", "show", "--property=MainPID", &unit])
+            .output()
+            .await
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pid_str = stdout.trim().strip_prefix("MainPID=")?;
+        let pid: u32 = pid_str.parse().ok()?;
+        if pid > 0 {
+            Some(pid)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     None
 }

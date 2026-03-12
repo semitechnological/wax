@@ -501,7 +501,8 @@ async fn check_state_consistency(d: &mut DiagResult) {
     }
 }
 
-fn check_glibc_version(_d: &mut DiagResult) {
+#[allow(unused_variables)]
+fn check_glibc_version(d: &mut DiagResult) {
     #[cfg(target_os = "linux")]
     {
         if let Some(output) = run_command_with_timeout("ldd", &["--version"], 2) {
@@ -525,6 +526,7 @@ fn check_glibc_version(_d: &mut DiagResult) {
     }
 }
 
+#[allow(unused_variables)]
 fn check_metal_toolchain(d: &mut DiagResult) {
     #[cfg(target_os = "macos")]
     {
@@ -542,6 +544,41 @@ fn check_metal_toolchain(d: &mut DiagResult) {
             } else {
                 d.warn("Metal GPU support not detected");
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut found_gpu = false;
+
+        if let Some(output) = run_command_with_timeout("vulkaninfo", &["--summary"], 3) {
+            if output.contains("apiVersion") || output.contains("Vulkan Instance") {
+                let version = output
+                    .lines()
+                    .find(|l| l.contains("apiVersion"))
+                    .map(|l| l.trim())
+                    .unwrap_or("detected");
+                d.pass(&format!("Vulkan: {}", version));
+                found_gpu = true;
+            }
+        }
+
+        if !found_gpu {
+            if let Some(output) = run_command_with_timeout("glxinfo", &["-B"], 3) {
+                if output.contains("OpenGL version") {
+                    let version = output
+                        .lines()
+                        .find(|l| l.contains("OpenGL version"))
+                        .map(|l| l.trim())
+                        .unwrap_or("detected");
+                    d.pass(&format!("GPU: {}", version));
+                    found_gpu = true;
+                }
+            }
+        }
+
+        if !found_gpu {
+            d.warn("no GPU toolchain detected (vulkaninfo/glxinfo not found)");
         }
     }
 }
