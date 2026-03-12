@@ -121,7 +121,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                 let install_result = if pkg.is_cask {
                     install::install_quiet_with_progress(
                         cache,
-                        &[pkg.name.clone()],
+                        std::slice::from_ref(&pkg.name),
                         true,
                         false,
                         false,
@@ -136,7 +136,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                     };
                     install::install_quiet_with_progress(
                         cache,
-                        &[pkg.name.clone()],
+                        std::slice::from_ref(&pkg.name),
                         false,
                         user_flag,
                         global_flag,
@@ -378,7 +378,14 @@ async fn reinstall_dependents(cache: &Cache, upgraded_package: &str) -> Result<(
 
         let result = async {
             uninstall::uninstall_quiet(cache, dep_name, false).await?;
-            install::install_quiet(cache, &[dep_name.clone()], false, user_flag, global_flag).await
+            install::install_quiet(
+                cache,
+                std::slice::from_ref(dep_name),
+                false,
+                user_flag,
+                global_flag,
+            )
+            .await
         }
         .await;
 

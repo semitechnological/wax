@@ -132,6 +132,16 @@ async fn install_from_source_task(
     Ok(())
 }
 
+struct InstallArgs<'a> {
+    dry_run: bool,
+    cask: bool,
+    user: bool,
+    global: bool,
+    build_from_source: bool,
+    quiet: bool,
+    external_pb: Option<&'a ProgressBar>,
+}
+
 #[instrument(skip(cache))]
 pub async fn install(
     cache: &Cache,
@@ -145,56 +155,70 @@ pub async fn install(
     install_impl(
         cache,
         package_names,
-        dry_run,
-        cask,
-        user,
-        global,
-        build_from_source,
-        false,
-        None,
+        InstallArgs {
+            dry_run,
+            cask,
+            user,
+            global,
+            build_from_source,
+            quiet: false,
+            external_pb: None,
+        },
     )
     .await
 }
 
 pub async fn install_quiet(
     cache: &Cache,
-    package_names: &[String],
+    package_names: &[impl AsRef<str>],
     cask: bool,
     user: bool,
     global: bool,
 ) -> Result<()> {
+    let names: Vec<String> = package_names
+        .iter()
+        .map(|s| s.as_ref().to_string())
+        .collect();
     install_impl(
         cache,
-        package_names,
-        false,
-        cask,
-        user,
-        global,
-        false,
-        true,
-        None,
+        &names,
+        InstallArgs {
+            dry_run: false,
+            cask,
+            user,
+            global,
+            build_from_source: false,
+            quiet: true,
+            external_pb: None,
+        },
     )
     .await
 }
 
 pub async fn install_quiet_with_progress(
     cache: &Cache,
-    package_names: &[String],
+    package_names: &[impl AsRef<str>],
     cask: bool,
     user: bool,
     global: bool,
     pb: &ProgressBar,
 ) -> Result<()> {
+    let names: Vec<String> = package_names
+        .iter()
+        .map(|s| s.as_ref().to_string())
+        .collect();
     install_impl(
         cache,
-        package_names,
-        false,
-        cask,
-        user,
-        global,
-        false,
-        true,
-        Some(pb),
+        &names,
+        InstallArgs {
+            dry_run: false,
+            cask,
+            user,
+            global,
+            build_from_source: false,
+            quiet: true,
+            external_pb: Some(pb),
+        },
     )
     .await
 }
@@ -202,14 +226,17 @@ pub async fn install_quiet_with_progress(
 async fn install_impl(
     cache: &Cache,
     package_names: &[String],
-    dry_run: bool,
-    cask: bool,
-    user: bool,
-    global: bool,
-    build_from_source: bool,
-    quiet: bool,
-    external_pb: Option<&ProgressBar>,
+    args: InstallArgs<'_>,
 ) -> Result<()> {
+    let InstallArgs {
+        dry_run,
+        cask,
+        user,
+        global,
+        build_from_source,
+        quiet,
+        external_pb,
+    } = args;
     if package_names.is_empty() {
         return Err(WaxError::InvalidInput("No packages specified".to_string()));
     }

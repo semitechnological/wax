@@ -22,13 +22,7 @@ fn platform_fallback_chain(platform: &str) -> Vec<String> {
         "arm64_big_sur",
     ];
     let x86_chain = [
-        "tahoe",
-        "sequoia",
-        "sonoma",
-        "ventura",
-        "monterey",
-        "big_sur",
-        "catalina",
+        "tahoe", "sequoia", "sonoma", "ventura", "monterey", "big_sur", "catalina",
     ];
 
     let fallbacks = if platform.starts_with("arm64_") {
@@ -116,7 +110,9 @@ async fn resolve_bottle_for_platform(
     if !resp.status().is_success() {
         return Err(WaxError::VersionNotFound(format!(
             "No manifest found for {}@{} (HTTP {})",
-            formula_name, version, resp.status()
+            formula_name,
+            version,
+            resp.status()
         )));
     }
 
@@ -149,8 +145,7 @@ async fn resolve_bottle_for_platform(
         if matched_digest.is_none() {
             for candidate in &fallback_platforms {
                 if manifest_platform == candidate {
-                    matched_digest =
-                        Some(manifest["digest"].as_str().unwrap_or("").to_string());
+                    matched_digest = Some(manifest["digest"].as_str().unwrap_or("").to_string());
                     matched_platform = manifest_platform.to_string();
                     break;
                 }
@@ -186,7 +181,9 @@ async fn resolve_bottle_for_platform(
     if !layer_resp.status().is_success() {
         return Err(WaxError::VersionNotFound(format!(
             "Cannot fetch platform manifest for {}@{} (HTTP {})",
-            formula_name, version, layer_resp.status()
+            formula_name,
+            version,
+            layer_resp.status()
         )));
     }
 
@@ -213,10 +210,7 @@ async fn resolve_bottle_for_platform(
         ))
     })?;
 
-    let sha256 = digest
-        .strip_prefix("sha256:")
-        .unwrap_or(digest)
-        .to_string();
+    let sha256 = digest.strip_prefix("sha256:").unwrap_or(digest).to_string();
     let blob_url = format!("{}/{}/blobs/{}", GHCR_BASE, formula_name, digest);
 
     Ok((blob_url, sha256, matched_platform))

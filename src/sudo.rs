@@ -97,7 +97,7 @@ pub fn sudo_remove(path: &Path) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status()
-        .map_err(|e| WaxError::IoError(e))?;
+        .map_err(WaxError::IoError)?;
 
     if !status.success() {
         return Err(WaxError::InstallError(format!(
@@ -118,7 +118,7 @@ pub fn sudo_copy(src: &Path, dst: &Path) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status()
-        .map_err(|e| WaxError::IoError(e))?;
+        .map_err(WaxError::IoError)?;
 
     if !status.success() {
         return Err(WaxError::InstallError(format!(
@@ -139,7 +139,7 @@ pub fn sudo_mkdir(path: &Path) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status()
-        .map_err(|e| WaxError::IoError(e))?;
+        .map_err(WaxError::IoError)?;
 
     if !status.success() {
         return Err(WaxError::InstallError(format!(
@@ -167,7 +167,7 @@ pub fn sudo_symlink(src: &Path, dst: &Path) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status()
-        .map_err(|e| WaxError::IoError(e))?;
+        .map_err(WaxError::IoError)?;
 
     if !status.success() {
         return Err(WaxError::InstallError(format!(
@@ -191,7 +191,7 @@ pub fn sudo_chown_recursive(path: &Path) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| WaxError::IoError(e))?;
+        .map_err(WaxError::IoError)?;
 
     if !status.success() {
         debug!("sudo chown failed for {:?}, continuing", path);
