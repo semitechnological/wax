@@ -1,4 +1,5 @@
 pub mod bundle;
+pub mod completions;
 pub mod cleanup;
 pub mod doctor;
 pub mod info;

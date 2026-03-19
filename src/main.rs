@@ -18,6 +18,7 @@ mod version;
 use api::ApiClient;
 use cache::Cache;
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use error::Result;
 use tracing::Level;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -237,6 +238,12 @@ enum Commands {
         #[arg(help = "Formula or cask name")]
         formula: String,
     },
+
+    #[command(about = "Generate shell completions")]
+    Completions {
+        #[arg(value_enum, help = "Shell to generate completions for")]
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -427,6 +434,10 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Source { formula } => commands::source::source(&cache, &formula).await,
+        Commands::Completions { shell } => {
+            commands::completions::completions(shell);
+            Ok(())
+        }
     };
 
     if let Err(e) = result {
