@@ -190,6 +190,7 @@ pub async fn sync(cache: &Cache) -> Result<()> {
             from_source: false,
             bottle_rebuild: 0,
             bottle_sha256: None,
+                pinned: false,
         };
         state.add(package).await?;
 

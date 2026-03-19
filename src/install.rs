@@ -99,6 +99,8 @@ pub struct InstalledPackage {
     pub bottle_rebuild: u32,
     #[serde(default)]
     pub bottle_sha256: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 fn default_install_mode() -> InstallMode {
@@ -156,6 +158,15 @@ impl InstallState {
         let mut packages = self.load().await?;
         packages.remove(name);
         self.save(&packages).await?;
+        Ok(())
+    }
+
+    pub async fn set_pinned(&self, name: &str, pinned: bool) -> Result<()> {
+        let mut packages = self.load().await?;
+        if let Some(pkg) = packages.get_mut(name) {
+            pkg.pinned = pinned;
+            self.save(&packages).await?;
+        }
         Ok(())
     }
 
@@ -254,6 +265,7 @@ impl InstallState {
                                 from_source: false,
                                 bottle_rebuild: 0,
                                 bottle_sha256: None,
+                pinned: false,
                             },
                         );
                     }

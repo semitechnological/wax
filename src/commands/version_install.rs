@@ -347,6 +347,7 @@ pub async fn version_install(
         from_source: false,
         bottle_rebuild: 0,
         bottle_sha256: Some(sha256),
+        pinned: false,
     };
     state.add(package).await?;
 

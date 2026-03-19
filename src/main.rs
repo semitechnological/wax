@@ -57,25 +57,25 @@ enum Commands {
         force: bool,
     },
 
-    #[command(about = "Search formulae and casks")]
+    #[command(about = "Search formulae and casks  [alias: s, find]")]
+    #[command(visible_alias = "s")]
     #[command(alias = "find")]
-    #[command(alias = "s")]
     Search { query: String },
 
-    #[command(about = "Show formula details")]
-    #[command(alias = "show")]
+    #[command(about = "Show formula details  [alias: show]")]
+    #[command(visible_alias = "show")]
     Info {
         formula: String,
         #[arg(long)]
         cask: bool,
     },
 
-    #[command(about = "List installed packages")]
-    #[command(alias = "ls")]
+    #[command(about = "List installed packages  [alias: ls]")]
+    #[command(visible_alias = "ls")]
     List,
 
-    #[command(about = "Install one or more formulae or casks")]
-    #[command(alias = "i")]
+    #[command(about = "Install one or more formulae or casks  [alias: i, add]")]
+    #[command(visible_alias = "i")]
     #[command(alias = "add")]
     Install {
         #[arg(required = true, help = "Package name(s) to install")]
@@ -92,9 +92,9 @@ enum Commands {
         build_from_source: bool,
     },
 
-    #[command(about = "Install casks (shorthand for install --cask)")]
+    #[command(about = "Install casks  [alias: c]")]
     #[command(name = "cask")]
-    #[command(alias = "c")]
+    #[command(visible_alias = "c")]
     InstallCask {
         #[arg(required = true, help = "Cask name(s) to install")]
         packages: Vec<String>,
@@ -106,8 +106,8 @@ enum Commands {
         global: bool,
     },
 
-    #[command(about = "Uninstall a formula or cask")]
-    #[command(alias = "rm")]
+    #[command(about = "Uninstall a formula or cask  [alias: rm, remove]")]
+    #[command(visible_alias = "rm")]
     #[command(alias = "remove")]
     #[command(alias = "delete")]
     Uninstall {
@@ -118,8 +118,17 @@ enum Commands {
         cask: bool,
     },
 
-    #[command(about = "Upgrade formulae to the latest version")]
-    #[command(alias = "up")]
+    #[command(about = "Reinstall a formula or cask  [alias: ri]")]
+    #[command(visible_alias = "ri")]
+    Reinstall {
+        #[arg(required = true)]
+        packages: Vec<String>,
+        #[arg(long)]
+        cask: bool,
+    },
+
+    #[command(about = "Upgrade formulae to the latest version  [alias: up]")]
+    #[command(visible_alias = "up")]
     Upgrade {
         #[arg(help = "Package name(s) to upgrade (upgrades all if omitted)")]
         packages: Vec<String>,
@@ -129,6 +138,56 @@ enum Commands {
 
     #[command(about = "List packages with available updates")]
     Outdated,
+
+    #[command(about = "Re-create symlinks for installed packages  [alias: ln]")]
+    #[command(visible_alias = "ln")]
+    Link {
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    #[command(about = "Remove symlinks for a package (keeps Cellar)")]
+    Unlink {
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    #[command(about = "Remove old versions from the Cellar")]
+    Cleanup {
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    #[command(about = "Show installed packages not required by any other package")]
+    Leaves,
+
+    #[command(about = "Show formulae that depend on a given formula")]
+    Uses {
+        formula: String,
+        #[arg(long, help = "Only show installed dependents")]
+        installed: bool,
+    },
+
+    #[command(about = "Show dependencies for a formula")]
+    Deps {
+        formula: String,
+        #[arg(long, help = "Show as dependency tree")]
+        tree: bool,
+        #[arg(long, help = "Only show installed dependencies")]
+        installed: bool,
+    },
+
+    #[command(about = "Pin a formula to its current version")]
+    Pin {
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    #[command(about = "Unpin a formula to allow upgrades")]
+    Unpin {
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
 
     #[command(about = "Generate lockfile from installed packages")]
     Lock,
@@ -142,8 +201,8 @@ enum Commands {
         action: Option<TapAction>,
     },
 
-    #[command(about = "Check system for potential problems")]
-    #[command(alias = "dr")]
+    #[command(about = "Check system for potential problems  [alias: dr]")]
+    #[command(visible_alias = "dr")]
     Doctor {
         #[arg(long, help = "Automatically fix detected issues")]
         fix: bool,
@@ -315,10 +374,27 @@ async fn main() -> Result<()> {
             dry_run,
             cask,
         } => commands::uninstall::uninstall(&cache, &formula, dry_run, cask, cli.yes).await,
+        Commands::Reinstall { packages, cask } => {
+            commands::reinstall::reinstall(&cache, &packages, cask).await
+        }
         Commands::Upgrade { packages, dry_run } => {
             commands::upgrade::upgrade(&cache, &packages, dry_run).await
         }
         Commands::Outdated => commands::outdated::outdated(&cache).await,
+        Commands::Link { packages } => commands::link::link(&packages).await,
+        Commands::Unlink { packages } => commands::link::unlink(&packages).await,
+        Commands::Cleanup { dry_run } => commands::cleanup::cleanup(dry_run).await,
+        Commands::Leaves => commands::leaves::leaves(&cache).await,
+        Commands::Uses { formula, installed } => {
+            commands::uses::uses(&cache, &formula, installed).await
+        }
+        Commands::Deps {
+            formula,
+            tree,
+            installed,
+        } => commands::show_deps::deps(&cache, &formula, tree, installed).await,
+        Commands::Pin { packages } => commands::pin::pin(&packages).await,
+        Commands::Unpin { packages } => commands::pin::unpin(&packages).await,
         Commands::Lock => commands::lock::lock().await,
         Commands::Sync => commands::sync::sync(&cache).await,
         Commands::Tap { action } => commands::tap::tap(action, Some(&cache)).await,

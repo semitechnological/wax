@@ -119,6 +119,7 @@ async fn install_from_source_task(
         from_source: true,
         bottle_rebuild: 0,
         bottle_sha256: None,
+            pinned: false,
     };
     state.add(package).await?;
 
@@ -644,6 +645,7 @@ async fn install_impl(
             from_source: false,
             bottle_rebuild: 0,
             bottle_sha256: Some(bottle_sha),
+            pinned: false,
         };
         state.add(package).await?;
 
