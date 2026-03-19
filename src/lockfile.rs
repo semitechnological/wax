@@ -77,7 +77,14 @@ impl Lockfile {
     }
 
     pub fn default_path() -> PathBuf {
-        PathBuf::from("./wax.lock")
+        if let Some(base_dirs) = directories::BaseDirs::new() {
+            base_dirs.data_local_dir().join("wax").join("wax.lock")
+        } else {
+            crate::ui::dirs::home_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".wax")
+                .join("wax.lock")
+        }
     }
 }
 
