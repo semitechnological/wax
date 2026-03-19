@@ -525,6 +525,8 @@ async fn install_impl(
 
         let task = tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
+            // Don't even start if already cancelled
+            crate::signal::check_cancelled()?;
             crate::signal::set_current_op(format!("downloading {}", name));
 
             let tarball_path = temp_dir.path().join(format!("{}-{}.tar.gz", name, version));
@@ -543,16 +545,27 @@ async fn install_impl(
         tasks.push(task);
     }
 
-    let results = futures::future::join_all(tasks).await;
-
+    // Collect results; abort remaining tasks immediately on cancellation
     let mut extracted_packages: Vec<(String, String, std::path::PathBuf, String)> = Vec::new();
     let mut failed_packages = Vec::new();
+    let mut cancelled = false;
 
-    for result in results {
-        match result {
+    for handle in tasks {
+        if cancelled || crate::signal::is_shutdown_requested() {
+            handle.abort();
+            cancelled = true;
+            continue;
+        }
+        match handle.await {
             Ok(Ok(data)) => extracted_packages.push(data),
+            Ok(Err(WaxError::Interrupted)) => {
+                cancelled = true;
+            }
             Ok(Err(e)) => {
                 failed_packages.push(format!("{}", e));
+            }
+            Err(e) if e.is_cancelled() => {
+                cancelled = true;
             }
             Err(e) => {
                 failed_packages.push(format!("Task error: {}", e));
@@ -561,6 +574,10 @@ async fn install_impl(
     }
 
     extracted_packages.extend(inline_extracted);
+
+    if cancelled {
+        return Err(WaxError::Interrupted);
+    }
 
     if !failed_packages.is_empty() && !quiet {
         for err in &failed_packages {

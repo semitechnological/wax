@@ -76,6 +76,12 @@ impl BottleDownloader {
 
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
+            if crate::signal::is_shutdown_requested() {
+                // Drop the incomplete file before returning so temp dir is clean
+                drop(file);
+                let _ = tokio::fs::remove_file(dest_path).await;
+                return Err(crate::error::WaxError::Interrupted);
+            }
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
