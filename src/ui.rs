@@ -107,4 +107,17 @@ pub mod dirs {
             )
         })
     }
+
+    /// Central wax data directory: ~/.wax
+    pub fn wax_dir() -> Result<PathBuf> {
+        Ok(home_dir()?.join(".wax"))
+    }
+
+    pub fn wax_cache_dir() -> Result<PathBuf> {
+        Ok(wax_dir()?.join("cache"))
+    }
+
+    pub fn wax_logs_dir() -> Result<PathBuf> {
+        Ok(wax_dir()?.join("logs"))
+    }
 }

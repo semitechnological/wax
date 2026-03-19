@@ -113,15 +113,7 @@ pub struct InstallState {
 
 impl InstallState {
     pub fn new() -> Result<Self> {
-        let state_path = if let Some(base_dirs) = directories::BaseDirs::new() {
-            base_dirs
-                .data_local_dir()
-                .join("wax")
-                .join("installed.json")
-        } else {
-            dirs::home_dir()?.join(".wax").join("installed.json")
-        };
-
+        let state_path = dirs::wax_dir()?.join("installed.json");
         Ok(Self { state_path })
     }
 

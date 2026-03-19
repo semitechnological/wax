@@ -311,11 +311,7 @@ enum TapAction {
 }
 
 fn init_logging(verbose: bool) -> Result<()> {
-    let log_dir = if let Some(base_dirs) = directories::BaseDirs::new() {
-        base_dirs.cache_dir().join("wax").join("logs")
-    } else {
-        ui::dirs::home_dir()?.join(".wax").join("logs")
-    };
+    let log_dir = ui::dirs::wax_logs_dir()?;
 
     std::fs::create_dir_all(&log_dir)?;
 
