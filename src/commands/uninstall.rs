@@ -30,6 +30,9 @@ pub async fn uninstall(
                 "Specify package name(s) or use --all to uninstall everything".to_string(),
             ));
         }
+        for name in formulae {
+            crate::error::validate_package_name(name)?;
+        }
         formulae.to_vec()
     };
 

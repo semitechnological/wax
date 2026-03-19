@@ -228,6 +228,11 @@ pub async fn services_start(formula_name: &str, nice: Option<i32>) -> Result<()>
         let mut plist_content = std::fs::read_to_string(&plist)?;
 
         if let Some(priority) = nice {
+            if !(-20..=20).contains(&priority) {
+                return Err(WaxError::ServiceError(
+                    "Nice priority must be between -20 and 20".to_string(),
+                ));
+            }
             if !plist_content.contains("<key>Nice</key>") {
                 let nice_entry = format!(
                     "\t<key>Nice</key>\n\t<integer>{}</integer>\n</dict>",
