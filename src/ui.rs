@@ -10,6 +10,9 @@ pub const PROGRESS_BAR_TEMPLATE: &str =
     "{msg} {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec}  eta {eta}";
 pub const PROGRESS_BAR_PREFIX_TEMPLATE: &str =
     "{prefix:.bold} {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec}  eta {eta}";
+pub const OVERALL_PROGRESS_TEMPLATE: &str =
+    "  overall  {bar:40.white/dim} {pos}/{len}  eta {eta}";
+pub const SPINNER_TICK_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
 pub fn copy_dir_all(src: &PathBuf, dst: &PathBuf) -> Result<()> {
     match copy_dir_all_inner(src, dst) {

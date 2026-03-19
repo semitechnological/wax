@@ -3,7 +3,7 @@ use crate::commands::{install, uninstall};
 use crate::error::{Result, WaxError};
 use crate::install::{InstallMode, InstallState};
 use crate::signal::{clear_active_multi, clear_current_op, set_active_multi, set_current_op};
-use crate::ui::{PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE};
+use crate::ui::{OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE, SPINNER_TICK_CHARS};
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::time::Instant;
@@ -40,9 +40,9 @@ pub async fn reinstall(cache: &Cache, packages: &[String], cask: bool, all: bool
         let pb = multi.insert_from_back(0, ProgressBar::new(total as u64));
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("  overall  {bar:40.white/dim} {pos}/{len}  eta {eta}")
+                .template(OVERALL_PROGRESS_TEMPLATE)
                 .unwrap()
-                .progress_chars("█▓▒░ "),
+                .progress_chars(PROGRESS_BAR_CHARS),
         );
         Some(pb)
     } else {
@@ -69,7 +69,7 @@ pub async fn reinstall(cache: &Cache, packages: &[String], cask: bool, all: bool
             ProgressStyle::default_spinner()
                 .template("{spinner:.cyan} {msg}")
                 .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+                .tick_chars(SPINNER_TICK_CHARS),
         );
         spinner.enable_steady_tick(std::time::Duration::from_millis(80));
         set_current_op(format!("removing {}", name));

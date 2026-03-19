@@ -194,15 +194,8 @@ impl BottleDownloader {
         }
 
         // Detect Mach-O binaries (macOS): 32-bit, 64-bit, and fat/universal
-        if content.len() >= 4 {
-            let magic = &content[0..4];
-            if magic == b"\xCE\xFA\xED\xFE"
-                || magic == b"\xCF\xFA\xED\xFE"
-                || magic == b"\xBE\xBA\xFE\xCA"
-                || magic == b"\xCA\xFE\xBA\xBE"
-            {
-                return Self::relocate_macho(path, prefix, cellar);
-            }
+        if is_mach_o(&content) {
+            return Self::relocate_macho(path, prefix, cellar);
         }
 
         let mut content = content;
@@ -352,7 +345,10 @@ impl BottleDownloader {
 
         let path_str = match path.to_str() {
             Some(s) => s,
-            None => return Ok(()),
+            None => {
+                debug!("Skipping Mach-O relocation: non-UTF-8 path {:?}", path);
+                return Ok(());
+            }
         };
 
         // Fix the binary's own install name (relevant for dylibs)
@@ -420,6 +416,18 @@ impl BottleDownloader {
 
         Ok(())
     }
+}
+
+/// Returns true if the first 4 bytes match any Mach-O magic number.
+pub fn is_mach_o(data: &[u8]) -> bool {
+    data.len() >= 4
+        && matches!(
+            &data[0..4],
+            b"\xCE\xFA\xED\xFE"
+                | b"\xCF\xFA\xED\xFE"
+                | b"\xBE\xBA\xFE\xCA"
+                | b"\xCA\xFE\xBA\xBE"
+        )
 }
 
 fn which_patchelf() -> Option<String> {

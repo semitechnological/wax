@@ -807,16 +807,7 @@ fn is_mach_o_with_placeholders(path: &Path) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    if content.len() < 4 {
-        return false;
-    }
-    // Check Mach-O magic bytes
-    let magic = &content[0..4];
-    let is_macho = magic == b"\xCE\xFA\xED\xFE"
-        || magic == b"\xCF\xFA\xED\xFE"
-        || magic == b"\xBE\xBA\xFE\xCA"
-        || magic == b"\xCA\xFE\xBA\xBE";
-    if !is_macho {
+    if !crate::bottle::is_mach_o(&content) {
         return false;
     }
     // Fast byte scan for placeholder strings

@@ -3,6 +3,7 @@ use crate::cask::CaskState;
 use crate::error::{Result, WaxError};
 use crate::install::{remove_symlinks, InstallState};
 use crate::signal::{clear_current_op, set_current_op};
+use crate::ui::{OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, SPINNER_TICK_CHARS};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use inquire::Confirm;
@@ -40,9 +41,9 @@ pub async fn uninstall(
         let pb = ProgressBar::new(total as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("  overall  {bar:40.white/dim} {pos}/{len}  eta {eta}")
+                .template(OVERALL_PROGRESS_TEMPLATE)
                 .unwrap()
-                .progress_chars("█▓▒░ "),
+                .progress_chars(PROGRESS_BAR_CHARS),
         );
         Some(pb)
     } else {
@@ -187,7 +188,7 @@ async fn uninstall_package_direct(
             ProgressStyle::default_spinner()
                 .template("{spinner:.red} {msg}")
                 .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+                .tick_chars(SPINNER_TICK_CHARS),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
         pb.set_message(format!(
