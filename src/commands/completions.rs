@@ -93,11 +93,9 @@ fn install_completions(shell: Shell) -> Result<()> {
                 .unwrap_or(false);
 
             if already_configured {
-                println!("completions are ready — restart zsh or run: {}", style("exec zsh").dim());
+                println!("completions are ready — run {} to activate", style("exec zsh").cyan());
             } else {
-                let prompt = inquire::Confirm::new(
-                    &format!("Add fpath to ~/.zshrc and restart zsh?"),
-                )
+                let prompt = inquire::Confirm::new("Add fpath to ~/.zshrc?")
                 .with_default(true)
                 .prompt();
 
