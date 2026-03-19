@@ -106,15 +106,6 @@ enum Commands {
         global: bool,
     },
 
-    #[command(about = "Re-create symlinks for installed packages")]
-    #[command(alias = "ln")]
-    Link {
-        #[arg(help = "Package name(s) to relink (use --all for everything)")]
-        packages: Vec<String>,
-        #[arg(long, help = "Relink all installed packages")]
-        all: bool,
-    },
-
     #[command(about = "Uninstall a formula or cask")]
     #[command(alias = "rm")]
     #[command(alias = "remove")]
@@ -319,7 +310,6 @@ async fn main() -> Result<()> {
         } => {
             commands::install::install(&cache, &packages, dry_run, true, user, global, false).await
         }
-        Commands::Link { packages, all } => commands::link::link(&packages, all).await,
         Commands::Uninstall {
             formula,
             dry_run,
