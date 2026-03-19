@@ -4,16 +4,25 @@ use crate::error::{Result, WaxError};
 use crate::install::{InstallMode, InstallState};
 use console::style;
 
-pub async fn reinstall(cache: &Cache, packages: &[String], cask: bool) -> Result<()> {
-    if packages.is_empty() {
-        return Err(WaxError::InvalidInput("No packages specified".to_string()));
-    }
-
+pub async fn reinstall(cache: &Cache, packages: &[String], cask: bool, all: bool) -> Result<()> {
     let state = InstallState::new()?;
     state.sync_from_cellar().await.ok();
     let installed = state.load().await?;
 
-    for name in packages {
+    let resolved: Vec<String> = if all {
+        let mut names: Vec<String> = installed.keys().cloned().collect();
+        names.sort();
+        names
+    } else {
+        if packages.is_empty() {
+            return Err(WaxError::InvalidInput(
+                "Specify package name(s) or use --all to reinstall everything".to_string(),
+            ));
+        }
+        packages.to_vec()
+    };
+
+    for name in &resolved {
         let install_mode = installed.get(name.as_str()).map(|p| p.install_mode);
 
         let (user_flag, global_flag) = match install_mode {

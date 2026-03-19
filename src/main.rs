@@ -111,20 +111,25 @@ enum Commands {
     #[command(alias = "remove")]
     #[command(alias = "delete")]
     Uninstall {
-        formula: String,
+        #[arg(conflicts_with = "all")]
+        formulae: Vec<String>,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
         cask: bool,
+        #[arg(long, help = "Uninstall all installed formulae")]
+        all: bool,
     },
 
     #[command(about = "Reinstall a formula or cask  [alias: ri]")]
     #[command(visible_alias = "ri")]
     Reinstall {
-        #[arg(required = true)]
+        #[arg(conflicts_with = "all")]
         packages: Vec<String>,
         #[arg(long)]
         cask: bool,
+        #[arg(long, help = "Reinstall all installed formulae")]
+        all: bool,
     },
 
     #[command(about = "Upgrade formulae to the latest version  [alias: up]")]
@@ -370,12 +375,13 @@ async fn main() -> Result<()> {
             commands::install::install(&cache, &packages, dry_run, true, user, global, false).await
         }
         Commands::Uninstall {
-            formula,
+            formulae,
             dry_run,
             cask,
-        } => commands::uninstall::uninstall(&cache, &formula, dry_run, cask, cli.yes).await,
-        Commands::Reinstall { packages, cask } => {
-            commands::reinstall::reinstall(&cache, &packages, cask).await
+            all,
+        } => commands::uninstall::uninstall(&cache, &formulae, dry_run, cask, cli.yes, all).await,
+        Commands::Reinstall { packages, cask, all } => {
+            commands::reinstall::reinstall(&cache, &packages, cask, all).await
         }
         Commands::Upgrade { packages, dry_run } => {
             commands::upgrade::upgrade(&cache, &packages, dry_run).await

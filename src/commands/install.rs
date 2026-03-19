@@ -616,11 +616,16 @@ async fn install_impl(
             }
         }
 
-        if cfg!(target_os = "linux") {
+        {
             let prefix = install_mode.prefix()?;
+            let default_prefix = if cfg!(target_os = "macos") {
+                "/opt/homebrew"
+            } else {
+                "/home/linuxbrew/.linuxbrew"
+            };
             BottleDownloader::relocate_bottle(
                 &formula_cellar,
-                prefix.to_str().unwrap_or("/home/linuxbrew/.linuxbrew"),
+                prefix.to_str().unwrap_or(default_prefix),
             )?;
         }
 

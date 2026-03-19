@@ -46,6 +46,24 @@ impl BottleDownloader {
         }
 
         let response = request.send().await?;
+
+        debug!(
+            "Download response: status={}, content-type={:?}, content-encoding={:?}",
+            response.status(),
+            response.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            response.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+        );
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(WaxError::InstallError(format!(
+                "Download failed with HTTP {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            )));
+        }
+
         let total_size = response.content_length().unwrap_or(0);
 
         if let Some(pb) = progress {
@@ -175,6 +193,18 @@ impl BottleDownloader {
             return Self::relocate_elf(path, prefix, cellar);
         }
 
+        // Detect Mach-O binaries (macOS): 32-bit, 64-bit, and fat/universal
+        if content.len() >= 4 {
+            let magic = &content[0..4];
+            if magic == b"\xCE\xFA\xED\xFE"
+                || magic == b"\xCF\xFA\xED\xFE"
+                || magic == b"\xBE\xBA\xFE\xCA"
+                || magic == b"\xCA\xFE\xBA\xBE"
+            {
+                return Self::relocate_macho(path, prefix, cellar);
+            }
+        }
+
         let mut content = content;
         let metadata = std::fs::metadata(path)?;
         let original_permissions = metadata.permissions();
@@ -298,6 +328,94 @@ impl BottleDownloader {
         #[cfg(unix)]
         {
             std::fs::set_permissions(path, original_permissions)?;
+        }
+
+        Ok(())
+    }
+
+    fn relocate_macho(path: &Path, prefix: &str, cellar: &str) -> Result<()> {
+        use std::process::Command;
+
+        // Make writable so install_name_tool can modify it
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mut perms = metadata.permissions();
+                let mode = perms.mode();
+                if mode & 0o200 == 0 {
+                    perms.set_mode(mode | 0o200);
+                    let _ = std::fs::set_permissions(path, perms);
+                }
+            }
+        }
+
+        let path_str = match path.to_str() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Fix the binary's own install name (relevant for dylibs)
+        if let Ok(output) = Command::new("otool").args(["-D", path_str]).output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let mut lines = text.lines();
+                lines.next(); // skip header line
+                if let Some(install_name) = lines.next() {
+                    let install_name = install_name.trim();
+                    let new_name = install_name
+                        .replace("@@HOMEBREW_CELLAR@@", cellar)
+                        .replace("@@HOMEBREW_PREFIX@@", prefix);
+                    if new_name != install_name {
+                        let _ = Command::new("install_name_tool")
+                            .args(["-id", &new_name, path_str])
+                            .output();
+                        debug!("Relocated Mach-O install name: {:?}", path);
+                    }
+                }
+            }
+        }
+
+        // Fix all referenced dylib paths
+        if let Ok(output) = Command::new("otool").args(["-L", path_str]).output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines().skip(1) {
+                    let line = line.trim();
+                    // Format: "\t/path/to/lib (compatibility version X, current version Y)"
+                    let lib_path = if let Some(end) = line.find(" (") {
+                        &line[..end]
+                    } else {
+                        continue;
+                    };
+
+                    if !lib_path.contains("@@HOMEBREW_CELLAR@@")
+                        && !lib_path.contains("@@HOMEBREW_PREFIX@@")
+                    {
+                        continue;
+                    }
+
+                    let new_path = lib_path
+                        .replace("@@HOMEBREW_CELLAR@@", cellar)
+                        .replace("@@HOMEBREW_PREFIX@@", prefix);
+
+                    let result = Command::new("install_name_tool")
+                        .args(["-change", lib_path, &new_path, path_str])
+                        .output();
+
+                    if let Ok(out) = result {
+                        if !out.status.success() {
+                            debug!(
+                                "install_name_tool failed for {:?}: {}",
+                                path,
+                                String::from_utf8_lossy(&out.stderr)
+                            );
+                        } else {
+                            debug!("Relocated Mach-O dep {} -> {} in {:?}", lib_path, new_path, path);
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())

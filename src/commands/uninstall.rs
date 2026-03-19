@@ -4,17 +4,34 @@ use crate::error::{Result, WaxError};
 use crate::install::{remove_symlinks, InstallState};
 use console::style;
 use inquire::Confirm;
-use tracing::instrument;
-
-#[instrument(skip(cache))]
 pub async fn uninstall(
     cache: &Cache,
-    formula_name: &str,
+    formulae: &[String],
     dry_run: bool,
     cask: bool,
     yes: bool,
+    all: bool,
 ) -> Result<()> {
-    uninstall_impl(cache, formula_name, dry_run, cask, yes, false).await
+    let names: Vec<String> = if all {
+        let state = InstallState::new()?;
+        state.sync_from_cellar().await.ok();
+        let installed = state.load().await?;
+        let mut names: Vec<String> = installed.keys().cloned().collect();
+        names.sort();
+        names
+    } else {
+        if formulae.is_empty() {
+            return Err(WaxError::InvalidInput(
+                "Specify package name(s) or use --all to uninstall everything".to_string(),
+            ));
+        }
+        formulae.to_vec()
+    };
+
+    for name in &names {
+        uninstall_impl(cache, name, dry_run, cask, yes, false).await?;
+    }
+    Ok(())
 }
 
 pub async fn uninstall_quiet(cache: &Cache, formula_name: &str, cask: bool) -> Result<()> {
