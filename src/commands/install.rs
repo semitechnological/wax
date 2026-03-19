@@ -271,6 +271,12 @@ async fn install_impl(
     let installed_packages = state.load().await?;
     let installed: HashSet<String> = installed_packages.keys().cloned().collect();
 
+    // Pre-build lookup maps for O(1) formula resolution instead of O(n) linear scans
+    let by_name: std::collections::HashMap<&str, &crate::api::Formula> =
+        formulae.iter().map(|f| (f.name.as_str(), f)).collect();
+    let by_full_name: std::collections::HashMap<&str, &crate::api::Formula> =
+        formulae.iter().map(|f| (f.full_name.as_str(), f)).collect();
+
     let mut all_to_install = Vec::new();
     let mut already_installed = Vec::new();
     let mut errors = Vec::new();
@@ -282,20 +288,20 @@ async fn install_impl(
         }
 
         let formula = if package_name.contains('/') {
-            formulae
-                .iter()
-                .find(|f| &f.full_name == package_name || &f.name == package_name)
+            by_full_name
+                .get(package_name.as_str())
+                .or_else(|| by_name.get(package_name.as_str()))
                 .or_else(|| {
                     let parts: Vec<&str> = package_name.split('/').collect();
                     if parts.len() >= 3 {
-                        let formula_name = parts[parts.len() - 1];
-                        formulae.iter().find(|f| f.name == formula_name)
+                        by_name.get(parts[parts.len() - 1])
                     } else {
                         None
                     }
                 })
+                .copied()
         } else {
-            formulae.iter().find(|f| f.name == *package_name)
+            by_name.get(package_name.as_str()).copied()
         };
 
         let formula = match formula {
@@ -438,9 +444,9 @@ async fn install_impl(
     let packages_to_install: Vec<_> = all_to_install
         .iter()
         .map(|name| {
-            formulae
-                .iter()
-                .find(|f| &f.name == name)
+            by_name
+                .get(name.as_str())
+                .copied()
                 .ok_or_else(|| WaxError::FormulaNotFound(name.clone()))
         })
         .collect::<Result<_>>()?;
@@ -944,10 +950,42 @@ async fn install_multiple_casks(cache: &Cache, cask_names: &[String], dry_run: b
         return Ok(());
     }
 
+    // Fetch all cask details concurrently
+    let api_client = Arc::new(crate::api::ApiClient::new());
+    let semaphore = Arc::new(Semaphore::new(8));
+
+    let detail_tasks: Vec<_> = to_install
+        .iter()
+        .map(|name| {
+            let api = Arc::clone(&api_client);
+            let sem = Arc::clone(&semaphore);
+            let name = name.clone();
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let details = api.fetch_cask_details(&name).await?;
+                Ok::<_, WaxError>((name, details))
+            })
+        })
+        .collect();
+
+    let mut cask_details = Vec::new();
+    for task in detail_tasks {
+        match task.await {
+            Ok(Ok(data)) => cask_details.push(data),
+            Ok(Err(e)) => {
+                eprintln!("failed to fetch cask details: {}", e);
+            }
+            Err(e) => {
+                eprintln!("task failed: {}", e);
+            }
+        }
+    }
+
+    // Install sequentially (DMG mounting/copying requires serial FS access)
     let mut installed_count = 0;
     let mut failed = Vec::new();
 
-    for cask_name in &to_install {
+    for (cask_name, _cask) in &cask_details {
         check_cancelled()?;
         match install_cask(cache, cask_name, false).await {
             Ok(_) => installed_count += 1,

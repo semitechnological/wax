@@ -79,7 +79,7 @@ enum Commands {
     #[command(visible_alias = "i")]
     #[command(alias = "add")]
     Install {
-        #[arg(required = true, help = "Package name(s) to install")]
+        #[arg(help = "Package name(s) to install (syncs from lockfile if omitted)")]
         packages: Vec<String>,
         #[arg(long)]
         dry_run: bool,
@@ -241,9 +241,21 @@ enum Commands {
 
     #[command(about = "Generate shell completions")]
     Completions {
-        #[arg(value_enum, help = "Shell to generate completions for")]
-        shell: Shell,
+        #[arg(value_enum, help = "Shell to generate completions for (auto-detected if omitted)")]
+        shell: Option<Shell>,
+        #[arg(long, help = "Install completions to the appropriate shell config directory")]
+        install: bool,
     },
+
+    #[command(about = "Show why a package is installed  [alias: explain]")]
+    #[command(alias = "explain")]
+    Why {
+        #[arg(help = "Package name")]
+        formula: String,
+    },
+
+    #[command(about = "Check installed packages for issues (deprecated, disabled, outdated)")]
+    Audit,
 }
 
 #[derive(Subcommand)]
@@ -363,16 +375,21 @@ async fn main() -> Result<()> {
             global,
             build_from_source,
         } => {
-            commands::install::install(
-                &cache,
-                &packages,
-                dry_run,
-                cask,
-                user,
-                global,
-                build_from_source,
-            )
-            .await
+            if packages.is_empty() && !cask {
+                // No packages specified — sync from lockfile like `npm install`
+                commands::sync::sync(&cache).await
+            } else {
+                commands::install::install(
+                    &cache,
+                    &packages,
+                    dry_run,
+                    cask,
+                    user,
+                    global,
+                    build_from_source,
+                )
+                .await
+            }
         }
         Commands::InstallCask {
             packages,
@@ -434,10 +451,13 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Source { formula } => commands::source::source(&cache, &formula).await,
-        Commands::Completions { shell } => {
-            commands::completions::completions(shell);
-            Ok(())
+        Commands::Completions { shell, install } => {
+            commands::completions::completions(shell, install)
         }
+        Commands::Why { formula } => {
+            commands::info::info(&api_client, &cache, &formula, false).await
+        }
+        Commands::Audit => commands::audit::audit(&cache).await,
     };
 
     if let Err(e) = result {

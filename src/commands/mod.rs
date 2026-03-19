@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod bundle;
 pub mod completions;
 pub mod cleanup;

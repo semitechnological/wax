@@ -2,27 +2,23 @@ use crate::bottle::homebrew_prefix;
 use crate::error::{validate_package_name, Result, WaxError};
 use crate::install::InstallState;
 use console::style;
-#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::instrument;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ServiceInfo {
-    pub name: String,
-    pub status: ServiceStatus,
-    pub plist_path: Option<PathBuf>,
-    pub pid: Option<u32>,
+struct ServiceInfo {
+    name: String,
+    status: ServiceStatus,
+    #[allow(dead_code)]
+    plist_path: Option<PathBuf>,
+    pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum ServiceStatus {
+enum ServiceStatus {
     Running,
     Stopped,
-    Error,
-    Unknown,
 }
 
 impl std::fmt::Display for ServiceStatus {
@@ -30,8 +26,6 @@ impl std::fmt::Display for ServiceStatus {
         match self {
             ServiceStatus::Running => write!(f, "running"),
             ServiceStatus::Stopped => write!(f, "stopped"),
-            ServiceStatus::Error => write!(f, "error"),
-            ServiceStatus::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -171,8 +165,6 @@ pub async fn services_list() -> Result<()> {
         let status_style = match svc.status {
             ServiceStatus::Running => style("running").green(),
             ServiceStatus::Stopped => style("stopped").dim(),
-            ServiceStatus::Error => style("error").red(),
-            ServiceStatus::Unknown => style("unknown").dim(),
         };
 
         let pid_str = svc.pid.map(|p| format!(" (pid {})", p)).unwrap_or_default();
@@ -457,12 +449,12 @@ async fn get_service_status(formula_name: &str) -> ServiceStatus {
                     ServiceStatus::Stopped
                 }
             }
-            Err(_) => ServiceStatus::Unknown,
+            Err(_) => ServiceStatus::Stopped,
         }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    ServiceStatus::Unknown
+    ServiceStatus::Stopped
 }
 
 async fn get_service_pid(formula_name: &str) -> Option<u32> {
