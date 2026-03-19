@@ -2,6 +2,7 @@ pub mod bundle;
 pub mod doctor;
 pub mod info;
 pub mod install;
+pub mod link;
 pub mod list;
 pub mod lock;
 pub mod outdated;

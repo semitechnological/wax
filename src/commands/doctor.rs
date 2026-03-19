@@ -3,7 +3,7 @@ use crate::bottle::{detect_platform, homebrew_prefix, run_command_with_timeout};
 use crate::cache::Cache;
 use crate::cask::CaskState;
 use crate::error::Result;
-use crate::install::{InstallMode, InstallState};
+use crate::install::{create_symlinks, InstallMode, InstallState};
 use console::style;
 use std::path::Path;
 
@@ -65,6 +65,7 @@ pub async fn doctor(cache: &Cache, fix: bool) -> Result<()> {
     check_install_state(&mut d).await;
     check_cask_state(&mut d).await;
     check_broken_symlinks(&mut d).await;
+    check_opt_symlinks(&mut d).await;
     check_state_consistency(&mut d).await;
     check_tools(&mut d);
     check_glibc_version(&mut d);
@@ -397,6 +398,112 @@ fn collect_broken_symlinks_recursive(dir: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     broken
+}
+
+async fn check_opt_symlinks(d: &mut DiagResult) {
+    let mut missing_opt = Vec::new();
+    let mut relinked = 0usize;
+
+    for mode in &[InstallMode::Global, InstallMode::User] {
+        let cellar = match mode.cellar_path() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !cellar.exists() {
+            continue;
+        }
+
+        let prefix = match mode.prefix() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let opt_dir = prefix.join("opt");
+
+        let entries = match std::fs::read_dir(&cellar) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let opt_link = opt_dir.join(&name);
+
+            // Check if opt symlink exists and is valid
+            let needs_fix = if let Ok(meta) = std::fs::symlink_metadata(&opt_link) {
+                if meta.is_symlink() {
+                    // Symlink exists - check if target is valid
+                    std::fs::metadata(&opt_link).is_err()
+                } else {
+                    false
+                }
+            } else {
+                // opt symlink doesn't exist at all
+                true
+            };
+
+            if needs_fix {
+                missing_opt.push((name, entry.path(), *mode));
+            }
+        }
+    }
+
+    if missing_opt.is_empty() {
+        d.pass("all cellar packages have opt/ symlinks");
+    } else if d.fix {
+        d.warn(&format!(
+            "{} packages missing opt/ symlinks — relinking...",
+            missing_opt.len()
+        ));
+        for (name, pkg_dir, mode) in &missing_opt {
+            // Find the latest version directory
+            let versions: Vec<String> = match std::fs::read_dir(pkg_dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect(),
+                Err(_) => continue,
+            };
+            if versions.is_empty() {
+                continue;
+            }
+            let mut sorted = versions;
+            crate::version::sort_versions(&mut sorted);
+            let version = sorted.last().unwrap().clone();
+
+            let cellar = match mode.cellar_path() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            match create_symlinks(name, &version, &cellar, false, *mode).await {
+                Ok(_) => {
+                    relinked += 1;
+                    if relinked <= 10 {
+                        d.fixed(&format!("relinked {}@{}", name, version));
+                    }
+                }
+                Err(e) => {
+                    d.fail(&format!("failed to relink {}: {}", name, e));
+                }
+            }
+        }
+        if relinked > 10 {
+            d.fixed(&format!("... and {} more packages relinked", relinked - 10));
+        }
+    } else {
+        for (i, (name, _, _)) in missing_opt.iter().enumerate() {
+            if i < 5 {
+                d.fail(&format!("missing opt/ symlink: {}", style(name).magenta()));
+            }
+        }
+        if missing_opt.len() > 5 {
+            d.fail(&format!(
+                "... and {} more missing opt/ symlinks",
+                missing_opt.len() - 5
+            ));
+        }
+    }
 }
 
 async fn check_state_consistency(d: &mut DiagResult) {
