@@ -693,6 +693,18 @@ pub async fn install_extracted_bottle(
     crate::signal::set_current_op(format!("installing {}", name));
     let _critical = CriticalSection::new();
 
+    macro_rules! step {
+        ($s:expr, $msg:expr) => {
+            if let Some(ref s) = $s {
+                s.set_message(format!(
+                    "{} {}",
+                    style(name).magenta(),
+                    style($msg).dim()
+                ));
+            }
+        };
+    }
+
     let spinner = if !quiet {
         let s = ProgressBar::new_spinner();
         s.set_style(
@@ -702,7 +714,7 @@ pub async fn install_extracted_bottle(
                 .tick_chars(crate::ui::SPINNER_TICK_CHARS),
         );
         s.enable_steady_tick(std::time::Duration::from_millis(80));
-        s.set_message(format!("installing {}...", style(name).magenta()));
+        s.set_message(format!("{} {}", style(name).magenta(), style("resolving...").dim()));
         Some(s)
     } else {
         None
@@ -738,6 +750,7 @@ pub async fn install_extracted_bottle(
 
     let formula_cellar = cellar.join(name).join(&cellar_version);
     if formula_cellar.exists() {
+        step!(spinner, "cleaning old version...");
         tokio::fs::remove_dir_all(&formula_cellar)
             .await
             .or_else(|_| crate::sudo::sudo_remove(&formula_cellar).map(|_| ()))?;
@@ -746,6 +759,7 @@ pub async fn install_extracted_bottle(
         .await
         .or_else(|_| crate::sudo::sudo_mkdir(&formula_cellar))?;
 
+    step!(spinner, "copying to cellar...");
     let actual_content_dir = name_dir.join(&cellar_version);
     if actual_content_dir.exists() {
         copy_dir_all(&actual_content_dir, &formula_cellar)?;
@@ -755,6 +769,7 @@ pub async fn install_extracted_bottle(
         copy_dir_all(&extract_dir.to_path_buf(), &formula_cellar)?;
     }
 
+    step!(spinner, "relocating...");
     {
         let prefix = install_mode.prefix()?;
         let default_prefix = if cfg!(target_os = "macos") {
@@ -768,6 +783,7 @@ pub async fn install_extracted_bottle(
         )?;
     }
 
+    step!(spinner, "symlinking...");
     create_symlinks(name, &cellar_version, cellar, false, install_mode).await?;
 
     let package = InstalledPackage {
