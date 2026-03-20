@@ -6,12 +6,15 @@ use crate::commands::{install, uninstall};
 use crate::deps::find_installed_reverse_dependencies;
 use crate::error::{Result, WaxError};
 use crate::install::{InstallMode, InstallState};
-use crate::signal::{check_cancelled, CriticalSection};
-use crate::ui::{create_spinner, PROGRESS_BAR_CHARS};
+use crate::signal::{
+    check_cancelled, clear_active_multi, clear_current_op, set_active_multi, set_current_op,
+    CriticalSection,
+};
+use crate::ui::{PROGRESS_BAR_CHARS, SPINNER_TICK_CHARS};
 use crate::version::is_same_or_newer;
 use console::style;
-use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashSet;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::{HashMap, HashSet};
 use tracing::instrument;
 
 #[derive(Debug)]
@@ -21,6 +24,15 @@ pub struct OutdatedPackage {
     pub latest_version: String,
     pub is_cask: bool,
     pub install_mode: Option<InstallMode>,
+}
+
+struct UpgradeMultiGuard;
+
+impl Drop for UpgradeMultiGuard {
+    fn drop(&mut self) {
+        clear_current_op();
+        clear_active_multi();
+    }
 }
 
 #[instrument(skip(cache))]
@@ -61,8 +73,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
 
     if outdated.is_empty() {
         println!("all packages are up to date");
-        let elapsed = start.elapsed();
-        println!("\n[{}ms] done", elapsed.as_millis());
+        println!("\n[{}ms] done", start.elapsed().as_millis());
         return Ok(());
     }
 
@@ -85,10 +96,69 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
         return Ok(());
     }
 
+    // --- Pre-compute the full plan before touching anything ---
+    let outdated_names: HashSet<String> = outdated.iter().map(|p| p.name.clone()).collect();
+
+    let formulae = cache.load_all_formulae().await?;
+    let state = InstallState::new()?;
+    let installed_packages = state.load().await?;
+    let installed_names: HashSet<String> = installed_packages.keys().cloned().collect();
+    let install_modes: HashMap<String, InstallMode> = installed_packages
+        .iter()
+        .map(|(k, v)| (k.clone(), v.install_mode))
+        .collect();
+
+    // Collect all reverse-deps across every outdated formula, excluding packages
+    // that are themselves outdated (they'll be handled by their own upgrade slot).
+    let mut dependents_to_reinstall: Vec<String> = Vec::new();
+    for pkg in &outdated {
+        if pkg.is_cask {
+            continue;
+        }
+        let rev_deps =
+            find_installed_reverse_dependencies(&pkg.name, &formulae, &installed_names);
+        for dep in rev_deps {
+            if !outdated_names.contains(&dep) && !dependents_to_reinstall.contains(&dep) {
+                dependents_to_reinstall.push(dep);
+            }
+        }
+    }
+
     let total = outdated.len();
+    let dep_total = dependents_to_reinstall.len();
+
+    // Print plan summary
+    let names: Vec<String> = outdated
+        .iter()
+        .map(|p| {
+            if p.is_cask {
+                format!("{} (cask)", p.name)
+            } else {
+                p.name.clone()
+            }
+        })
+        .collect();
+    println!("upgrading {}\n", style(names.join(", ")).magenta());
+    if dep_total > 0 {
+        println!(
+            "  will reinstall {} dependent{} after: {}\n",
+            dep_total,
+            if dep_total == 1 { "" } else { "s" },
+            dependents_to_reinstall
+                .iter()
+                .map(|s| style(s).dim().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let multi = MultiProgress::new();
+    set_active_multi(multi.clone());
+    let _guard = UpgradeMultiGuard;
+
     let mut success_count = 0;
     let mut fail_count = 0;
-    let mut failed_names = Vec::new();
+    let mut failed_names: Vec<String> = Vec::new();
 
     for (i, pkg) in outdated.into_iter().enumerate() {
         check_cancelled()?;
@@ -96,7 +166,21 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
 
         let label = format!("({}/{}) {}", i + 1, total, pkg.name);
 
-        let spinner = create_spinner(&format!("removing {} ({}/{})", pkg.name, i + 1, total));
+        let spinner = multi.add(ProgressBar::new_spinner());
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars(SPINNER_TICK_CHARS),
+        );
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        set_current_op(format!("removing {}", pkg.name));
+        spinner.set_message(format!(
+            "{} removing {}...",
+            style(&label).dim(),
+            style(&pkg.name).magenta()
+        ));
+
         let uninstall_result = if pkg.is_cask {
             uninstall::uninstall_quiet(cache, &pkg.name, true).await
         } else {
@@ -106,7 +190,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
 
         let result = match uninstall_result {
             Ok(()) => {
-                let pb = ProgressBar::new(0);
+                let pb = multi.add(ProgressBar::new(0));
                 pb.set_style(
                     ProgressStyle::default_bar()
                         .template(&format!(
@@ -117,6 +201,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                         .progress_chars(PROGRESS_BAR_CHARS),
                 );
                 pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                set_current_op(format!("installing {}", pkg.name));
 
                 let install_result = if pkg.is_cask {
                     install::install_quiet_with_progress(
@@ -150,6 +235,8 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
             Err(e) => Err(e),
         };
 
+        clear_current_op();
+
         match result {
             Ok(()) => {
                 let cask_indicator = if pkg.is_cask {
@@ -157,36 +244,87 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                 } else {
                     String::new()
                 };
-                println!(
+                let _ = multi.println(format!(
                     "{} {}{} {} → {}",
                     style("✓").green(),
                     style(&pkg.name).magenta(),
                     cask_indicator,
                     style(&pkg.installed_version).dim(),
                     style(&pkg.latest_version).green()
-                );
+                ));
                 success_count += 1;
-
-                if !pkg.is_cask {
-                    if let Err(e) = reinstall_dependents(cache, &pkg.name).await {
-                        eprintln!(
-                            "{} failed to reinstall dependents of {}: {}",
-                            style("!").yellow(),
-                            style(&pkg.name).magenta(),
-                            e
-                        );
-                    }
-                }
             }
             Err(e) => {
                 fail_count += 1;
-                eprintln!(
+                let _ = multi.println(format!(
                     "{} {} failed: {}",
                     style("✗").red(),
                     style(&pkg.name).magenta(),
                     e
-                );
+                ));
                 failed_names.push(pkg.name.clone());
+            }
+        }
+    }
+
+    // Reinstall all affected dependents — each exactly once.
+    if !dependents_to_reinstall.is_empty() {
+        let _ = multi.println(format!(
+            "  {} reinstalling {} dependent{}",
+            style("→").cyan(),
+            dep_total,
+            if dep_total == 1 { "" } else { "s" },
+        ));
+
+        for dep_name in &dependents_to_reinstall {
+            check_cancelled()?;
+
+            let dep_mode = install_modes.get(dep_name).copied();
+            let (user_flag, global_flag) = match dep_mode {
+                Some(InstallMode::User) => (true, false),
+                Some(InstallMode::Global) => (false, true),
+                _ => (false, false),
+            };
+
+            let spinner = multi.add(ProgressBar::new_spinner());
+            spinner.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.cyan} {msg}")
+                    .unwrap()
+                    .tick_chars(SPINNER_TICK_CHARS),
+            );
+            spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+            set_current_op(format!("reinstalling {}", dep_name));
+            spinner.set_message(format!(
+                "  reinstalling {}...",
+                style(dep_name).magenta()
+            ));
+
+            let result = async {
+                uninstall::uninstall_quiet(cache, dep_name, false).await?;
+                install::install_quiet(cache, std::slice::from_ref(dep_name), false, user_flag, global_flag).await
+            }
+            .await;
+
+            spinner.finish_and_clear();
+            clear_current_op();
+
+            match result {
+                Ok(()) => {
+                    let _ = multi.println(format!(
+                        "  {} {} reinstalled",
+                        style("✓").green(),
+                        style(dep_name).magenta()
+                    ));
+                }
+                Err(e) => {
+                    let _ = multi.println(format!(
+                        "  {} {} reinstall failed: {}",
+                        style("✗").red(),
+                        style(dep_name).magenta(),
+                        e
+                    ));
+                }
             }
         }
     }
@@ -194,14 +332,14 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
     let elapsed = start.elapsed();
     if fail_count > 0 {
         println!(
-            "{} upgraded, {} failed [{}ms]",
+            "\n{} upgraded, {} failed [{}ms]",
             style(success_count).green(),
             style(fail_count).red(),
             elapsed.as_millis()
         );
     } else {
         println!(
-            "{} package{} upgraded [{}ms]",
+            "\n{} package{} upgraded [{}ms]",
             style(success_count).green(),
             if success_count == 1 { "" } else { "s" },
             elapsed.as_millis()
@@ -378,8 +516,6 @@ async fn reinstall_dependents(cache: &Cache, upgraded_package: &str) -> Result<(
     for dep_name in &reverse_deps {
         let dep_mode = installed_packages.get(dep_name).map(|p| p.install_mode);
 
-        let spinner = create_spinner(&format!("reinstalling {}", dep_name));
-
         let (user_flag, global_flag) = match dep_mode {
             Some(InstallMode::User) => (true, false),
             Some(InstallMode::Global) => (false, true),
@@ -398,8 +534,6 @@ async fn reinstall_dependents(cache: &Cache, upgraded_package: &str) -> Result<(
             .await
         }
         .await;
-
-        spinner.finish_and_clear();
 
         match result {
             Ok(()) => {

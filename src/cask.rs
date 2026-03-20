@@ -347,8 +347,9 @@ impl CaskInstaller {
         Self::check_platform_support()?;
         info!("Installing DMG: {:?}", dmg_path);
 
-        let mount_point = PathBuf::from("/Volumes").join(format!("wax-{}", uuid::Uuid::new_v4()));
-        tokio::fs::create_dir_all(&mount_point).await?;
+        // Use a temp dir as mountpoint — /Volumes is root-owned on modern macOS
+        let mount_dir = tempfile::tempdir()?;
+        let mount_point = mount_dir.path().to_path_buf();
 
         let attach_output = tokio::process::Command::new("hdiutil")
             .arg("attach")
@@ -393,8 +394,7 @@ impl CaskInstaller {
         }
 
         self.unmount_dmg(&mount_point).await?;
-
-        tokio::fs::remove_dir(&mount_point).await.ok();
+        // mount_dir (tempdir) is cleaned up automatically on drop
 
         info!("Successfully installed {}", app_name);
         Ok(())
@@ -403,11 +403,9 @@ impl CaskInstaller {
     async fn copy_app(&self, source: &Path, app_name: &str) -> Result<()> {
         let app_dest = Self::applications_dir()?.join(app_name);
 
+        // Remove existing app bundle before copying (upgrade path)
         if app_dest.exists() {
-            return Err(WaxError::InstallError(format!(
-                "{} already exists in Applications directory",
-                app_name
-            )));
+            tokio::fs::remove_dir_all(&app_dest).await?;
         }
 
         let cp_output = tokio::process::Command::new("cp")
@@ -674,17 +672,3 @@ pub fn detect_artifact_type_from_disposition(disposition: &str) -> Option<&'stat
     None
 }
 
-mod uuid {
-    pub struct Uuid;
-
-    impl Uuid {
-        pub fn new_v4() -> String {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            format!("{:x}", now)
-        }
-    }
-}
