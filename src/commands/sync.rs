@@ -45,7 +45,11 @@ pub async fn sync(cache: &Cache) -> Result<()> {
     for (name, lock_pkg) in &lockfile.packages {
         match installed_packages.get(name) {
             Some(installed) if installed.version != lock_pkg.version => {
-                upgrades.push((name.clone(), installed.version.clone(), lock_pkg.version.clone()));
+                upgrades.push((
+                    name.clone(),
+                    installed.version.clone(),
+                    lock_pkg.version.clone(),
+                ));
                 packages_to_install.push((name.clone(), lock_pkg.clone()));
             }
             Some(installed) if installed.platform != lock_pkg.bottle => {
@@ -273,7 +277,7 @@ pub async fn sync(cache: &Cache) -> Result<()> {
                 from_source: false,
                 bottle_rebuild: 0,
                 bottle_sha256: None,
-                    pinned: false,
+                pinned: false,
             };
             state.add(package).await?;
 
