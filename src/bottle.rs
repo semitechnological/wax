@@ -84,13 +84,14 @@ impl BottleDownloader {
                 (url.to_string(), 0, false)
             });
 
+        debug!("Download probe: size={} bytes, accepts_ranges={}, max_connections={}", total_size, accepts_ranges, max_connections);
         if accepts_ranges && total_size >= Self::MULTIPART_THRESHOLD && max_connections > 1 {
             match self
                 .download_multipart(&cdn_url, dest_path, total_size, progress, max_connections)
                 .await
             {
                 Ok(()) => return Ok(()),
-                Err(e) => debug!("Multipart failed ({}), falling back to single", e),
+                Err(e) => tracing::info!("Multipart failed ({}), falling back to single-connection", e),
             }
         }
 
@@ -112,7 +113,8 @@ impl BottleDownloader {
         let resp = req.send().await?;
 
         let final_url = resp.url().to_string();
-        let accepts_ranges = resp.status().as_u16() == 206
+        let status = resp.status().as_u16();
+        let accepts_ranges = status == 206
             || resp
                 .headers()
                 .get("accept-ranges")
@@ -130,6 +132,9 @@ impl BottleDownloader {
             .or_else(|| resp.content_length())
             .unwrap_or(0);
 
+        // Drain the tiny response body so the connection is properly returned to the pool.
+        let _ = resp.bytes().await;
+
         Ok((final_url, total_size, accepts_ranges))
     }
 
@@ -146,16 +151,31 @@ impl BottleDownloader {
 
         if let Some(pb) = progress {
             pb.set_length(total_size);
-            // Append "[Nx]" connection badge to whatever name the caller set.
+            // Append "[Nx]" badge to whichever field the caller used for the name.
+            // Formula bars use set_message ({msg}); cask bars use set_prefix ({prefix}).
             if n > 1 {
-                let current = pb.message().to_string();
-                pb.set_message(format!("{} [{}x]", current, n));
+                let msg = pb.message().to_string();
+                if !msg.is_empty() {
+                    pb.set_message(format!("{} [{}x]", msg, n));
+                }
+                let prefix = pb.prefix().to_string();
+                if !prefix.is_empty() {
+                    pb.set_prefix(format!("{} [{}x]", prefix, n));
+                }
             }
+        }
+
+        // Pre-allocate the file so every chunk task can seek to its own offset
+        // and write without holding the entire file in memory (aria2-style).
+        {
+            let f = std::fs::File::create(dest_path)?;
+            f.set_len(total_size)?;
         }
 
         let downloaded_so_far = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let client = self.client.clone();
         let url = url.to_string();
+        let dest_path_buf = dest_path.to_path_buf();
 
         let mut tasks = Vec::with_capacity(n);
         for i in 0..n {
@@ -165,9 +185,9 @@ impl BottleDownloader {
             let client = client.clone();
             let url = url.clone();
             let counter = Arc::clone(&downloaded_so_far);
+            let dest = dest_path_buf.clone();
 
             tasks.push(tokio::spawn(async move {
-                // CDN URL is pre-signed — no auth header needed.
                 let response = client
                     .get(&url)
                     .header("Range", format!("bytes={}-{}", start, end))
@@ -183,6 +203,8 @@ impl BottleDownloader {
                     )));
                 }
 
+                // Stream chunk bytes, counting progress, then write at the
+                // correct file offset in a blocking thread.
                 let mut data = Vec::with_capacity((end - start + 1) as usize);
                 let mut stream = response.bytes_stream();
                 use futures::StreamExt;
@@ -195,7 +217,18 @@ impl BottleDownloader {
                     data.extend_from_slice(&piece);
                 }
 
-                Ok::<(usize, Vec<u8>), WaxError>((i, data))
+                // Write directly to the correct byte offset — no in-memory assembly needed.
+                tokio::task::spawn_blocking(move || {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let mut f = std::fs::OpenOptions::new().write(true).open(&dest)?;
+                    f.seek(SeekFrom::Start(start))?;
+                    f.write_all(&data)?;
+                    Ok::<(), std::io::Error>(())
+                })
+                .await
+                .map_err(|e| WaxError::InstallError(format!("join error: {}", e)))??;
+
+                Ok::<(), WaxError>(())
             }));
         }
 
@@ -211,13 +244,18 @@ impl BottleDownloader {
             }
         });
 
-        let mut chunks: Vec<(usize, Vec<u8>)> = Vec::with_capacity(n);
         let mut err: Option<String> = None;
         for task in tasks {
             match task.await {
-                Ok(Ok(chunk)) => chunks.push(chunk),
-                Ok(Err(e)) => { err = Some(e.to_string()); break; }
-                Err(e) => { err = Some(e.to_string()); break; }
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    err = Some(e.to_string());
+                    break;
+                }
+                Err(e) => {
+                    err = Some(e.to_string());
+                    break;
+                }
             }
         }
         poll_handle.abort();
@@ -226,17 +264,10 @@ impl BottleDownloader {
             return Err(WaxError::InstallError(format!("Multipart download failed: {}", e)));
         }
 
-        chunks.sort_unstable_by_key(|(i, _)| *i);
-        let mut file = tokio::fs::File::create(dest_path).await?;
-        for (_, data) in chunks {
-            file.write_all(&data).await?;
-        }
-        file.flush().await?;
-
         if let Some(pb) = progress {
             pb.set_position(total_size);
         }
-        debug!("Multipart complete: {} connections, {} bytes", n, total_size);
+        tracing::info!("Multipart complete: {} connections, {} bytes", n, total_size);
         Ok(())
     }
 
