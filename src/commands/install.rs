@@ -458,7 +458,7 @@ async fn install_impl(
 
     let semaphore = Arc::new(Semaphore::new(8));
     let mut tasks = Vec::new();
-    let mut inline_extracted: Vec<(String, String, std::path::PathBuf, String)> = Vec::new();
+    let mut inline_extracted: Vec<(String, String, std::path::PathBuf, String, u32)> = Vec::new();
     let mut source_install_count = 0usize;
 
     let temp_dir = Arc::new(TempDir::new()?);
@@ -504,6 +504,7 @@ async fn install_impl(
         let sha256 = bottle_file.sha256.clone();
         let name = pkg.name.clone();
         let version = pkg.versions.stable.clone();
+        let rebuild = pkg.bottle_rebuild();
 
         if let Some(ext_pb) = external_pb {
             let tarball_path = temp_dir.path().join(format!("{}-{}.tar.gz", name, version));
@@ -517,7 +518,7 @@ async fn install_impl(
             let extract_dir = temp_dir.path().join(&name);
             BottleDownloader::extract(&tarball_path, &extract_dir)?;
 
-            inline_extracted.push((name, version, extract_dir, sha256));
+            inline_extracted.push((name, version, extract_dir, sha256, rebuild));
             continue;
         }
 
@@ -554,14 +555,14 @@ async fn install_impl(
             let extract_dir = temp_dir.path().join(&name);
             BottleDownloader::extract(&tarball_path, &extract_dir)?;
 
-            Ok::<_, WaxError>((name, version, extract_dir, sha256))
+            Ok::<_, WaxError>((name, version, extract_dir, sha256, rebuild))
         });
 
         tasks.push(task);
     }
 
     // Collect results; abort remaining tasks immediately on cancellation
-    let mut extracted_packages: Vec<(String, String, std::path::PathBuf, String)> = Vec::new();
+    let mut extracted_packages: Vec<(String, String, std::path::PathBuf, String, u32)> = Vec::new();
     let mut failed_packages = Vec::new();
     let mut cancelled = false;
 
@@ -611,86 +612,20 @@ async fn install_impl(
     if !quiet {
         println!();
     }
-    for (name, version, extract_dir, bottle_sha) in extracted_packages {
-        crate::signal::set_current_op(format!("installing {}", name));
-        let _critical = CriticalSection::new();
-        let formula_cellar = cellar.join(&name).join(&version);
-        if formula_cellar.exists() {
-            tokio::fs::remove_dir_all(&formula_cellar)
-                .await
-                .or_else(|_| crate::sudo::sudo_remove(&formula_cellar).map(|_| ()))?;
-        }
-        tokio::fs::create_dir_all(&formula_cellar)
-            .await
-            .or_else(|_| crate::sudo::sudo_mkdir(&formula_cellar))?;
-
-        let actual_content_dir = extract_dir.join(&name).join(&version);
-        if actual_content_dir.exists() {
-            copy_dir_all(&actual_content_dir, &formula_cellar)?;
-        } else {
-            let name_dir = extract_dir.join(&name);
-            if name_dir.exists() {
-                let mut found_version_dir = None;
-                if let Ok(mut entries) = std::fs::read_dir(&name_dir) {
-                    while let Some(Ok(entry)) = entries.next() {
-                        let entry_name = entry.file_name().to_string_lossy().to_string();
-                        if entry_name.starts_with(&version) && entry.path().is_dir() {
-                            found_version_dir = Some(entry.path());
-                            break;
-                        }
-                    }
-                }
-                if let Some(version_dir) = found_version_dir {
-                    copy_dir_all(&version_dir, &formula_cellar)?;
-                } else {
-                    copy_dir_all(&extract_dir, &formula_cellar)?;
-                }
-            } else {
-                copy_dir_all(&extract_dir, &formula_cellar)?;
-            }
-        }
-
-        {
-            let prefix = install_mode.prefix()?;
-            let default_prefix = if cfg!(target_os = "macos") {
-                "/opt/homebrew"
-            } else {
-                "/home/linuxbrew/.linuxbrew"
-            };
-            BottleDownloader::relocate_bottle(
-                &formula_cellar,
-                prefix.to_str().unwrap_or(default_prefix),
-            )?;
-        }
-
-        create_symlinks(
+    for (name, version, extract_dir, bottle_sha, bottle_rebuild) in extracted_packages {
+        install_extracted_bottle(
             &name,
             &version,
+            &extract_dir,
+            bottle_sha,
+            bottle_rebuild,
             &cellar,
-            false, /* dry_run */
             install_mode,
+            &platform,
+            &state,
+            quiet,
         )
         .await?;
-
-        let package = InstalledPackage {
-            name: name.clone(),
-            version: version.clone(),
-            platform: platform.clone(),
-            install_date: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
-            install_mode,
-            from_source: false,
-            bottle_rebuild: 0,
-            bottle_sha256: Some(bottle_sha),
-            pinned: false,
-        };
-        state.add(package).await?;
-
-        if !quiet {
-            println!("+ {}@{}", style(&name).magenta(), style(&version).dim());
-        }
     }
 
     let state_snapshot = state.load().await?;
@@ -743,6 +678,105 @@ async fn install_impl(
     Ok(())
 }
 
+pub async fn install_extracted_bottle(
+    name: &str,
+    version: &str,
+    extract_dir: &std::path::Path,
+    bottle_sha: String,
+    bottle_rebuild: u32,
+    cellar: &std::path::Path,
+    install_mode: InstallMode,
+    platform: &str,
+    state: &InstallState,
+    quiet: bool,
+) -> Result<()> {
+    crate::signal::set_current_op(format!("installing {}", name));
+    let _critical = CriticalSection::new();
+
+    // Detect the actual version directory from what's in the extracted bottle.
+    // Homebrew bottles embed {version}_{rebuild} paths, but the API's rebuild
+    // field can lag behind. Scanning the extracted dir gives us the ground truth.
+    let name_dir = extract_dir.join(name);
+    let cellar_version: String = if name_dir.exists() {
+        let mut found = None;
+        if let Ok(mut entries) = std::fs::read_dir(&name_dir) {
+            while let Some(Ok(entry)) = entries.next() {
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+                if entry_name.starts_with(version) && entry.path().is_dir() {
+                    found = Some(entry_name);
+                    break;
+                }
+            }
+        }
+        found.unwrap_or_else(|| {
+            if bottle_rebuild > 0 {
+                format!("{}_{}", version, bottle_rebuild)
+            } else {
+                version.to_string()
+            }
+        })
+    } else if bottle_rebuild > 0 {
+        format!("{}_{}", version, bottle_rebuild)
+    } else {
+        version.to_string()
+    };
+
+    let formula_cellar = cellar.join(name).join(&cellar_version);
+    if formula_cellar.exists() {
+        tokio::fs::remove_dir_all(&formula_cellar)
+            .await
+            .or_else(|_| crate::sudo::sudo_remove(&formula_cellar).map(|_| ()))?;
+    }
+    tokio::fs::create_dir_all(&formula_cellar)
+        .await
+        .or_else(|_| crate::sudo::sudo_mkdir(&formula_cellar))?;
+
+    let actual_content_dir = name_dir.join(&cellar_version);
+    if actual_content_dir.exists() {
+        copy_dir_all(&actual_content_dir, &formula_cellar)?;
+    } else if name_dir.exists() {
+        copy_dir_all(&name_dir, &formula_cellar)?;
+    } else {
+        copy_dir_all(&extract_dir.to_path_buf(), &formula_cellar)?;
+    }
+
+    {
+        let prefix = install_mode.prefix()?;
+        let default_prefix = if cfg!(target_os = "macos") {
+            "/opt/homebrew"
+        } else {
+            "/home/linuxbrew/.linuxbrew"
+        };
+        BottleDownloader::relocate_bottle(
+            &formula_cellar,
+            prefix.to_str().unwrap_or(default_prefix),
+        )?;
+    }
+
+    create_symlinks(name, &cellar_version, cellar, false, install_mode).await?;
+
+    let package = InstalledPackage {
+        name: name.to_string(),
+        version: cellar_version.clone(),
+        platform: platform.to_string(),
+        install_date: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+        install_mode,
+        from_source: false,
+        bottle_rebuild,
+        bottle_sha256: Some(bottle_sha),
+        pinned: false,
+    };
+    state.add(package).await?;
+
+    if !quiet {
+        println!("+ {}@{}", style(name).magenta(), style(version).dim());
+    }
+
+    Ok(())
+}
 
 fn extract_app_name(artifacts: &[crate::api::CaskArtifact]) -> Option<String> {
     use crate::api::CaskArtifact;

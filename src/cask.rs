@@ -315,6 +315,12 @@ impl CaskInstaller {
     }
 
     pub fn verify_checksum(path: &Path, expected_sha256: &str) -> Result<()> {
+        // Homebrew uses "no_check" to skip checksum verification
+        if expected_sha256 == "no_check" {
+            debug!("Skipping checksum verification (no_check) for {:?}", path);
+            return Ok(());
+        }
+
         debug!("Verifying checksum for {:?}", path);
 
         let mut file = std::fs::File::open(path)?;
