@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 use tar::Archive;
@@ -28,6 +28,17 @@ impl BottleDownloader {
         Self { client }
     }
 
+    // Minimum file size to bother splitting across multiple connections.
+    const MULTIPART_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB
+
+    fn num_connections(size: u64) -> usize {
+        match size {
+            s if s < 10 * 1024 * 1024 => 4,  // <10 MB → 4 connections
+            s if s < 50 * 1024 * 1024 => 6,  // <50 MB → 6 connections
+            _ => 8,                            // ≥50 MB → 8 connections
+        }
+    }
+
     #[instrument(skip(self, progress))]
     pub async fn download(
         &self,
@@ -35,31 +46,187 @@ impl BottleDownloader {
         dest_path: &Path,
         progress: Option<&ProgressBar>,
     ) -> Result<()> {
-        debug!("Downloading bottle from {}", url);
+        debug!("Downloading from {}", url);
 
-        let mut request = self.client.get(url);
+        // Fetch auth token once (GHCR only — needed for the first redirect).
+        let auth_token: Option<String> = if url.contains("ghcr.io") {
+            self.get_ghcr_token(url).await.ok()
+        } else {
+            None
+        };
 
-        if url.contains("ghcr.io") {
-            if let Ok(token) = self.get_ghcr_token(url).await {
-                request = request.header("Authorization", format!("Bearer {}", token));
+        // Probe with a tiny range request.  This also resolves any redirect chain
+        // (e.g. GHCR → Azure CDN pre-signed URL) and tells us the final URL and
+        // whether the server supports byte-range requests.
+        let (cdn_url, total_size, accepts_ranges) =
+            self.probe_url(url, &auth_token).await.unwrap_or_else(|_| {
+                (url.to_string(), 0, false)
+            });
+
+        if accepts_ranges && total_size >= Self::MULTIPART_THRESHOLD {
+            match self
+                .download_multipart(&cdn_url, dest_path, total_size, progress)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => debug!("Multipart failed ({}), falling back to single", e),
             }
         }
 
+        self.download_single(url, dest_path, &auth_token, total_size, progress)
+            .await
+    }
+
+    /// Makes a range probe (bytes=0-0) following all redirects to discover the
+    /// final CDN URL, total content length, and range support.
+    async fn probe_url(
+        &self,
+        url: &str,
+        auth_token: &Option<String>,
+    ) -> Result<(String, u64, bool)> {
+        let mut req = self.client.get(url).header("Range", "bytes=0-0");
+        if let Some(ref tok) = auth_token {
+            req = req.header("Authorization", format!("Bearer {}", tok));
+        }
+        let resp = req.send().await?;
+
+        let final_url = resp.url().to_string();
+        let accepts_ranges = resp.status().as_u16() == 206
+            || resp
+                .headers()
+                .get("accept-ranges")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == "bytes")
+                .unwrap_or(false);
+
+        // Content-Range: bytes 0-0/TOTAL → parse total
+        let total_size = resp
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split('/').next_back())
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| resp.content_length())
+            .unwrap_or(0);
+
+        Ok((final_url, total_size, accepts_ranges))
+    }
+
+    async fn download_multipart(
+        &self,
+        url: &str,
+        dest_path: &Path,
+        total_size: u64,
+        progress: Option<&ProgressBar>,
+    ) -> Result<()> {
+        let n = Self::num_connections(total_size);
+        let chunk_size = (total_size + n as u64 - 1) / n as u64;
+
+        if let Some(pb) = progress {
+            pb.set_length(total_size);
+        }
+
+        let downloaded_so_far = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client = self.client.clone();
+        let url = url.to_string();
+
+        let mut tasks = Vec::with_capacity(n);
+        for i in 0..n {
+            let start = i as u64 * chunk_size;
+            let end = (start + chunk_size - 1).min(total_size - 1);
+
+            let client = client.clone();
+            let url = url.clone();
+            let counter = Arc::clone(&downloaded_so_far);
+
+            tasks.push(tokio::spawn(async move {
+                // CDN URL is pre-signed — no auth header needed.
+                let response = client
+                    .get(&url)
+                    .header("Range", format!("bytes={}-{}", start, end))
+                    .send()
+                    .await
+                    .map_err(WaxError::from)?;
+
+                if response.status().as_u16() != 206 {
+                    return Err(WaxError::InstallError(format!(
+                        "Chunk {} got HTTP {} (not 206)",
+                        i,
+                        response.status()
+                    )));
+                }
+
+                let mut data = Vec::with_capacity((end - start + 1) as usize);
+                let mut stream = response.bytes_stream();
+                use futures::StreamExt;
+                while let Some(piece) = stream.next().await {
+                    if crate::signal::is_shutdown_requested() {
+                        return Err(WaxError::Interrupted);
+                    }
+                    let piece = piece.map_err(WaxError::from)?;
+                    counter.fetch_add(piece.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    data.extend_from_slice(&piece);
+                }
+
+                Ok::<(usize, Vec<u8>), WaxError>((i, data))
+            }));
+        }
+
+        // Update progress bar at ~50ms intervals while chunks download.
+        let counter_poll = Arc::clone(&downloaded_so_far);
+        let pb_poll = progress.cloned();
+        let poll_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if let Some(ref pb) = pb_poll {
+                    pb.set_position(counter_poll.load(std::sync::atomic::Ordering::Relaxed));
+                }
+            }
+        });
+
+        let mut chunks: Vec<(usize, Vec<u8>)> = Vec::with_capacity(n);
+        let mut err: Option<String> = None;
+        for task in tasks {
+            match task.await {
+                Ok(Ok(chunk)) => chunks.push(chunk),
+                Ok(Err(e)) => { err = Some(e.to_string()); break; }
+                Err(e) => { err = Some(e.to_string()); break; }
+            }
+        }
+        poll_handle.abort();
+
+        if let Some(e) = err {
+            return Err(WaxError::InstallError(format!("Multipart download failed: {}", e)));
+        }
+
+        chunks.sort_unstable_by_key(|(i, _)| *i);
+        let mut file = tokio::fs::File::create(dest_path).await?;
+        for (_, data) in chunks {
+            file.write_all(&data).await?;
+        }
+        file.flush().await?;
+
+        if let Some(pb) = progress {
+            pb.set_position(total_size);
+        }
+        debug!("Multipart complete: {} connections, {} bytes", n, total_size);
+        Ok(())
+    }
+
+    async fn download_single(
+        &self,
+        url: &str,
+        dest_path: &Path,
+        auth_token: &Option<String>,
+        content_length: u64,
+        progress: Option<&ProgressBar>,
+    ) -> Result<()> {
+        let mut request = self.client.get(url);
+        if let Some(ref tok) = auth_token {
+            request = request.header("Authorization", format!("Bearer {}", tok));
+        }
+
         let response = request.send().await?;
-
-        debug!(
-            "Download response: status={}, content-type={:?}, content-encoding={:?}",
-            response.status(),
-            response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            response
-                .headers()
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok()),
-        );
-
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -70,8 +237,7 @@ impl BottleDownloader {
             )));
         }
 
-        let total_size = response.content_length().unwrap_or(0);
-
+        let total_size = response.content_length().unwrap_or(content_length);
         if let Some(pb) = progress {
             pb.set_length(total_size);
         }
@@ -83,7 +249,6 @@ impl BottleDownloader {
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
             if crate::signal::is_shutdown_requested() {
-                // Drop the incomplete file before returning so temp dir is clean
                 drop(file);
                 let _ = tokio::fs::remove_file(dest_path).await;
                 return Err(crate::error::WaxError::Interrupted);
@@ -91,14 +256,13 @@ impl BottleDownloader {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
-
             if let Some(pb) = progress {
                 pb.set_position(downloaded);
             }
         }
 
         file.flush().await?;
-        debug!("Downloaded {} bytes to {:?}", downloaded, dest_path);
+        debug!("Single-connection download: {} bytes", downloaded);
         Ok(())
     }
 
