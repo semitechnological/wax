@@ -1,4 +1,4 @@
-use crate::bottle::BottleDownloader;
+use crate::bottle::{homebrew_prefix, BottleDownloader};
 use crate::error::{Result, WaxError};
 use crate::ui::dirs;
 use indicatif::ProgressBar;
@@ -24,39 +24,134 @@ pub struct InstalledCask {
 }
 
 pub struct CaskState {
-    state_path: PathBuf,
+    // Keep a path to legacy state for migration/fallback if needed, but primarily use Caskroom
+    legacy_state_path: PathBuf,
 }
 
 impl CaskState {
     pub fn new() -> Result<Self> {
-        let state_path = dirs::wax_dir()?.join("installed_casks.json");
-        Ok(Self { state_path })
+        let legacy_state_path = dirs::wax_dir()?.join("installed_casks.json");
+        Ok(Self { legacy_state_path })
+    }
+
+    pub fn caskroom_dir() -> PathBuf {
+        homebrew_prefix().join("Caskroom")
+    }
+
+    pub fn user_caskroom_dir() -> Result<PathBuf> {
+        Ok(dirs::home_dir()?.join(".local").join("wax").join("Caskroom"))
     }
 
     pub async fn load(&self) -> Result<HashMap<String, InstalledCask>> {
-        match fs::read_to_string(&self.state_path).await {
-            Ok(json) => {
-                let casks: HashMap<String, InstalledCask> = serde_json::from_str(&json)?;
-                Ok(casks)
+        let mut casks = HashMap::new();
+
+        // 1. Load from legacy state file (if any)
+        if self.legacy_state_path.exists() {
+            if let Ok(json) = fs::read_to_string(&self.legacy_state_path).await {
+                if let Ok(legacy_casks) = serde_json::from_str::<HashMap<String, InstalledCask>>(&json) {
+                    for (name, cask) in legacy_casks {
+                        casks.insert(name, cask);
+                    }
+                }
             }
-            Err(_) => Ok(HashMap::new()),
         }
+
+        // 2. Scan Homebrew Caskroom and User Caskroom
+        let mut caskrooms = vec![Self::caskroom_dir()];
+        if let Ok(user_dir) = Self::user_caskroom_dir() {
+            caskrooms.push(user_dir);
+        }
+
+        for caskroom in caskrooms {
+            if !caskroom.exists() {
+                continue;
+            }
+
+            if let Ok(mut entries) = tokio::fs::read_dir(&caskroom).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if let Ok(file_type) = entry.file_type().await {
+                        if file_type.is_dir() {
+                            let cask_name = entry.file_name().to_string_lossy().to_string();
+                            if cask_name.starts_with('.') {
+                                continue;
+                            }
+
+                            // Find version
+                            let mut version = "unknown".to_string();
+                            let mut install_date = 0;
+                            
+                            // Check for versions inside the cask directory
+                            if let Ok(mut ver_entries) = tokio::fs::read_dir(entry.path()).await {
+                                while let Ok(Some(ver_entry)) = ver_entries.next_entry().await {
+                                    let ver_name = ver_entry.file_name().to_string_lossy().to_string();
+                                    if !ver_name.starts_with('.') {
+                                        if let Ok(t) = ver_entry.file_type().await {
+                                            if t.is_dir() {
+                                                version = ver_name;
+                                                if let Ok(metadata) = ver_entry.metadata().await {
+                                                    if let Ok(modified) = metadata.modified() {
+                                                        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                                                            install_date = duration.as_secs() as i64;
+                                                        }
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Do not overwrite legacy metadata if we already have it for the same cask,
+                            // unless we want to update the version
+                            casks.entry(cask_name.clone()).or_insert_with(|| InstalledCask {
+                                name: cask_name.clone(),
+                                version,
+                                install_date,
+                                artifact_type: None,
+                                binary_paths: None,
+                                app_name: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(casks)
     }
 
     pub async fn save(&self, casks: &HashMap<String, InstalledCask>) -> Result<()> {
         let parent = self
-            .state_path
+            .legacy_state_path
             .parent()
             .ok_or_else(|| WaxError::CacheError("Cannot determine parent directory".into()))?;
         fs::create_dir_all(parent).await?;
 
         let json = serde_json::to_string_pretty(casks)?;
-        fs::write(&self.state_path, json).await?;
+        fs::write(&self.legacy_state_path, json).await?;
         Ok(())
     }
 
     pub async fn add(&self, cask: InstalledCask) -> Result<()> {
         let mut casks = self.load().await?;
+        
+        // Also create Caskroom structure
+        let caskroom = Self::caskroom_dir();
+        let cask_dir = caskroom.join(&cask.name);
+        let version_dir = cask_dir.join(&cask.version);
+        fs::create_dir_all(&version_dir).await?;
+
+        // Try to create symlinks inside version_dir based on app_name or binary_paths
+        if let Some(app_name) = &cask.app_name {
+            let app_path = PathBuf::from("/Applications").join(app_name);
+            let link_path = version_dir.join(app_name);
+            if app_path.exists() && !link_path.exists() {
+                #[cfg(unix)]
+                tokio::fs::symlink(&app_path, &link_path).await.ok();
+            }
+        }
+
         casks.insert(cask.name.clone(), cask);
         self.save(&casks).await?;
         Ok(())
@@ -64,6 +159,20 @@ impl CaskState {
 
     pub async fn remove(&self, name: &str) -> Result<()> {
         let mut casks = self.load().await?;
+        
+        let caskroom = Self::caskroom_dir();
+        let cask_dir = caskroom.join(name);
+        if cask_dir.exists() {
+            let _ = fs::remove_dir_all(&cask_dir).await;
+        }
+
+        if let Ok(user_dir) = Self::user_caskroom_dir() {
+            let user_cask_dir = user_dir.join(name);
+            if user_cask_dir.exists() {
+                let _ = fs::remove_dir_all(&user_cask_dir).await;
+            }
+        }
+
         casks.remove(name);
         self.save(&casks).await?;
         Ok(())
