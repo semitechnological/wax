@@ -693,6 +693,21 @@ pub async fn install_extracted_bottle(
     crate::signal::set_current_op(format!("installing {}", name));
     let _critical = CriticalSection::new();
 
+    let spinner = if !quiet {
+        let s = ProgressBar::new_spinner();
+        s.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars(crate::ui::SPINNER_TICK_CHARS),
+        );
+        s.enable_steady_tick(std::time::Duration::from_millis(80));
+        s.set_message(format!("installing {}...", style(name).magenta()));
+        Some(s)
+    } else {
+        None
+    };
+
     // Detect the actual version directory from what's in the extracted bottle.
     // Homebrew bottles embed {version}_{rebuild} paths, but the API's rebuild
     // field can lag behind. Scanning the extracted dir gives us the ground truth.
@@ -771,8 +786,11 @@ pub async fn install_extracted_bottle(
     };
     state.add(package).await?;
 
+    if let Some(s) = spinner {
+        s.finish_and_clear();
+    }
     if !quiet {
-        println!("+ {}@{}", style(name).magenta(), style(version).dim());
+        println!("+ {}@{}", style(name).magenta(), style(&cellar_version).dim());
     }
 
     Ok(())
