@@ -183,25 +183,62 @@ impl BottleDownloader {
                 )));
             }
 
-            match entry.header().entry_type() {
-                t if t.is_symlink() || t.is_hard_link() => {
-                    return Err(WaxError::InstallError(format!(
-                        "Tar entry contains unsupported link type: {}",
-                        path.display()
-                    )));
-                }
-                _ => {}
-            }
-
             let full_path = canonical_dest.join(&path);
 
-            if entry.header().entry_type().is_dir() {
-                std::fs::create_dir_all(&full_path)?;
-            } else {
-                if let Some(parent) = full_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+            match entry.header().entry_type() {
+                t if t.is_symlink() => {
+                    #[cfg(unix)]
+                    {
+                        let link_name = entry.link_name()?.ok_or_else(|| {
+                            WaxError::InstallError(format!(
+                                "Symlink entry has no link name: {}",
+                                path.display()
+                            ))
+                        })?;
+                        if let Some(parent) = full_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        if full_path.symlink_metadata().is_ok() {
+                            std::fs::remove_file(&full_path)?;
+                        }
+                        std::os::unix::fs::symlink(&*link_name, &full_path)?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Err(WaxError::InstallError(format!(
+                            "Symlinks not supported on this platform: {}",
+                            path.display()
+                        )));
+                    }
                 }
-                entry.unpack(&full_path)?;
+                t if t.is_hard_link() => {
+                    let link_name = entry.link_name()?.ok_or_else(|| {
+                        WaxError::InstallError(format!(
+                            "Hard link entry has no link name: {}",
+                            path.display()
+                        ))
+                    })?;
+                    let link_target = canonical_dest.join(&*link_name);
+                    if !link_target.starts_with(&canonical_dest) {
+                        return Err(WaxError::InstallError(format!(
+                            "Hard link target escapes destination: {}",
+                            link_name.display()
+                        )));
+                    }
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::hard_link(&link_target, &full_path)?;
+                }
+                _ if entry.header().entry_type().is_dir() => {
+                    std::fs::create_dir_all(&full_path)?;
+                }
+                _ => {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    entry.unpack(&full_path)?;
+                }
             }
         }
 

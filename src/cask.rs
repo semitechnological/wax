@@ -262,6 +262,47 @@ impl CaskInstaller {
         }
     }
 
+    /// Probe a URL via HEAD request to detect artifact type from response headers.
+    /// Falls back to GET if HEAD is not supported. Returns None if type cannot be determined.
+    pub async fn probe_artifact_type(&self, url: &str) -> Option<&'static str> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .ok()?;
+
+        let response = client.head(url).send().await.ok()?;
+        let final_url = response.url().to_string();
+
+        // Check final URL after redirects
+        if let Some(t) = detect_artifact_type(&final_url) {
+            return Some(t);
+        }
+
+        // Check Content-Disposition header
+        if let Some(disposition) = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(t) = detect_artifact_type_from_disposition(disposition) {
+                return Some(t);
+            }
+        }
+
+        // Check Content-Type header
+        if let Some(ct) = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(t) = detect_artifact_type_from_content_type(ct) {
+                return Some(t);
+            }
+        }
+
+        None
+    }
+
     #[instrument(skip(self, progress))]
     pub async fn download_cask(
         &self,
@@ -483,6 +524,44 @@ impl CaskInstaller {
         Ok(())
     }
 
+    fn find_binary_recursive<'a>(
+        dir: &'a std::path::Path,
+        binary_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PathBuf>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut entries = match tokio::fs::read_dir(dir).await {
+                Ok(e) => e,
+                Err(_) => return None,
+            };
+            let mut fallback_executable: Option<PathBuf> = None;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    if let Some(found) =
+                        Self::find_binary_recursive(&path, binary_name).await
+                    {
+                        return Some(found);
+                    }
+                } else if metadata.is_file() {
+                    if path.file_name().and_then(|s| s.to_str()) == Some(binary_name) {
+                        return Some(path);
+                    }
+                    #[cfg(unix)]
+                    if fallback_executable.is_none() {
+                        use std::os::unix::fs::PermissionsExt;
+                        if metadata.permissions().mode() & 0o111 != 0 {
+                            fallback_executable = Some(path);
+                        }
+                    }
+                }
+            }
+            fallback_executable
+        })
+    }
+
     #[instrument(skip(self))]
     pub async fn install_tarball(&self, tarball_path: &Path, binary_name: &str) -> Result<PathBuf> {
         info!("Installing tarball: {:?}", tarball_path);
@@ -506,30 +585,7 @@ impl CaskInstaller {
 
         let bin_dest = Self::detect_writable_bin_dir().await?;
 
-        let mut found_binary = None;
-        let mut entries = tokio::fs::read_dir(temp_dir.path()).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let metadata = tokio::fs::metadata(&path).await?;
-
-            if metadata.is_file() && path.file_name().and_then(|s| s.to_str()) == Some(binary_name)
-            {
-                found_binary = Some(path);
-                break;
-            }
-
-            if metadata.is_file() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = metadata.permissions();
-                    if perms.mode() & 0o111 != 0 {
-                        found_binary = Some(path);
-                        break;
-                    }
-                }
-            }
-        }
+        let found_binary = Self::find_binary_recursive(temp_dir.path(), binary_name).await;
 
         let binary_source = found_binary.ok_or_else(|| {
             WaxError::InstallError("Could not find executable binary in tarball".to_string())
@@ -586,6 +642,36 @@ pub fn detect_artifact_type(url: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+pub fn detect_artifact_type_from_content_type(content_type: &str) -> Option<&'static str> {
+    let ct = content_type.split(';').next().unwrap_or(content_type).trim();
+    match ct {
+        "application/x-apple-diskimage" | "application/octet-stream" => None, // ambiguous
+        "application/zip" | "application/x-zip-compressed" => Some("zip"),
+        "application/x-tar" | "application/gzip" | "application/x-gzip" => Some("tar.gz"),
+        "application/x-pkg" | "application/vnd.apple.installer+xml" => Some("pkg"),
+        _ => None,
+    }
+}
+
+pub fn detect_artifact_type_from_disposition(disposition: &str) -> Option<&'static str> {
+    // Look for filename= in Content-Disposition header
+    for part in disposition.split(';') {
+        let part = part.trim();
+        let value = if let Some(v) = part.strip_prefix("filename*=") {
+            // RFC 5987 encoded, e.g. UTF-8''Raycast-1.0.dmg
+            v.splitn(3, '\'').nth(2).unwrap_or(v).to_string()
+        } else if let Some(v) = part.strip_prefix("filename=") {
+            v.trim_matches('"').to_string()
+        } else {
+            continue;
+        };
+        if let Some(t) = detect_artifact_type(&value) {
+            return Some(t);
+        }
+    }
+    None
 }
 
 mod uuid {

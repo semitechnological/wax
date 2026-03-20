@@ -768,9 +768,20 @@ async fn install_cask(cache: &Cache, cask_name: &str, dry_run: bool) -> Result<(
         return Ok(());
     }
 
-    let artifact_type = detect_artifact_type(&cask.url).ok_or_else(|| {
-        WaxError::InstallError(format!("Unsupported artifact type for URL: {}", cask.url))
-    })?;
+    let installer = CaskInstaller::new();
+    let artifact_type = if let Some(t) = detect_artifact_type(&cask.url) {
+        t
+    } else {
+        installer
+            .probe_artifact_type(&cask.url)
+            .await
+            .ok_or_else(|| {
+                WaxError::InstallError(format!(
+                    "Unsupported artifact type for URL: {}",
+                    cask.url
+                ))
+            })?
+    };
 
     let temp_dir = TempDir::new()?;
     let download_path = temp_dir
@@ -785,7 +796,6 @@ async fn install_cask(cache: &Cache, cask_name: &str, dry_run: bool) -> Result<(
     pb.set_style(pb_style);
     pb.set_prefix(display_name.to_string());
 
-    let installer = CaskInstaller::new();
     installer
         .download_cask(&cask.url, &download_path, Some(&pb))
         .await?;
