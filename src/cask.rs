@@ -303,7 +303,7 @@ impl StagingContext {
                     .unwrap_or_else(|| download_path.file_name().unwrap().to_str().unwrap());
 
                 let decoded_filename = urlencoding::decode(original_filename)
-                    .unwrap_or_else(|_| std::borrow::Cow::Borrowed(original_filename));
+                    .unwrap_or(std::borrow::Cow::Borrowed(original_filename));
 
                 let dest = staging_root.join(decoded_filename.as_ref());
                 tokio::fs::copy(download_path, &dest).await?;

@@ -766,6 +766,7 @@ async fn install_impl(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn install_extracted_bottle(
     name: &str,
     version: &str,
@@ -1384,18 +1385,16 @@ async fn install_from_downloaded(
                         installer.install_completion(&staging, &mut rollback, source, "fish", &cask.token).await?;
                     }
                 }
-                CaskArtifact::Preflight { preflight } => {
-                    if let Some(script) = preflight {
-                        step!("skipping preflight script (not supported yet)");
-                        debug!("Preflight script: {}", script);
-                    }
+                CaskArtifact::Preflight { preflight: Some(script) } => {
+                    step!("skipping preflight script (not supported yet)");
+                    debug!("Preflight script: {}", script);
                 }
-                CaskArtifact::Postflight { postflight } => {
-                    if let Some(script) = postflight {
-                        step!("skipping postflight script (not supported yet)");
-                        debug!("Postflight script: {}", script);
-                    }
+                CaskArtifact::Preflight { preflight: None } => {}
+                CaskArtifact::Postflight { postflight: Some(script) } => {
+                    step!("skipping postflight script (not supported yet)");
+                    debug!("Postflight script: {}", script);
                 }
+                CaskArtifact::Postflight { postflight: None } => {}
                 _ => {}
             }
         }

@@ -147,7 +147,7 @@ impl BottleDownloader {
         max_connections: usize,
     ) -> Result<()> {
         let n = Self::num_connections(total_size, max_connections);
-        let chunk_size = (total_size + n as u64 - 1) / n as u64;
+        let chunk_size = total_size.div_ceil(n as u64);
 
         if let Some(pb) = progress {
             pb.set_length(total_size);
