@@ -216,7 +216,7 @@ impl RollbackContext {
 impl Drop for RollbackContext {
     fn drop(&mut self) {
         if !self.committed && !self.installed_paths.is_empty() {
-            debug!("Rolling back installation: removing partially installed artifacts");
+            println!("  ⚠️  rolling back {} partially installed artifact(s)...", self.installed_paths.len());
             for path in &self.installed_paths {
                 if path.exists() {
                     if path.is_dir() {
@@ -605,7 +605,7 @@ impl CaskInstaller {
         rollback: &mut RollbackContext,
         source_rel: &str,
         target_name: Option<&str>,
-    ) -> Result<PathBuf> {
+    ) -> Result<Option<PathBuf>> {
         Self::check_platform_support()?;
         let source = self.resolve_source_path(staging, source_rel);
         let name = target_name.unwrap_or_else(|| {
@@ -618,10 +618,8 @@ impl CaskInstaller {
         info!("Installing binary: {} from {:?}", name, source);
 
         if !source.exists() {
-            return Err(WaxError::InstallError(format!(
-                "Binary source does not exist: {:?}",
-                source
-            )));
+            println!("  ⚠️  skipping binary: source not found (possibly requires preflight script)");
+            return Ok(None);
         }
 
         let bin_dest_dir = Self::detect_writable_bin_dir().await?;
@@ -645,7 +643,7 @@ impl CaskInstaller {
 
         info!("Successfully installed {} to {}", name, bin_dest_dir.display());
 
-        Ok(binary_dest_path)
+        Ok(Some(binary_dest_path))
     }
 
     #[instrument(skip(self, staging, rollback))]

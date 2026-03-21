@@ -1245,8 +1245,9 @@ async fn install_from_downloaded(
                             None
                         };
                         step!(format!("installing binary: {}", source));
-                        let path = installer.install_binary(&staging, &mut rollback, source, target).await?;
-                        binary_paths.push(path.display().to_string());
+                        if let Some(path) = installer.install_binary(&staging, &mut rollback, source, target).await? {
+                            binary_paths.push(path.display().to_string());
+                        }
                     }
                 }
                 CaskArtifact::Font { font } => {
