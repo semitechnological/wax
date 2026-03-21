@@ -1211,7 +1211,7 @@ async fn install_from_downloaded(
     }
 
     step!("staging...");
-    let staging = StagingContext::new(download_path, artifact_type).await?;
+    let staging = StagingContext::new(download_path, artifact_type, &cask.url).await?;
     let mut rollback = RollbackContext::new();
 
     let mut binary_paths: Vec<String> = Vec::new();

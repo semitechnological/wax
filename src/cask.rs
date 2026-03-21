@@ -231,7 +231,7 @@ impl Drop for RollbackContext {
 }
 
 impl StagingContext {
-    pub async fn new(download_path: &Path, artifact_type: &str) -> Result<Self> {
+    pub async fn new(download_path: &Path, artifact_type: &str, url: &str) -> Result<Self> {
         let temp_dir = tempfile::tempdir()?;
         let staging_root = temp_dir.path().to_path_buf();
         let mut mount_point = None;
@@ -293,12 +293,19 @@ impl StagingContext {
                 }
             }
             _ => {
-                // For "pkg" or "binary", copy the file to the staging root to be consistent
-                let dest = staging_root.join(
-                    download_path
-                        .file_name()
-                        .ok_or_else(|| WaxError::InstallError("Invalid download path".into()))?,
-                );
+                // For "pkg" or "binary", copy the file to the staging root, attempting to use its original name
+                let original_filename = url
+                    .split('?')
+                    .next()
+                    .unwrap_or(url)
+                    .split('/')
+                    .next_back()
+                    .unwrap_or_else(|| download_path.file_name().unwrap().to_str().unwrap());
+
+                let decoded_filename = urlencoding::decode(original_filename)
+                    .unwrap_or_else(|_| std::borrow::Cow::Borrowed(original_filename));
+
+                let dest = staging_root.join(decoded_filename.as_ref());
                 tokio::fs::copy(download_path, &dest).await?;
             }
         }
@@ -643,7 +650,7 @@ impl CaskInstaller {
         let bin_dest_dir = Self::detect_writable_bin_dir().await?;
         let binary_dest_path = bin_dest_dir.join(name);
 
-        if binary_dest_path.exists() {
+        if tokio::fs::symlink_metadata(&binary_dest_path).await.is_ok() {
             tokio::fs::remove_file(&binary_dest_path).await.ok();
         }
 
