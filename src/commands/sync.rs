@@ -70,7 +70,11 @@ pub async fn sync(cache: &Cache) -> Result<()> {
     for (name, lock_cask) in &lockfile.casks {
         match installed_casks.get(name) {
             Some(installed) if installed.version != lock_cask.version => {
-                cask_upgrades.push((name.clone(), installed.version.clone(), lock_cask.version.clone()));
+                cask_upgrades.push((
+                    name.clone(),
+                    installed.version.clone(),
+                    lock_cask.version.clone(),
+                ));
                 casks_to_install.push(name.clone());
             }
             Some(_) => {
@@ -175,14 +179,19 @@ pub async fn sync(cache: &Cache) -> Result<()> {
                 .bottle
                 .as_ref()
                 .and_then(|b| b.stable.as_ref())
-                .ok_or_else(|| WaxError::BottleNotAvailable(format!("{} (no bottle info)", name)))?;
+                .ok_or_else(|| {
+                    WaxError::BottleNotAvailable(format!("{} (no bottle info)", name))
+                })?;
 
             let bottle_file = bottle_info
                 .files
                 .get(&lock_pkg.bottle)
                 .or_else(|| bottle_info.files.get("all"))
                 .ok_or_else(|| {
-                    WaxError::BottleNotAvailable(format!("{} for platform {}", name, lock_pkg.bottle))
+                    WaxError::BottleNotAvailable(format!(
+                        "{} for platform {}",
+                        name, lock_pkg.bottle
+                    ))
                 })?;
 
             let url = bottle_file.url.clone();
@@ -211,7 +220,9 @@ pub async fn sync(cache: &Cache) -> Result<()> {
                     .path()
                     .join(format!("{}-{}.tar.gz", name_clone, version));
 
-                downloader.download(&url, &tarball_path, Some(&pb), conns).await?;
+                downloader
+                    .download(&url, &tarball_path, Some(&pb), conns)
+                    .await?;
                 pb.finish_and_clear();
 
                 BottleDownloader::verify_checksum(&tarball_path, &sha256)?;
@@ -295,10 +306,11 @@ pub async fn sync(cache: &Cache) -> Result<()> {
         crate::commands::install::install_quiet(
             cache,
             &casks_to_install,
-            true, // cask
+            true,  // cask
             false, // user
             false, // global
-        ).await?;
+        )
+        .await?;
     }
 
     let elapsed = start.elapsed();

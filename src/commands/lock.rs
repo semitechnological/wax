@@ -29,11 +29,7 @@ pub async fn lock() -> Result<()> {
             "packages"
         },
         cask_count,
-        if cask_count == 1 {
-            "cask"
-        } else {
-            "casks"
-        }
+        if cask_count == 1 { "cask" } else { "casks" }
     );
 
     Ok(())

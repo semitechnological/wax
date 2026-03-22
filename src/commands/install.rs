@@ -1,4 +1,4 @@
-use crate::api::{Formula, CaskArtifact};
+use crate::api::{CaskArtifact, Formula};
 use crate::bottle::{detect_platform, BottleDownloader};
 use crate::builder::Builder;
 use crate::cache::Cache;
@@ -493,22 +493,33 @@ async fn install_impl(
         }
 
         let total_size: u64 = sizes.values().sum();
+        let pool = BottleDownloader::GLOBAL_CONNECTION_POOL;
         let n = bottle_urls.len().max(1);
-        sizes
+        let mut allocs: Vec<(String, usize, f64)> = sizes
             .iter()
             .map(|(name, &size)| {
-                let conns = if total_size == 0 {
-                    (BottleDownloader::GLOBAL_CONNECTION_POOL / n).max(1)
+                if total_size == 0 {
+                    let base = pool / n;
+                    (name.clone(), base.max(1), 0.0)
                 } else {
-                    let proportional = (BottleDownloader::GLOBAL_CONNECTION_POOL as f64
-                        * size as f64
-                        / total_size as f64)
-                        .round() as usize;
-                    proportional.max(1)
-                };
-                (name.clone(), conns)
+                    let exact = pool as f64 * size as f64 / total_size as f64;
+                    let base = (exact.floor() as usize).max(1);
+                    (name.clone(), base, exact - base as f64)
+                }
             })
-            .collect()
+            .collect();
+        // Distribute remaining connections by largest fractional part
+        let used: usize = allocs.iter().map(|(_, c, _)| *c).sum();
+        let mut remaining = pool.saturating_sub(used);
+        allocs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        for (_, c, _) in allocs.iter_mut() {
+            if remaining == 0 {
+                break;
+            }
+            *c += 1;
+            remaining -= 1;
+        }
+        allocs.into_iter().map(|(name, c, _)| (name, c)).collect()
     };
 
     let semaphore = Arc::new(Semaphore::new(CONCURRENT_LIMIT));
@@ -629,7 +640,9 @@ async fn install_impl(
 
             let tarball_path = temp_dir.path().join(format!("{}-{}.tar.gz", name, version));
 
-            downloader.download(&url, &tarball_path, Some(&pb), conns).await?;
+            downloader
+                .download(&url, &tarball_path, Some(&pb), conns)
+                .await?;
             pb.finish_and_clear();
 
             BottleDownloader::verify_checksum(&tarball_path, &sha256)?;
@@ -777,7 +790,7 @@ pub async fn install_extracted_bottle(
     platform: &str,
     state: &InstallState,
     quiet: bool,
-    _multi: Option<&MultiProgress>,
+    multi: Option<&MultiProgress>,
     existing_pb: Option<ProgressBar>,
 ) -> Result<()> {
     crate::signal::set_current_op(format!("installing {}", name));
@@ -795,7 +808,12 @@ pub async fn install_extracted_bottle(
                     pb.set_message(format!("{} {}", style(name).magenta(), style($msg).dim()));
                     pb.tick();
                 } else {
-                    println!("  {} {}", style(name).magenta(), style($msg).dim());
+                    let line = format!("  {} {}", style(name).magenta(), style($msg).dim());
+                    if let Some(ref m) = multi {
+                        let _ = m.println(&line);
+                    } else {
+                        println!("{}", line);
+                    }
                 }
             }
         };
@@ -869,14 +887,14 @@ pub async fn install_extracted_bottle(
     create_symlinks(name, &cellar_version, cellar, false, install_mode).await?;
 
     if let Some(_formula) = state.load().await?.get(name) {
-         // Auto-run postinstall if possible
-         if let Ok(formulae) = state.load_formulae_from_cache().await {
-             if let Some(f) = formulae.iter().find(|f| f.name == name) {
-                 if f.post_install_defined {
-                     let _ = postinstall_impl(name, install_mode, true).await;
-                 }
-             }
-         }
+        // Auto-run postinstall if possible
+        if let Ok(formulae) = state.load_formulae_from_cache().await {
+            if let Some(f) = formulae.iter().find(|f| f.name == name) {
+                if f.post_install_defined {
+                    let _ = postinstall_impl(name, install_mode, true).await;
+                }
+            }
+        }
     }
 
     let package = InstalledPackage {
@@ -896,7 +914,11 @@ pub async fn install_extracted_bottle(
     state.add(package).await?;
 
     if !quiet && existing_pb.is_none() {
-        println!("+ {}@{}", style(name).magenta(), style(&cellar_version).dim());
+        println!(
+            "+ {}@{}",
+            style(name).magenta(),
+            style(&cellar_version).dim()
+        );
     }
 
     Ok(())
@@ -1150,27 +1172,29 @@ pub async fn postinstall(
     Ok(())
 }
 
-async fn postinstall_impl(
-    name: &str,
-    _install_mode: InstallMode,
-    quiet: bool,
-) -> Result<()> {
+async fn postinstall_impl(name: &str, _install_mode: InstallMode, quiet: bool) -> Result<()> {
     if !quiet {
-        println!("  {} {}", style(name).magenta(), style("running postinstall...").dim());
+        println!(
+            "  {} {}",
+            style(name).magenta(),
+            style("running postinstall...").dim()
+        );
     }
 
     // Try to run Homebrew's postinstall if brew is installed
-    let brew_path = match tokio::process::Command::new("which").arg("brew").output().await {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+    let brew_path = match tokio::process::Command::new("which")
+        .arg("brew")
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     };
 
     if !brew_path.is_empty() {
         let mut cmd = tokio::process::Command::new(&brew_path);
         cmd.arg("postinstall").arg(name);
-        
+
         // We might need to set HOMEBREW_PREFIX or similar if wax's prefix is different
         // but for now let's assume standard prefix
         match cmd.status().await {
@@ -1202,11 +1226,7 @@ async fn install_from_downloaded(
     // Step feedback printed directly so it always shows regardless of any parent progress context.
     macro_rules! step {
         ($msg:expr) => {
-            println!(
-                "  {} {}",
-                style(&cask.token).magenta(),
-                style($msg).dim()
-            );
+            println!("  {} {}", style(&cask.token).magenta(), style($msg).dim());
         };
     }
 
@@ -1223,14 +1243,18 @@ async fn install_from_downloaded(
                 CaskArtifact::App { app } => {
                     if let Some(source) = app.first().and_then(|v| v.as_str()) {
                         step!(format!("installing app: {}", source));
-                        installer.install_app(&staging, &mut rollback, source).await?;
+                        installer
+                            .install_app(&staging, &mut rollback, source)
+                            .await?;
                         installed_app_name = Some(source.to_string());
                     }
                 }
                 CaskArtifact::Pkg { pkg } => {
                     if let Some(source) = pkg.first().and_then(|v| v.as_str()) {
                         step!(format!("installing pkg: {}", source));
-                        installer.install_pkg(&staging, &mut rollback, source).await?;
+                        installer
+                            .install_pkg(&staging, &mut rollback, source)
+                            .await?;
                     }
                 }
                 CaskArtifact::Binary { binary } => {
@@ -1245,7 +1269,16 @@ async fn install_from_downloaded(
                             None
                         };
                         step!(format!("installing binary: {}", source));
-                        if let Some(path) = installer.install_binary(&staging, &mut rollback, source, target, Some(&cask.token)).await? {
+                        if let Some(path) = installer
+                            .install_binary(
+                                &staging,
+                                &mut rollback,
+                                source,
+                                target,
+                                Some(&cask.token),
+                            )
+                            .await?
+                        {
                             binary_paths.push(path.display().to_string());
                         }
                     }
@@ -1253,13 +1286,17 @@ async fn install_from_downloaded(
                 CaskArtifact::Font { font } => {
                     if let Some(source) = font.first().and_then(|v| v.as_str()) {
                         step!(format!("installing font: {}", source));
-                        installer.install_font(&staging, &mut rollback, source).await?;
+                        installer
+                            .install_font(&staging, &mut rollback, source)
+                            .await?;
                     }
                 }
                 CaskArtifact::Manpage { manpage } => {
                     if let Some(source) = manpage.first().and_then(|v| v.as_str()) {
                         step!(format!("installing manpage: {}", source));
-                        installer.install_manpage(&staging, &mut rollback, source).await?;
+                        installer
+                            .install_manpage(&staging, &mut rollback, source)
+                            .await?;
                     }
                 }
                 CaskArtifact::Artifact { artifact } => {
@@ -1272,7 +1309,9 @@ async fn install_from_downloaded(
                             .and_then(|v| v.as_str()),
                     ) {
                         step!(format!("installing artifact: {} to {}", source, target));
-                        installer.install_artifact(&staging, &mut rollback, source, target).await?;
+                        installer
+                            .install_artifact(&staging, &mut rollback, source, target)
+                            .await?;
                     }
                 }
                 CaskArtifact::Dictionary { dictionary } => {
@@ -1369,19 +1408,37 @@ async fn install_from_downloaded(
                 CaskArtifact::BashCompletion { bash_completion } => {
                     if let Some(source) = bash_completion.first().and_then(|v| v.as_str()) {
                         step!(format!("installing bash completion: {}", source));
-                        installer.install_completion(&staging, &mut rollback, source, "bash", &cask.token).await?;
+                        installer
+                            .install_completion(
+                                &staging,
+                                &mut rollback,
+                                source,
+                                "bash",
+                                &cask.token,
+                            )
+                            .await?;
                     }
                 }
                 CaskArtifact::ZshCompletion { zsh_completion } => {
                     if let Some(source) = zsh_completion.first().and_then(|v| v.as_str()) {
                         step!(format!("installing zsh completion: {}", source));
-                        installer.install_completion(&staging, &mut rollback, source, "zsh", &cask.token).await?;
+                        installer
+                            .install_completion(&staging, &mut rollback, source, "zsh", &cask.token)
+                            .await?;
                     }
                 }
                 CaskArtifact::FishCompletion { fish_completion } => {
                     if let Some(source) = fish_completion.first().and_then(|v| v.as_str()) {
                         step!(format!("installing fish completion: {}", source));
-                        installer.install_completion(&staging, &mut rollback, source, "fish", &cask.token).await?;
+                        installer
+                            .install_completion(
+                                &staging,
+                                &mut rollback,
+                                source,
+                                "fish",
+                                &cask.token,
+                            )
+                            .await?;
                     }
                 }
                 CaskArtifact::Preflight { preflight } => {
@@ -1408,7 +1465,9 @@ async fn install_from_downloaded(
                 if path.extension().and_then(|s| s.to_str()) == Some("app") {
                     let app_name = path.file_name().unwrap().to_str().unwrap();
                     step!(format!("installing guessed app: {}", app_name));
-                    installer.install_app(&staging, &mut rollback, app_name).await?;
+                    installer
+                        .install_app(&staging, &mut rollback, app_name)
+                        .await?;
                     installed_app_name = Some(app_name.to_string());
                     break;
                 }

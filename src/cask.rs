@@ -39,7 +39,10 @@ impl CaskState {
     }
 
     pub fn user_caskroom_dir() -> Result<PathBuf> {
-        Ok(dirs::home_dir()?.join(".local").join("wax").join("Caskroom"))
+        Ok(dirs::home_dir()?
+            .join(".local")
+            .join("wax")
+            .join("Caskroom"))
     }
 
     pub async fn load(&self) -> Result<HashMap<String, InstalledCask>> {
@@ -48,7 +51,9 @@ impl CaskState {
         // 1. Load from legacy state file (if any)
         if self.legacy_state_path.exists() {
             if let Ok(json) = fs::read_to_string(&self.legacy_state_path).await {
-                if let Ok(legacy_casks) = serde_json::from_str::<HashMap<String, InstalledCask>>(&json) {
+                if let Ok(legacy_casks) =
+                    serde_json::from_str::<HashMap<String, InstalledCask>>(&json)
+                {
                     casks.extend(legacy_casks);
                 }
             }
@@ -80,14 +85,16 @@ impl CaskState {
                 // Find version and install date
                 let (version, install_date) = self.scan_cask_version_dir(&entry.path()).await?;
 
-                casks.entry(cask_name.clone()).or_insert_with(|| InstalledCask {
-                    name: cask_name,
-                    version,
-                    install_date,
-                    artifact_type: None,
-                    binary_paths: None,
-                    app_name: None,
-                });
+                casks
+                    .entry(cask_name.clone())
+                    .or_insert_with(|| InstalledCask {
+                        name: cask_name,
+                        version,
+                        install_date,
+                        artifact_type: None,
+                        binary_paths: None,
+                        app_name: None,
+                    });
             }
         }
 
@@ -135,7 +142,7 @@ impl CaskState {
 
     pub async fn add(&self, cask: InstalledCask) -> Result<()> {
         let mut casks = self.load().await?;
-        
+
         // Also create Caskroom structure
         let caskroom = Self::caskroom_dir();
         let cask_dir = caskroom.join(&cask.name);
@@ -148,7 +155,14 @@ impl CaskState {
             let link_path = version_dir.join(app_name);
             if app_path.exists() && !link_path.exists() {
                 #[cfg(unix)]
-                tokio::fs::symlink(&app_path, &link_path).await.ok();
+                if let Err(e) = tokio::fs::symlink(&app_path, &link_path).await {
+                    tracing::warn!(
+                        "Failed to create Caskroom symlink {:?} -> {:?}: {}",
+                        link_path,
+                        app_path,
+                        e
+                    );
+                }
             }
         }
 
@@ -159,7 +173,7 @@ impl CaskState {
 
     pub async fn remove(&self, name: &str) -> Result<()> {
         let mut casks = self.load().await?;
-        
+
         let caskroom = Self::caskroom_dir();
         let cask_dir = caskroom.join(name);
         if cask_dir.exists() {
@@ -216,7 +230,10 @@ impl RollbackContext {
 impl Drop for RollbackContext {
     fn drop(&mut self) {
         if !self.committed && !self.installed_paths.is_empty() {
-            println!("  ⚠️  rolling back {} partially installed artifact(s)...", self.installed_paths.len());
+            println!(
+                "  ⚠️  rolling back {} partially installed artifact(s)...",
+                self.installed_paths.len()
+            );
             for path in &self.installed_paths {
                 if path.exists() {
                     if path.is_dir() {
@@ -300,7 +317,12 @@ impl StagingContext {
                     .unwrap_or(url)
                     .split('/')
                     .next_back()
-                    .unwrap_or_else(|| download_path.file_name().unwrap().to_str().unwrap());
+                    .unwrap_or_else(|| {
+                        download_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("download")
+                    });
 
                 let decoded_filename = urlencoding::decode(original_filename)
                     .unwrap_or_else(|_| std::borrow::Cow::Borrowed(original_filename));
@@ -406,37 +428,63 @@ impl CaskInstaller {
     }
 
     fn resolve_source_path(&self, staging: &StagingContext, source_rel: &str) -> PathBuf {
-        let prefix = crate::bottle::homebrew_prefix().to_string_lossy().to_string();
+        let prefix = crate::bottle::homebrew_prefix()
+            .to_string_lossy()
+            .to_string();
+        let staging_str = staging.staging_root.to_str().unwrap_or("");
         let path = source_rel
             .replace("$HOMEBREW_PREFIX", &prefix)
             .replace("#{HOMEBREW_PREFIX}", &prefix)
-            .replace("$APPDIR", staging.staging_root.to_str().unwrap_or(""));
+            .replace("$APPDIR", staging_str);
 
         let p = Path::new(&path);
-        if p.is_absolute() {
+        let resolved = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            staging.staging_root.join(path)
-        }
-    }
+            staging.staging_root.join(&path)
+        };
 
-    fn _is_in_path(dir: &Path) -> bool {
-        if let Ok(path_env) = std::env::var("PATH") {
-            path_env.split(':').any(|p| Path::new(p) == dir)
-        } else {
-            false
+        // Reject path traversal attempts (e.g. "../../etc/passwd")
+        if resolved
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            tracing::warn!(
+                "Rejecting source path with traversal: {} (resolved: {:?})",
+                source_rel,
+                resolved
+            );
+            return staging.staging_root.join(
+                Path::new(source_rel)
+                    .file_name()
+                    .unwrap_or(std::ffi::OsStr::new("unknown")),
+            );
         }
+
+        resolved
     }
 
     /// Probe a URL via HEAD request to detect artifact type from response headers.
-    /// Falls back to GET if HEAD is not supported. Returns None if type cannot be determined.
+    /// Falls back to a ranged GET if HEAD is not supported (e.g. 405).
+    /// Returns None if type cannot be determined.
     pub async fn probe_artifact_type(&self, url: &str) -> Option<&'static str> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .ok()?;
 
-        let response = client.head(url).send().await.ok()?;
+        let response = match client.head(url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => {
+                // HEAD rejected — fall back to a tiny ranged GET.
+                client
+                    .get(url)
+                    .header(reqwest::header::RANGE, "bytes=0-0")
+                    .send()
+                    .await
+                    .ok()?
+            }
+        };
         let final_url = response.url().to_string();
 
         // Check final URL after redirects
@@ -478,7 +526,12 @@ impl CaskInstaller {
     ) -> Result<()> {
         debug!("Downloading cask from {}", url);
         self.downloader
-            .download(url, dest_path, progress, BottleDownloader::GLOBAL_CONNECTION_POOL)
+            .download(
+                url,
+                dest_path,
+                progress,
+                BottleDownloader::GLOBAL_CONNECTION_POOL,
+            )
             .await
     }
 
@@ -627,15 +680,25 @@ impl CaskInstaller {
 
         if !source.exists() {
             if let Some(cask) = cask_name {
-                debug!("Binary missing, attempting to fetch and extract preflight shimscript for {}", cask);
-                if let Ok(ruby_content) = crate::formula_parser::FormulaParser::fetch_cask_rb(cask).await {
-                    if let Some(script_content) = crate::formula_parser::FormulaParser::extract_shimscript(&ruby_content) {
+                debug!(
+                    "Binary missing, attempting to fetch and extract preflight shimscript for {}",
+                    cask
+                );
+                if let Ok(ruby_content) =
+                    crate::formula_parser::FormulaParser::fetch_cask_rb(cask).await
+                {
+                    if let Some(script_content) =
+                        crate::formula_parser::FormulaParser::extract_shimscript(&ruby_content)
+                    {
                         // Write the script to the expected source location
                         if let Some(parent) = source.parent() {
                             tokio::fs::create_dir_all(parent).await.ok();
                         }
                         if tokio::fs::write(&source, script_content).await.is_ok() {
-                            println!("  {} generated wrapper script via preflight", console::style("✓").green());
+                            println!(
+                                "  {} generated wrapper script via preflight",
+                                console::style("✓").green()
+                            );
                         }
                     }
                 }
@@ -643,7 +706,9 @@ impl CaskInstaller {
         }
 
         if !source.exists() {
-            println!("  ⚠️  skipping binary: source not found (possibly requires preflight script)");
+            println!(
+                "  ⚠️  skipping binary: source not found (possibly requires preflight script)"
+            );
             return Ok(None);
         }
 
@@ -666,7 +731,11 @@ impl CaskInstaller {
             tokio::fs::set_permissions(&binary_dest_path, perms).await?;
         }
 
-        info!("Successfully installed {} to {}", name, bin_dest_dir.display());
+        info!(
+            "Successfully installed {} to {}",
+            name,
+            bin_dest_dir.display()
+        );
 
         Ok(Some(binary_dest_path))
     }
@@ -683,7 +752,9 @@ impl CaskInstaller {
         let font_name = Path::new(source_rel)
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| WaxError::InstallError(format!("Invalid font source: {}", source_rel)))?;
+            .ok_or_else(|| {
+                WaxError::InstallError(format!("Invalid font source: {}", source_rel))
+            })?;
 
         let user_fonts = dirs::home_dir()?.join("Library/Fonts");
         tokio::fs::create_dir_all(&user_fonts).await?;
@@ -796,7 +867,12 @@ impl CaskInstaller {
         let dest = dest_parent.join(name);
 
         if dest.exists() {
-            tokio::fs::remove_dir_all(&dest).await?;
+            let meta = tokio::fs::symlink_metadata(&dest).await?;
+            if meta.is_dir() {
+                tokio::fs::remove_dir_all(&dest).await?;
+            } else {
+                tokio::fs::remove_file(&dest).await?;
+            }
         }
 
         rollback.add(dest.clone());
@@ -829,7 +905,7 @@ impl CaskInstaller {
         token: &str,
     ) -> Result<()> {
         Self::check_platform_support()?;
-        
+
         let source = self.resolve_source_path(staging, source_rel);
 
         if !source.exists() {
@@ -842,7 +918,12 @@ impl CaskInstaller {
             "bash" => prefix.join("etc/bash_completion.d"),
             "zsh" => prefix.join("share/zsh/site-functions"),
             "fish" => prefix.join("share/fish/vendor_completions.d"),
-            _ => return Err(WaxError::InstallError(format!("Unsupported shell: {}", shell))),
+            _ => {
+                return Err(WaxError::InstallError(format!(
+                    "Unsupported shell: {}",
+                    shell
+                )))
+            }
         };
 
         tokio::fs::create_dir_all(&dest_dir).await?;
@@ -850,7 +931,7 @@ impl CaskInstaller {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(token);
-        
+
         let dest = dest_dir.join(filename);
 
         if dest.exists() {
@@ -885,7 +966,13 @@ pub fn detect_artifact_type(url: &str) -> Option<&'static str> {
         Some("pkg")
     } else if path.ends_with(".zip") {
         Some("zip")
-    } else if path.ends_with(".tar.gz") || path.ends_with(".tgz") || path.ends_with(".tar.bz2") || path.ends_with(".tbz") || path.ends_with(".tar.xz") || path.ends_with(".txz") {
+    } else if path.ends_with(".tar.gz")
+        || path.ends_with(".tgz")
+        || path.ends_with(".tar.bz2")
+        || path.ends_with(".tbz")
+        || path.ends_with(".tar.xz")
+        || path.ends_with(".txz")
+    {
         Some("tar.gz")
     } else {
         None
@@ -893,7 +980,11 @@ pub fn detect_artifact_type(url: &str) -> Option<&'static str> {
 }
 
 pub fn detect_artifact_type_from_content_type(content_type: &str) -> Option<&'static str> {
-    let ct = content_type.split(';').next().unwrap_or(content_type).trim();
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
     match ct {
         "application/x-apple-diskimage" => Some("dmg"),
         "application/octet-stream" => Some("binary"),
@@ -933,14 +1024,16 @@ mod tests {
         let installer = CaskInstaller::new();
         let temp = tempdir().unwrap();
         let staging_root = temp.path().to_path_buf();
-        
+
         let staging = StagingContext {
             staging_root: staging_root.clone(),
             mount_point: None,
             _temp_dir: temp,
         };
 
-        let prefix = crate::bottle::homebrew_prefix().to_string_lossy().to_string();
+        let prefix = crate::bottle::homebrew_prefix()
+            .to_string_lossy()
+            .to_string();
 
         // Test $HOMEBREW_PREFIX
         let res = installer.resolve_source_path(&staging, "$HOMEBREW_PREFIX/bin/foo");
