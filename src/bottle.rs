@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 use tar::Archive;
@@ -28,38 +28,296 @@ impl BottleDownloader {
         Self { client }
     }
 
+    // Minimum file size to bother splitting across multiple connections.
+    const MULTIPART_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB
+
+    /// Global connection pool shared across all concurrent downloads.
+    pub const GLOBAL_CONNECTION_POOL: usize = 16;
+
+    /// Probe a URL to get its download size. Used before starting downloads to
+    /// allocate connections proportionally across packages by file size.
+    pub async fn probe_size(&self, url: &str) -> u64 {
+        let auth_token: Option<String> = if url.contains("ghcr.io") {
+            self.get_ghcr_token(url).await.ok()
+        } else {
+            None
+        };
+        self.probe_url(url, &auth_token)
+            .await
+            .map(|(_, size, _)| size)
+            .unwrap_or(0)
+    }
+
+    /// Returns how many connections to use for a file of the given size,
+    /// capped by `max_connections` (the caller's share of the global pool).
+    fn num_connections(size: u64, max_connections: usize) -> usize {
+        let ideal = match size {
+            s if s < 10 * 1024 * 1024 => 4, // <10 MB → up to 4
+            s if s < 50 * 1024 * 1024 => 6, // <50 MB → up to 6
+            _ => 8,                         // ≥50 MB → up to 8
+        };
+        ideal.min(max_connections).max(1)
+    }
+
     #[instrument(skip(self, progress))]
     pub async fn download(
         &self,
         url: &str,
         dest_path: &Path,
         progress: Option<&ProgressBar>,
+        max_connections: usize,
     ) -> Result<()> {
-        debug!("Downloading bottle from {}", url);
+        debug!("Downloading from {}", url);
 
-        let mut request = self.client.get(url);
+        // Fetch auth token once (GHCR only — needed for the first redirect).
+        let auth_token: Option<String> = if url.contains("ghcr.io") {
+            self.get_ghcr_token(url).await.ok()
+        } else {
+            None
+        };
 
-        if url.contains("ghcr.io") {
-            if let Ok(token) = self.get_ghcr_token(url).await {
-                request = request.header("Authorization", format!("Bearer {}", token));
+        // Probe with a tiny range request.  This also resolves any redirect chain
+        // (e.g. GHCR → Azure CDN pre-signed URL) and tells us the final URL and
+        // whether the server supports byte-range requests.
+        let (cdn_url, total_size, accepts_ranges) = self
+            .probe_url(url, &auth_token)
+            .await
+            .unwrap_or_else(|_| (url.to_string(), 0, false));
+
+        debug!(
+            "Download probe: size={} bytes, accepts_ranges={}, max_connections={}",
+            total_size, accepts_ranges, max_connections
+        );
+        if accepts_ranges && total_size >= Self::MULTIPART_THRESHOLD && max_connections > 1 {
+            match self
+                .download_multipart(&cdn_url, dest_path, total_size, progress, max_connections)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => tracing::info!(
+                    "Multipart failed ({}), falling back to single-connection",
+                    e
+                ),
             }
         }
 
-        let response = request.send().await?;
+        self.download_single(url, dest_path, &auth_token, total_size, progress)
+            .await
+    }
 
-        debug!(
-            "Download response: status={}, content-type={:?}, content-encoding={:?}",
-            response.status(),
-            response
+    /// Makes a HEAD probe following all redirects to discover the final CDN URL,
+    /// total content length, and range support.  Falls back to a range-GET
+    /// (bytes=0-0) if the HEAD request fails (e.g. 405 Method Not Allowed).
+    async fn probe_url(
+        &self,
+        url: &str,
+        auth_token: &Option<String>,
+    ) -> Result<(String, u64, bool)> {
+        // Try HEAD first — cheap and avoids downloading any body.
+        let mut head_req = self.client.head(url);
+        if let Some(ref tok) = auth_token {
+            head_req = head_req.header("Authorization", format!("Bearer {}", tok));
+        }
+
+        let resp = match head_req.send().await {
+            Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
+            _ => {
+                // HEAD rejected or failed — fall back to a tiny range GET.
+                let mut get_req = self.client.get(url).header("Range", "bytes=0-0");
+                if let Some(ref tok) = auth_token {
+                    get_req = get_req.header("Authorization", format!("Bearer {}", tok));
+                }
+                let r = get_req.send().await?;
+                // If the server ignored the Range header and returned the full
+                // body (200 instead of 206), abort early to avoid downloading
+                // the entire file during a probe.
+                if r.status().as_u16() == 200 {
+                    let final_url = r.url().to_string();
+                    let size = r.content_length().unwrap_or(0);
+                    drop(r);
+                    return Ok((final_url, size, false));
+                }
+                r
+            }
+        };
+
+        let final_url = resp.url().to_string();
+        let status = resp.status().as_u16();
+        let accepts_ranges = status == 206
+            || resp
                 .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            response
-                .headers()
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok()),
+                .get("accept-ranges")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == "bytes")
+                .unwrap_or(false);
+
+        // Content-Range: bytes 0-0/TOTAL → parse total
+        let total_size = resp
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split('/').next_back())
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| resp.content_length())
+            .unwrap_or(0);
+
+        Ok((final_url, total_size, accepts_ranges))
+    }
+
+    async fn download_multipart(
+        &self,
+        url: &str,
+        dest_path: &Path,
+        total_size: u64,
+        progress: Option<&ProgressBar>,
+        max_connections: usize,
+    ) -> Result<()> {
+        let n = Self::num_connections(total_size, max_connections);
+        let chunk_size = (total_size + n as u64 - 1) / n as u64;
+
+        if let Some(pb) = progress {
+            pb.set_length(total_size);
+            // Append "[Nx]" badge to whichever field the caller used for the name.
+            // Formula bars use set_message ({msg}); cask bars use set_prefix ({prefix}).
+            if n > 1 {
+                let msg = pb.message().to_string();
+                if !msg.is_empty() {
+                    pb.set_message(format!("{} [{}x]", msg, n));
+                }
+                let prefix = pb.prefix().to_string();
+                if !prefix.is_empty() {
+                    pb.set_prefix(format!("{} [{}x]", prefix, n));
+                }
+            }
+        }
+
+        // Pre-allocate the file so every chunk task can seek to its own offset
+        // and write without holding the entire file in memory (aria2-style).
+        {
+            let f = std::fs::File::create(dest_path)?;
+            f.set_len(total_size)?;
+        }
+
+        let downloaded_so_far = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client = self.client.clone();
+        let url = url.to_string();
+        let dest_path_buf = dest_path.to_path_buf();
+
+        let mut tasks = Vec::with_capacity(n);
+        for i in 0..n {
+            let start = i as u64 * chunk_size;
+            let end = (start + chunk_size - 1).min(total_size - 1);
+
+            let client = client.clone();
+            let url = url.clone();
+            let counter = Arc::clone(&downloaded_so_far);
+            let dest = dest_path_buf.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let response = client
+                    .get(&url)
+                    .header("Range", format!("bytes={}-{}", start, end))
+                    .send()
+                    .await
+                    .map_err(WaxError::from)?;
+
+                if response.status().as_u16() != 206 {
+                    return Err(WaxError::InstallError(format!(
+                        "Chunk {} got HTTP {} (not 206)",
+                        i,
+                        response.status()
+                    )));
+                }
+
+                // Stream chunk bytes, counting progress, then write at the
+                // correct file offset in a blocking thread.
+                let mut data = Vec::with_capacity((end - start + 1) as usize);
+                let mut stream = response.bytes_stream();
+                use futures::StreamExt;
+                while let Some(piece) = stream.next().await {
+                    if crate::signal::is_shutdown_requested() {
+                        return Err(WaxError::Interrupted);
+                    }
+                    let piece = piece.map_err(WaxError::from)?;
+                    counter.fetch_add(piece.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    data.extend_from_slice(&piece);
+                }
+
+                // Write directly to the correct byte offset — no in-memory assembly needed.
+                tokio::task::spawn_blocking(move || {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let mut f = std::fs::OpenOptions::new().write(true).open(&dest)?;
+                    f.seek(SeekFrom::Start(start))?;
+                    f.write_all(&data)?;
+                    Ok::<(), std::io::Error>(())
+                })
+                .await
+                .map_err(|e| WaxError::InstallError(format!("join error: {}", e)))??;
+
+                Ok::<(), WaxError>(())
+            }));
+        }
+
+        // Update progress bar at ~150ms intervals — smoother display, less jitter.
+        let counter_poll = Arc::clone(&downloaded_so_far);
+        let pb_poll = progress.cloned();
+        let poll_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                if let Some(ref pb) = pb_poll {
+                    pb.set_position(counter_poll.load(std::sync::atomic::Ordering::Relaxed));
+                }
+            }
+        });
+
+        let mut err: Option<String> = None;
+        for task in tasks {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    err = Some(e.to_string());
+                    break;
+                }
+                Err(e) => {
+                    err = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        poll_handle.abort();
+
+        if let Some(e) = err {
+            return Err(WaxError::InstallError(format!(
+                "Multipart download failed: {}",
+                e
+            )));
+        }
+
+        if let Some(pb) = progress {
+            pb.set_position(total_size);
+        }
+        tracing::info!(
+            "Multipart complete: {} connections, {} bytes",
+            n,
+            total_size
         );
+        Ok(())
+    }
 
+    async fn download_single(
+        &self,
+        url: &str,
+        dest_path: &Path,
+        auth_token: &Option<String>,
+        content_length: u64,
+        progress: Option<&ProgressBar>,
+    ) -> Result<()> {
+        let mut request = self.client.get(url);
+        if let Some(ref tok) = auth_token {
+            request = request.header("Authorization", format!("Bearer {}", tok));
+        }
+
+        let response = request.send().await?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -70,8 +328,7 @@ impl BottleDownloader {
             )));
         }
 
-        let total_size = response.content_length().unwrap_or(0);
-
+        let total_size = response.content_length().unwrap_or(content_length);
         if let Some(pb) = progress {
             pb.set_length(total_size);
         }
@@ -83,7 +340,6 @@ impl BottleDownloader {
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
             if crate::signal::is_shutdown_requested() {
-                // Drop the incomplete file before returning so temp dir is clean
                 drop(file);
                 let _ = tokio::fs::remove_file(dest_path).await;
                 return Err(crate::error::WaxError::Interrupted);
@@ -91,14 +347,13 @@ impl BottleDownloader {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
-
             if let Some(pb) = progress {
                 pb.set_position(downloaded);
             }
         }
 
         file.flush().await?;
-        debug!("Downloaded {} bytes to {:?}", downloaded, dest_path);
+        debug!("Single-connection download: {} bytes", downloaded);
         Ok(())
     }
 
@@ -183,17 +438,92 @@ impl BottleDownloader {
                 )));
             }
 
-            match entry.header().entry_type() {
-                t if t.is_symlink() || t.is_hard_link() => {
-                    return Err(WaxError::InstallError(format!(
-                        "Tar entry contains unsupported link type: {}",
-                        path.display()
-                    )));
-                }
-                _ => {}
-            }
+            let full_path = canonical_dest.join(&path);
 
-            entry.unpack_in(&canonical_dest)?;
+            match entry.header().entry_type() {
+                t if t.is_symlink() => {
+                    #[cfg(unix)]
+                    {
+                        let link_name = entry.link_name()?.ok_or_else(|| {
+                            WaxError::InstallError(format!(
+                                "Symlink entry has no link name: {}",
+                                path.display()
+                            ))
+                        })?;
+                        // Validate symlink target: reject absolute paths and
+                        // parent-dir traversals that could escape the dest.
+                        let target = Path::new(&*link_name);
+                        if target.is_absolute() {
+                            return Err(WaxError::InstallError(format!(
+                                "Symlink target is absolute (path traversal): {}",
+                                link_name.display()
+                            )));
+                        }
+                        // Resolve the symlink target relative to the entry's
+                        // parent and ensure it stays within canonical_dest.
+                        if let Some(parent) = full_path.parent() {
+                            let resolved = parent.join(&*link_name);
+                            // Normalize away ".." components manually
+                            let mut normalized = PathBuf::new();
+                            for component in resolved.components() {
+                                match component {
+                                    std::path::Component::ParentDir => {
+                                        normalized.pop();
+                                    }
+                                    _ => normalized.push(component),
+                                }
+                            }
+                            if !normalized.starts_with(&canonical_dest) {
+                                return Err(WaxError::InstallError(format!(
+                                    "Symlink target escapes destination: {} -> {}",
+                                    path.display(),
+                                    link_name.display()
+                                )));
+                            }
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        if full_path.symlink_metadata().is_ok() {
+                            std::fs::remove_file(&full_path)?;
+                        }
+                        std::os::unix::fs::symlink(&*link_name, &full_path)?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Err(WaxError::InstallError(format!(
+                            "Symlinks not supported on this platform: {}",
+                            path.display()
+                        )));
+                    }
+                }
+                t if t.is_hard_link() => {
+                    let link_name = entry.link_name()?.ok_or_else(|| {
+                        WaxError::InstallError(format!(
+                            "Hard link entry has no link name: {}",
+                            path.display()
+                        ))
+                    })?;
+                    let link_target = canonical_dest.join(&*link_name);
+                    if !link_target.starts_with(&canonical_dest) {
+                        return Err(WaxError::InstallError(format!(
+                            "Hard link target escapes destination: {}",
+                            link_name.display()
+                        )));
+                    }
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::hard_link(&link_target, &full_path)?;
+                }
+                _ if entry.header().entry_type().is_dir() => {
+                    std::fs::create_dir_all(&full_path)?;
+                }
+                _ => {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    entry.unpack(&full_path)?;
+                }
+            }
         }
 
         debug!("Extraction complete");

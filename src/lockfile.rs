@@ -1,3 +1,4 @@
+use crate::cask::CaskState;
 use crate::error::{Result, WaxError};
 use crate::install::InstallState;
 use serde::{Deserialize, Serialize};
@@ -12,15 +13,24 @@ pub struct LockfilePackage {
     pub bottle: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockfileCask {
+    pub version: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Lockfile {
+    #[serde(default)]
     pub packages: HashMap<String, LockfilePackage>,
+    #[serde(default)]
+    pub casks: HashMap<String, LockfileCask>,
 }
 
 impl Lockfile {
     pub fn new() -> Self {
         Self {
             packages: HashMap::new(),
+            casks: HashMap::new(),
         }
     }
 
@@ -42,7 +52,20 @@ impl Lockfile {
             );
         }
 
-        Ok(Self { packages })
+        let cask_state = CaskState::new()?;
+        let installed_casks = cask_state.load().await?;
+
+        let mut casks = HashMap::new();
+        for (name, pkg) in installed_casks {
+            casks.insert(
+                name,
+                LockfileCask {
+                    version: pkg.version,
+                },
+            );
+        }
+
+        Ok(Self { packages, casks })
     }
 
     #[instrument(skip(self))]
@@ -76,7 +99,11 @@ impl Lockfile {
         let lockfile: Lockfile = toml::from_str(&contents)
             .map_err(|e| WaxError::LockfileError(format!("Failed to parse lockfile: {}", e)))?;
 
-        debug!("Loaded {} packages from lockfile", lockfile.packages.len());
+        debug!(
+            "Loaded {} packages and {} casks from lockfile",
+            lockfile.packages.len(),
+            lockfile.casks.len()
+        );
         Ok(lockfile)
     }
 

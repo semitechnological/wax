@@ -208,6 +208,14 @@ async fn uninstall_package_direct(
     let install_mode = package.install_mode;
     let cellar = install_mode.cellar_path()?;
 
+    if let Some(ref pb) = spinner {
+        pb.set_message(format!(
+            "{}removing {} {}",
+            prefix,
+            style(formula_name).magenta(),
+            style("unlinking...").dim()
+        ));
+    }
     remove_symlinks(
         formula_name,
         &package.version,
@@ -217,6 +225,14 @@ async fn uninstall_package_direct(
     )
     .await?;
 
+    if let Some(ref pb) = spinner {
+        pb.set_message(format!(
+            "{}removing {} {}",
+            prefix,
+            style(formula_name).magenta(),
+            style("deleting files...").dim()
+        ));
+    }
     let formula_dir = cellar.join(formula_name);
     if formula_dir.exists() {
         tokio::fs::remove_dir_all(&formula_dir).await?;
@@ -268,7 +284,7 @@ async fn uninstall_cask(
     let artifact_type = cask.artifact_type.as_deref().unwrap_or("dmg");
 
     match artifact_type {
-        "tar.gz" => {
+        "tar.gz" | "binary" => {
             if let Some(binary_paths) = &cask.binary_paths {
                 for binary_path in binary_paths {
                     let path = std::path::PathBuf::from(binary_path);

@@ -22,11 +22,12 @@ use clap_complete::Shell;
 use error::Result;
 use tracing::Level;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
+use version::WAX_VERSION;
 
 #[derive(Parser)]
 #[command(name = "wax")]
-#[command(about = "Fast Homebrew-compatible package manager", long_about = None)]
-#[command(version)]
+#[command(version = WAX_VERSION)]
+#[command(about = format!("wax v{} - the fast homebrew-compat package manager", WAX_VERSION), long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -132,6 +133,16 @@ enum Commands {
         cask: bool,
         #[arg(long, help = "Reinstall all installed formulae")]
         all: bool,
+    },
+
+    #[command(about = "Run post-installation steps for a package")]
+    Postinstall {
+        #[arg(help = "Formula name(s) to run post-install for")]
+        formulae: Vec<String>,
+        #[arg(long, help = "Install to ~/.local/wax")]
+        user: bool,
+        #[arg(long, help = "Install to system directory")]
+        global: bool,
     },
 
     #[command(about = "Upgrade formulae to the latest version  [alias: up]")]
@@ -409,6 +420,11 @@ async fn main() -> Result<()> {
             cask,
             all,
         } => commands::reinstall::reinstall(&cache, &packages, cask, all).await,
+        Commands::Postinstall {
+            formulae,
+            user,
+            global,
+        } => commands::install::postinstall(&cache, &formulae, user, global).await,
         Commands::Upgrade { packages, dry_run } => {
             commands::upgrade::upgrade(&cache, &packages, dry_run).await
         }

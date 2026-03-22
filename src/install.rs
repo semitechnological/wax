@@ -68,10 +68,48 @@ impl InstallMode {
 }
 
 fn is_writable(path: &Path) -> bool {
-    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mode = metadata.mode();
+            let uid = unsafe { libc::getuid() };
 
+            if uid == 0 {
+                return true;
+            }
+
+            // Owner write
+            if metadata.uid() == uid {
+                return mode & 0o200 != 0;
+            }
+
+            // Check primary and supplementary groups
+            if mode & 0o020 != 0 {
+                let file_gid = metadata.gid();
+                let primary_gid = unsafe { libc::getgid() };
+                if file_gid == primary_gid {
+                    return true;
+                }
+                // Check supplementary groups
+                let ngroups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+                if ngroups > 0 {
+                    let mut groups = vec![0u32; ngroups as usize];
+                    let n = unsafe { libc::getgroups(ngroups, groups.as_mut_ptr()) };
+                    if n > 0 && groups[..n as usize].contains(&file_gid) {
+                        return true;
+                    }
+                }
+            }
+
+            // Other write
+            return mode & 0o002 != 0;
+        }
+    }
+
+    // Fallback: actually try to create a file (also used on non-unix)
     let test_file = path.join(".wax_write_test");
-    let result = OpenOptions::new()
+    let result = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
@@ -162,6 +200,11 @@ impl InstallState {
         Ok(())
     }
 
+    pub async fn load_formulae_from_cache(&self) -> Result<Vec<crate::api::Formula>> {
+        let cache = crate::cache::Cache::new()?;
+        cache.load_all_formulae().await
+    }
+
     fn detect_install_mode(&self, cellar: &Path) -> InstallMode {
         if cellar.starts_with("/opt/homebrew") || cellar.starts_with("/usr/local") {
             InstallMode::Global
@@ -176,7 +219,7 @@ impl InstallState {
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
 
-        let candidates = match os {
+        let mut candidates = match os {
             "macos" => match arch {
                 "aarch64" => vec![PathBuf::from("/opt/homebrew"), PathBuf::from("/usr/local")],
                 _ => vec![PathBuf::from("/usr/local"), PathBuf::from("/opt/homebrew")],
@@ -189,18 +232,17 @@ impl InstallState {
         };
 
         if let Some(prefix_str) = run_command_with_timeout("brew", &["--prefix"], 2) {
-            let brew_prefix = PathBuf::from(prefix_str);
-            let cellar = brew_prefix.join("Cellar");
-            if cellar.exists() {
-                self.scan_cellar_and_update(&cellar, &mut packages).await?;
-            }
+            candidates.push(PathBuf::from(prefix_str.trim()));
         }
+
+        // De-duplicate candidates
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|p| seen.insert(p.clone()));
 
         for path in candidates {
             let cellar = path.join("Cellar");
             if cellar.exists() {
                 self.scan_cellar_and_update(&cellar, &mut packages).await?;
-                break;
             }
         }
 
@@ -289,6 +331,14 @@ pub async fn create_symlinks(
     );
 
     let formula_path = cellar_path.join(formula_name).join(version);
+    if !formula_path.exists() {
+        return Err(WaxError::InstallError(format!(
+            "Formula path does not exist: {}",
+            formula_path.display()
+        )));
+    }
+    let formula_path = dunce::canonicalize(&formula_path).unwrap_or(formula_path);
+
     let prefix = install_mode.prefix()?;
 
     let mut created_links = Vec::new();
@@ -315,7 +365,14 @@ pub async fn create_symlinks(
                 .or_else(|_| sudo::sudo_mkdir(&target_dir))?;
         }
 
-        link_directory_recursive(&source_dir, &target_dir, dry_run, &mut created_links).await?;
+        link_directory_recursive(
+            &source_dir,
+            &target_dir,
+            &formula_path,
+            dry_run,
+            &mut created_links,
+        )
+        .await?;
     }
 
     let opt_dir = prefix.join("opt");
@@ -353,6 +410,7 @@ pub async fn create_symlinks(
 fn link_directory_recursive<'a>(
     source_dir: &'a Path,
     target_dir: &'a Path,
+    formula_base: &'a Path,
     dry_run: bool,
     created_links: &'a mut Vec<PathBuf>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
@@ -364,12 +422,22 @@ fn link_directory_recursive<'a>(
             let target_path = target_dir.join(&file_name);
             let source_meta = entry.metadata().await?;
 
+            // Safety check: ensure source is actually inside the formula path
+            if !source_path.starts_with(formula_base) {
+                debug!(
+                    "Skipping symlink for path outside formula: {:?}",
+                    source_path
+                );
+                continue;
+            }
+
             if source_meta.is_dir() {
                 if let Ok(target_meta) = fs::symlink_metadata(&target_path).await {
                     if target_meta.is_dir() && !target_meta.is_symlink() {
                         link_directory_recursive(
                             &source_path,
                             &target_path,
+                            formula_base,
                             dry_run,
                             created_links,
                         )
@@ -449,6 +517,7 @@ pub async fn remove_symlinks(
     );
 
     let formula_path = cellar_path.join(formula_name).join(version);
+    let formula_path = dunce::canonicalize(&formula_path).unwrap_or(formula_path);
     let prefix = install_mode.prefix()?;
 
     let mut removed_links = Vec::new();
@@ -464,10 +533,6 @@ pub async fn remove_symlinks(
 
     for (subdir, target_dir) in link_dirs {
         let source_dir = formula_path.join(subdir);
-
-        if !source_dir.exists() {
-            continue;
-        }
 
         unlink_directory_recursive(
             &source_dir,
@@ -485,6 +550,7 @@ pub async fn remove_symlinks(
         if let Ok(metadata) = fs::symlink_metadata(&opt_link).await {
             if metadata.is_symlink() {
                 if let Ok(link_target) = fs::read_link(&opt_link).await {
+                    let link_target = dunce::canonicalize(&link_target).unwrap_or(link_target);
                     if link_target.starts_with(&formula_path) {
                         if !dry_run {
                             fs::remove_file(&opt_link)
@@ -529,6 +595,7 @@ fn unlink_directory_recursive<'a>(
             {
                 if target_meta.is_symlink() {
                     if let Ok(link_target) = fs::read_link(&target_path).await {
+                        let link_target = dunce::canonicalize(&link_target).unwrap_or(link_target);
                         if link_target.starts_with(formula_path) {
                             if !dry_run {
                                 fs::remove_file(&target_path)
