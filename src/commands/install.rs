@@ -916,8 +916,8 @@ struct DownloadedCask {
 async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> Result<()> {
     let start = std::time::Instant::now();
     let casks = cache.load_casks().await?;
-    let state = CaskState::new()?;
-    let installed_casks = state.load().await?;
+    let _state = CaskState::new()?;
+    let installed_casks = _state.load().await?;
 
     let mut to_install = Vec::new();
     let mut already_installed = Vec::new();
@@ -1212,8 +1212,19 @@ async fn install_from_downloaded(
     }
 
     step!("staging...");
-    let staging = StagingContext::new(download_path, artifact_type, &cask.url).await?;
+    let cask_dir = CaskState::caskroom_dir().join(&cask.token);
+    let version_dir = cask_dir.join(&cask.version);
+    
+    // Clean up if version_dir already exists to ensure a fresh extraction
+    if version_dir.exists() {
+        tokio::fs::remove_dir_all(&version_dir).await.ok();
+    }
+    
+    let staging = StagingContext::new_in_dir(download_path, artifact_type, &cask.url, version_dir.clone()).await?;
     let mut rollback = RollbackContext::new();
+    
+    // Ensure we rollback the version_dir if installation fails
+    rollback.add(version_dir.clone());
 
     let mut binary_paths: Vec<String> = Vec::new();
     let mut installed_app_name: Option<String> = None;
@@ -1369,20 +1380,35 @@ async fn install_from_downloaded(
                 }
                 CaskArtifact::BashCompletion { bash_completion } => {
                     if let Some(source) = bash_completion.first().and_then(|v| v.as_str()) {
+                        let target = bash_completion
+                            .get(1)
+                            .and_then(|v| v.as_object())
+                            .and_then(|o| o.get("target"))
+                            .and_then(|v| v.as_str());
                         step!(format!("installing bash completion: {}", source));
-                        installer.install_completion(&staging, &mut rollback, source, "bash", &cask.token).await?;
+                        installer.install_completion(&staging, &mut rollback, source, "bash", &cask.token, target).await?;
                     }
                 }
                 CaskArtifact::ZshCompletion { zsh_completion } => {
                     if let Some(source) = zsh_completion.first().and_then(|v| v.as_str()) {
+                        let target = zsh_completion
+                            .get(1)
+                            .and_then(|v| v.as_object())
+                            .and_then(|o| o.get("target"))
+                            .and_then(|v| v.as_str());
                         step!(format!("installing zsh completion: {}", source));
-                        installer.install_completion(&staging, &mut rollback, source, "zsh", &cask.token).await?;
+                        installer.install_completion(&staging, &mut rollback, source, "zsh", &cask.token, target).await?;
                     }
                 }
                 CaskArtifact::FishCompletion { fish_completion } => {
                     if let Some(source) = fish_completion.first().and_then(|v| v.as_str()) {
+                        let target = fish_completion
+                            .get(1)
+                            .and_then(|v| v.as_object())
+                            .and_then(|o| o.get("target"))
+                            .and_then(|v| v.as_str());
                         step!(format!("installing fish completion: {}", source));
-                        installer.install_completion(&staging, &mut rollback, source, "fish", &cask.token).await?;
+                        installer.install_completion(&staging, &mut rollback, source, "fish", &cask.token, target).await?;
                     }
                 }
                 CaskArtifact::Preflight { preflight: Some(script) } => {

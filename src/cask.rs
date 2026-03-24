@@ -188,7 +188,7 @@ impl Default for CaskState {
 pub struct StagingContext {
     pub staging_root: PathBuf,
     mount_point: Option<PathBuf>,
-    _temp_dir: tempfile::TempDir,
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 pub struct RollbackContext {
@@ -231,9 +231,18 @@ impl Drop for RollbackContext {
 }
 
 impl StagingContext {
-    pub async fn new(download_path: &Path, artifact_type: &str, url: &str) -> Result<Self> {
-        let temp_dir = tempfile::tempdir()?;
-        let staging_root = temp_dir.path().to_path_buf();
+    pub async fn new_in_dir(download_path: &Path, artifact_type: &str, url: &str, target_dir: PathBuf) -> Result<Self> {
+        tokio::fs::create_dir_all(&target_dir).await?;
+        Self::new_internal(download_path, artifact_type, url, target_dir, None).await
+    }
+
+    async fn new_internal(
+        download_path: &Path,
+        artifact_type: &str,
+        url: &str,
+        staging_root: PathBuf,
+        temp_dir: Option<tempfile::TempDir>,
+    ) -> Result<Self> {
         let mut mount_point = None;
 
         match artifact_type {
@@ -656,14 +665,13 @@ impl CaskInstaller {
 
         rollback.add(binary_dest_path.clone());
 
-        tokio::fs::copy(&source, &binary_dest_path).await?;
-
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = tokio::fs::metadata(&binary_dest_path).await?.permissions();
-            perms.set_mode(0o755);
-            tokio::fs::set_permissions(&binary_dest_path, perms).await?;
+            tokio::fs::symlink(&source, &binary_dest_path).await?;
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::fs::copy(&source, &binary_dest_path).await?;
         }
 
         info!("Successfully installed {} to {}", name, bin_dest_dir.display());
@@ -827,6 +835,7 @@ impl CaskInstaller {
         source_rel: &str,
         shell: &str,
         token: &str,
+        target_name: Option<&str>,
     ) -> Result<()> {
         Self::check_platform_support()?;
         
@@ -846,23 +855,36 @@ impl CaskInstaller {
         };
 
         tokio::fs::create_dir_all(&dest_dir).await?;
-        let filename = Path::new(source_rel)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(token);
+        let filename = target_name.unwrap_or_else(|| {
+            Path::new(source_rel)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(token)
+        });
         
         let dest = dest_dir.join(filename);
 
-        if dest.exists() {
-            tokio::fs::remove_file(&dest).await.ok();
+        if tokio::fs::symlink_metadata(&dest).await.is_ok() {
+            if dest.is_dir() {
+                tokio::fs::remove_dir_all(&dest).await.ok();
+            } else {
+                tokio::fs::remove_file(&dest).await.ok();
+            }
         }
 
         rollback.add(dest.clone());
 
-        if source.is_dir() {
-            crate::ui::copy_dir_all(&source, &dest)?;
-        } else {
-            tokio::fs::copy(&source, &dest).await?;
+        #[cfg(unix)]
+        {
+            tokio::fs::symlink(&source, &dest).await?;
+        }
+        #[cfg(not(unix))]
+        {
+            if source.is_dir() {
+                crate::ui::copy_dir_all(&source, &dest)?;
+            } else {
+                tokio::fs::copy(&source, &dest).await?;
+            }
         }
 
         Ok(())
