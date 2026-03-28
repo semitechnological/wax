@@ -1,4 +1,4 @@
-use crate::bottle::{homebrew_prefix, run_command_with_timeout};
+use crate::bottle::{detect_platform, homebrew_prefix, run_command_with_timeout};
 use crate::error::{Result, WaxError};
 use crate::sudo;
 use crate::ui::dirs;
@@ -274,11 +274,7 @@ impl InstallState {
                             InstalledPackage {
                                 name: package_name,
                                 version,
-                                platform: format!(
-                                    "{}-{}",
-                                    std::env::consts::OS,
-                                    std::env::consts::ARCH
-                                ),
+                                platform: detect_platform(),
                                 install_date: 0,
                                 install_mode: self.detect_install_mode(cellar),
                                 from_source: false,
@@ -350,7 +346,14 @@ pub async fn create_symlinks(
                 .or_else(|_| sudo::sudo_mkdir(&target_dir))?;
         }
 
-        link_directory_recursive(&source_dir, &target_dir, &formula_path, dry_run, &mut created_links).await?;
+        link_directory_recursive(
+            &source_dir,
+            &target_dir,
+            &formula_path,
+            dry_run,
+            &mut created_links,
+        )
+        .await?;
     }
 
     let opt_dir = prefix.join("opt");
@@ -402,7 +405,10 @@ fn link_directory_recursive<'a>(
 
             // Safety check: ensure source is actually inside the formula path
             if !source_path.starts_with(formula_base) {
-                debug!("Skipping symlink for path outside formula: {:?}", source_path);
+                debug!(
+                    "Skipping symlink for path outside formula: {:?}",
+                    source_path
+                );
                 continue;
             }
 
