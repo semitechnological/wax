@@ -1,7 +1,9 @@
 use crate::api::{Cask, Formula};
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 use crate::bottle::detect_platform;
 use crate::cask::InstalledCask;
 use crate::error::Result;
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 use crate::install::{InstallMode, InstalledPackage};
 use crate::ui::dirs;
 use std::collections::HashMap;
@@ -10,11 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tracing::{debug, info};
 
+#[allow(dead_code)]
 pub async fn discover_manual_casks(casks: &[Cask]) -> Result<HashMap<String, InstalledCask>> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = casks;
-        return Ok(HashMap::new());
+        Ok(HashMap::new())
     }
 
     #[cfg(target_os = "macos")]
@@ -95,6 +98,8 @@ pub async fn discover_manual_casks(casks: &[Cask]) -> Result<HashMap<String, Ins
     }
 }
 
+#[allow(dead_code)]
+#[allow(clippy::needless_return)]
 pub async fn discover_linux_formulae(
     formulae: &[Formula],
 ) -> Result<HashMap<String, InstalledPackage>> {
@@ -140,6 +145,7 @@ pub async fn discover_linux_formulae(
     }
 }
 
+#[allow(dead_code)]
 fn build_cask_alias_index(casks: &[Cask]) -> HashMap<String, String> {
     let mut index = HashMap::new();
 
@@ -154,6 +160,7 @@ fn build_cask_alias_index(casks: &[Cask]) -> HashMap<String, String> {
     index
 }
 
+#[allow(dead_code)]
 fn build_formula_alias_index(formulae: &[Formula]) -> HashMap<String, String> {
     let mut index = HashMap::new();
 
@@ -169,12 +176,14 @@ fn build_formula_alias_index(formulae: &[Formula]) -> HashMap<String, String> {
     index
 }
 
+#[allow(dead_code)]
 fn cask_aliases(cask: &Cask) -> Vec<String> {
     let mut aliases = vec![cask.token.clone(), cask.full_token.clone()];
     aliases.extend(cask.name.clone());
     aliases
 }
 
+#[allow(dead_code)]
 fn match_cask_token(alias_index: &HashMap<String, String>, value: &str) -> Option<String> {
     let normalized = normalize_identifier(value);
     if let Some(token) = alias_index.get(&normalized) {
@@ -186,6 +195,7 @@ fn match_cask_token(alias_index: &HashMap<String, String>, value: &str) -> Optio
     alias_index.get(&normalized_stripped).cloned()
 }
 
+#[allow(dead_code)]
 fn normalize_identifier(value: &str) -> String {
     let value = value
         .replace(".app", "")
@@ -227,6 +237,7 @@ fn macos_app_roots() -> Vec<PathBuf> {
     roots
 }
 
+#[allow(dead_code)]
 async fn app_bundle_name(path: &Path) -> Option<String> {
     if let Some(name) = read_bundle_string(path, "CFBundleDisplayName").await {
         return Some(name);
@@ -240,6 +251,7 @@ async fn app_bundle_name(path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[allow(dead_code)]
 async fn read_bundle_version(path: &Path) -> Option<String> {
     if let Some(version) = read_bundle_string(path, "CFBundleShortVersionString").await {
         Some(version)
@@ -287,6 +299,7 @@ async fn read_bundle_string(path: &Path, key: &str) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 async fn linux_package_inventory() -> Result<Vec<(String, String)>> {
     let mut inventories = Vec::new();
 
@@ -303,6 +316,7 @@ async fn linux_package_inventory() -> Result<Vec<(String, String)>> {
     Ok(inventories)
 }
 
+#[allow(dead_code)]
 async fn query_dpkg_packages() -> Result<Option<Vec<(String, String)>>> {
     let output = Command::new("dpkg-query")
         .arg("-W")
@@ -321,6 +335,7 @@ async fn query_dpkg_packages() -> Result<Option<Vec<(String, String)>>> {
     Ok(Some(parse_package_lines(&output.stdout, true)))
 }
 
+#[allow(dead_code)]
 async fn query_rpm_packages() -> Result<Option<Vec<(String, String)>>> {
     let output = Command::new("rpm")
         .arg("-qa")
@@ -340,6 +355,7 @@ async fn query_rpm_packages() -> Result<Option<Vec<(String, String)>>> {
     Ok(Some(parse_package_lines(&output.stdout, false)))
 }
 
+#[allow(dead_code)]
 fn parse_package_lines(stdout: &[u8], strip_arch_suffix: bool) -> Vec<(String, String)> {
     String::from_utf8_lossy(stdout)
         .lines()

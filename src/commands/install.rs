@@ -7,7 +7,7 @@ use crate::cask::{
 };
 use crate::commands::version_install;
 use crate::deps::resolve_dependencies;
-use crate::discovery::{discover_linux_formulae, discover_manual_casks};
+use crate::discovery::discover_manual_casks;
 use crate::error::{Result, WaxError};
 use crate::formula_parser::FormulaParser;
 use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackage};
