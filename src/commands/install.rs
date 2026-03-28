@@ -7,6 +7,7 @@ use crate::cask::{
 };
 use crate::commands::version_install;
 use crate::deps::resolve_dependencies;
+use crate::discovery::{discover_linux_formulae, discover_manual_casks};
 use crate::error::{Result, WaxError};
 use crate::formula_parser::FormulaParser;
 use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackage};
@@ -917,7 +918,13 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
     let start = std::time::Instant::now();
     let casks = cache.load_casks().await?;
     let _state = CaskState::new()?;
-    let installed_casks = _state.load().await?;
+    let mut installed_casks = _state.load().await?;
+
+    if cfg!(target_os = "macos") {
+        for (name, cask) in discover_manual_casks(&casks).await? {
+            installed_casks.entry(name).or_insert(cask);
+        }
+    }
 
     let mut to_install = Vec::new();
     let mut already_installed = Vec::new();

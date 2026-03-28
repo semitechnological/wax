@@ -1,14 +1,61 @@
+use crate::cache::Cache;
+use crate::cask::CaskState;
+use crate::discovery::{discover_linux_formulae, discover_manual_casks};
 use crate::error::Result;
 use crate::install::InstallState;
-use crate::lockfile::Lockfile;
+use crate::lockfile::{Lockfile, LockfileCask, LockfilePackage};
 use tracing::instrument;
 
-#[instrument]
-pub async fn lock() -> Result<()> {
+#[instrument(skip(cache))]
+pub async fn lock(cache: &Cache) -> Result<()> {
+    let formulae = cache.load_formulae().await?;
+    let casks = cache.load_casks().await?;
+
     let state = InstallState::new()?;
     state.sync_from_cellar().await?;
 
-    let lockfile = Lockfile::generate().await?;
+    let mut installed_packages = state.load().await?;
+    let cask_state = CaskState::new()?;
+    let mut installed_casks = cask_state.load().await?;
+
+    if cfg!(target_os = "linux") {
+        for (name, package) in discover_linux_formulae(&formulae).await? {
+            installed_packages.entry(name).or_insert(package);
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        for (name, cask) in discover_manual_casks(&casks).await? {
+            installed_casks.entry(name).or_insert(cask);
+        }
+    }
+
+    let lockfile = Lockfile {
+        packages: installed_packages
+            .into_iter()
+            .map(|(name, pkg)| {
+                (
+                    name,
+                    LockfilePackage {
+                        version: pkg.version,
+                        bottle: pkg.platform,
+                    },
+                )
+            })
+            .collect(),
+        casks: installed_casks
+            .into_iter()
+            .map(|(name, cask)| {
+                (
+                    name,
+                    LockfileCask {
+                        version: cask.version,
+                    },
+                )
+            })
+            .collect(),
+    };
+
     let package_count = lockfile.packages.len();
     let cask_count = lockfile.casks.len();
 
@@ -29,11 +76,7 @@ pub async fn lock() -> Result<()> {
             "packages"
         },
         cask_count,
-        if cask_count == 1 {
-            "cask"
-        } else {
-            "casks"
-        }
+        if cask_count == 1 { "cask" } else { "casks" }
     );
 
     Ok(())
