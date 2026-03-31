@@ -16,22 +16,29 @@
 ///    generation by computing the diff and driving the native package manager
 ///    to install/remove the delta.
 ///
-/// The actual package installation is delegated to the native OS package
-/// manager (apt/dnf/pacman/apk) via `system_pm.rs`, keeping privilege
-/// escalation minimal and correct.  The generation + state layer lives in
-/// `~/.wax/system/`.
+/// Installs use the fully native pipeline (registry fetch → dependency
+/// resolution → parallel download → extraction) for distros where a registry
+/// is available.  For other distros the native OS PM is used as a fallback.
 pub mod distro;
+pub mod extractor;
 pub mod generations;
+pub mod installer;
 pub mod query;
+pub mod registry;
+pub mod resolver;
 pub mod state;
 
 use crate::error::{Result, WaxError};
-use crate::system::distro::DistroInfo;
+use crate::system::distro::{DistroInfo, PackageFormat};
 use crate::system::generations::{Generation, GenerationManager};
+use crate::system::installer::SystemInstaller;
 use crate::system::query::list_installed;
+use crate::system::registry::PackageIndex;
+use crate::system::resolver::Resolver;
 use crate::system::state::SystemState;
 use crate::system_pm::SystemPm;
 use console::style;
+use tracing::warn;
 
 pub struct SystemManager {
     pm: SystemPm,
@@ -69,6 +76,38 @@ impl SystemManager {
         }
     }
 
+    /// Build a native registry for the current distro, or return None for
+    /// distros that don't have a native registry yet.
+    async fn build_index(&self) -> Option<PackageIndex> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .ok()?;
+
+        match &self.distro.format {
+            PackageFormat::Deb => {
+                let reg = match self.distro.name.to_lowercase() {
+                    n if n.contains("debian") => registry::apt::AptRegistry::debian_default(),
+                    _ => registry::apt::AptRegistry::ubuntu_default(),
+                };
+                reg.load(&client).await.ok()
+            }
+            PackageFormat::Pacman => {
+                let reg = registry::pacman::PacmanRegistry::arch_default();
+                reg.load(&client).await.ok()
+            }
+            PackageFormat::Apk => {
+                let reg = registry::apk::ApkRegistry::alpine_default();
+                reg.load(&client).await.ok()
+            }
+            PackageFormat::Rpm => {
+                let reg = registry::dnf::DnfRegistry::fedora_default();
+                reg.load(&client).await.ok()
+            }
+            PackageFormat::Other => None,
+        }
+    }
+
     /// Snapshot current live packages into a new generation, then upgrade all.
     pub async fn upgrade_all(&self) -> Result<()> {
         println!(
@@ -81,14 +120,51 @@ impl SystemManager {
         // Snapshot *before* the upgrade so we can diff forward/back.
         self.snapshot("pre-upgrade").await?;
 
+        // Try native upgrade path first
+        if let Some(index) = self.build_index().await {
+            let st = SystemState::load().await?;
+            let declared = st.declared.clone();
+
+            if !declared.is_empty() {
+                let resolver = Resolver::new(&index);
+                let to_install = resolver.resolve(&declared)?;
+
+                if !to_install.is_empty() {
+                    println!(
+                        "  {} upgrading {} packages natively",
+                        style("→").cyan(),
+                        to_install.len()
+                    );
+                    let installer = SystemInstaller::new();
+                    let prefix = SystemInstaller::install_prefix();
+                    let installed = installer
+                        .install_packages(&to_install.iter().map(|p| (*p).clone()).collect::<Vec<_>>(), &prefix)
+                        .await?;
+
+                    let mut state = SystemState::load().await?;
+                    for (name, version) in &installed {
+                        state.mark_installed(name, Some(version.clone()), declared.contains(name));
+                    }
+                    state.save().await?;
+
+                    let live = self.live_packages().await?;
+                    let gen = self.gen_mgr.create("upgrade (native)", live).await?;
+                    println!(
+                        "  {} generation {} created",
+                        style("✓").green(),
+                        style(gen.id).bold()
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback: shell-out upgrade
         self.pm.upgrade_all().await?;
 
         // Snapshot *after* so rollback undoes the upgrade.
         let pkgs = self.live_packages().await?;
-        let after = self
-            .gen_mgr
-            .create("upgrade", pkgs)
-            .await?;
+        let after = self.gen_mgr.create("upgrade", pkgs).await?;
 
         println!(
             "  {} generation {} created",
@@ -106,24 +182,92 @@ impl SystemManager {
 
         self.snapshot(&format!("pre-install {}", packages.join(" "))).await?;
 
-        // Record the packages as declared and mark them installed.
+        // Record the packages as declared in state
         let mut st = SystemState::load().await?;
         for pkg in packages {
             st.declare(pkg);
         }
+        st.save().await?;
 
+        // Try native install path
+        if let Some(index) = self.build_index().await {
+            let resolver = Resolver::new(&index);
+            match resolver.resolve(packages) {
+                Ok(to_install) if !to_install.is_empty() => {
+                    println!(
+                        "  {} installing {} packages (+ deps) natively",
+                        style("→").cyan(),
+                        to_install.len()
+                    );
+                    for pkg in &to_install {
+                        println!(
+                            "    {} {}@{}",
+                            style("+").green(),
+                            style(&pkg.name).magenta(),
+                            style(&pkg.version).dim()
+                        );
+                    }
+
+                    let installer = SystemInstaller::new();
+                    let prefix = SystemInstaller::install_prefix();
+                    let installed_list = installer
+                        .install_packages(
+                            &to_install.iter().map(|p| (*p).clone()).collect::<Vec<_>>(),
+                            &prefix,
+                        )
+                        .await?;
+
+                    let mut state = SystemState::load().await?;
+                    let declared_set: std::collections::HashSet<_> =
+                        packages.iter().map(|s| s.as_str()).collect();
+                    for (name, version) in &installed_list {
+                        state.mark_installed(
+                            name,
+                            Some(version.clone()),
+                            declared_set.contains(name.as_str()),
+                        );
+                    }
+                    state.save().await?;
+
+                    let live = self.live_packages().await?;
+                    let gen = self
+                        .gen_mgr
+                        .create(&format!("install {}", packages.join(" ")), live)
+                        .await?;
+
+                    println!(
+                        "  {} generation {} created",
+                        style("✓").green(),
+                        style(gen.id).bold()
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {
+                    warn!("Native install resolved 0 packages — falling back to system PM");
+                }
+                Err(e) => {
+                    warn!("Native resolver failed ({}), falling back to system PM", e);
+                }
+            }
+        }
+
+        // Fallback: shell-out to native PM
         self.pm.install(packages).await?;
 
         // Refresh the live list so the generation reflects reality.
         let live = self.live_packages().await?;
+        let mut state = SystemState::load().await?;
         for pkg in packages {
-            if !st.installed.contains_key(pkg.as_str()) {
-                st.mark_installed(pkg, None, true);
+            if !state.installed.contains_key(pkg.as_str()) {
+                state.mark_installed(pkg, None, true);
             }
         }
-        st.save().await?;
+        state.save().await?;
 
-        let gen = self.gen_mgr.create(&format!("install {}", packages.join(" ")), live).await?;
+        let gen = self
+            .gen_mgr
+            .create(&format!("install {}", packages.join(" ")), live)
+            .await?;
 
         println!(
             "  {} generation {} created",
@@ -251,7 +395,7 @@ impl SystemManager {
         if !to_install.is_empty() {
             let names: Vec<String> = to_install.iter().map(|p| p.name.clone()).collect();
             println!("  installing: {}", names.join(", "));
-            self.pm.install(&names).await?;
+            self.install(&names).await?;
         }
 
         // Record the rollback as its own generation so the history is complete.

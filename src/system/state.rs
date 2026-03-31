@@ -80,5 +80,4 @@ impl SystemState {
             pkg.declared = false;
         }
     }
-
 }
