@@ -472,7 +472,8 @@ async fn install_impl(
 
     // Probe all bottle URLs concurrently to get file sizes, then allocate
     // connections proportionally by size from the global pool.
-    const CONCURRENT_LIMIT: usize = 8;
+    // All packages download simultaneously; limit only caps runaway scenarios.
+    let concurrent_limit = packages_to_install.len().max(1).min(32);
     let connections_map: std::collections::HashMap<String, usize> = {
         use std::sync::Arc;
         let dl = Arc::clone(&downloader);
@@ -523,7 +524,7 @@ async fn install_impl(
         allocs.into_iter().map(|(name, c, _)| (name, c)).collect()
     };
 
-    let semaphore = Arc::new(Semaphore::new(CONCURRENT_LIMIT));
+    let semaphore = Arc::new(Semaphore::new(concurrent_limit));
     let mut tasks = Vec::new();
     let inline_extracted: Vec<(String, String, std::path::PathBuf, String, u32)> = Vec::new();
     let mut source_install_count = 0usize;
@@ -634,7 +635,7 @@ async fn install_impl(
         };
 
         let task = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
+            let permit = semaphore.acquire().await.unwrap();
             // Don't even start if already cancelled
             crate::signal::check_cancelled()?;
             crate::signal::set_current_op(format!("downloading {}", name));
@@ -645,6 +646,10 @@ async fn install_impl(
                 .download(&url, &tarball_path, Some(&pb), conns)
                 .await?;
             pb.finish_and_clear();
+
+            // Release the download permit before extraction so the next package
+            // can start downloading immediately rather than waiting for CPU-bound work.
+            drop(permit);
 
             BottleDownloader::verify_checksum(&tarball_path, &sha256)?;
 

@@ -190,7 +190,9 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
         .collect();
 
     // Probe all bottle sizes concurrently, then allocate connections proportionally.
-    const UPGRADE_CONCURRENT_LIMIT: usize = 6;
+    // All upgrades download simultaneously; limit only caps extreme scenarios.
+    let formula_upgrade_count = formula_bottle_urls.len().max(1);
+    let upgrade_concurrent_limit = formula_upgrade_count.min(32);
     let upgrade_connections_map: HashMap<String, usize> = {
         let probe_tasks: Vec<_> = formula_bottle_urls
             .iter()
@@ -239,7 +241,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
         allocs.into_iter().map(|(name, c, _)| (name, c)).collect()
     };
 
-    let semaphore = Arc::new(Semaphore::new(UPGRADE_CONCURRENT_LIMIT));
+    let semaphore = Arc::new(Semaphore::new(upgrade_concurrent_limit));
     let temp_dir = Arc::new(TempDir::new()?);
 
     let download_tasks: Vec<_> = outdated
@@ -265,7 +267,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
             let conns = upgrade_connections_map.get(&pkg.name).copied().unwrap_or(1);
 
             Some(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
+                let permit = sem.acquire().await.unwrap();
                 crate::signal::check_cancelled()?;
 
                 let tarball = tmp.path().join(format!("{}-{}.tar.gz", name, version));
@@ -280,6 +282,9 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
 
                 dl.download(&url, &tarball, Some(&pb), conns).await?;
                 pb.finish_and_clear();
+
+                // Release the download permit before extraction.
+                drop(permit);
 
                 BottleDownloader::verify_checksum(&tarball, &sha256)?;
 

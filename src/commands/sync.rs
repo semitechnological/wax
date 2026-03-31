@@ -161,14 +161,21 @@ pub async fn sync(cache: &Cache) -> Result<()> {
     if sync_package_count > 0 {
         let multi = MultiProgress::new();
         let downloader = Arc::new(BottleDownloader::new());
-        const SYNC_CONCURRENT_LIMIT: usize = 8;
-        let sync_concurrent = sync_package_count.clamp(1, SYNC_CONCURRENT_LIMIT);
-        let sync_connections_per_pkg =
-            (BottleDownloader::GLOBAL_CONNECTION_POOL / sync_concurrent).max(1);
-        let semaphore = Arc::new(Semaphore::new(SYNC_CONCURRENT_LIMIT));
+        // All packages download simultaneously; the semaphore only caps extreme cases.
+        let concurrent_limit = sync_package_count.max(1).min(32);
+        let semaphore = Arc::new(Semaphore::new(concurrent_limit));
         let temp_dir = Arc::new(TempDir::new()?);
-        let mut tasks = Vec::new();
 
+        // Collect download entries and probe sizes concurrently for connection allocation.
+        struct SyncEntry {
+            name: String,
+            version: String,
+            platform: String,
+            url: String,
+            sha256: String,
+        }
+
+        let mut entries: Vec<SyncEntry> = Vec::new();
         for (name, lock_pkg) in packages_to_install {
             let formula = formulae
                 .iter()
@@ -208,15 +215,41 @@ pub async fn sync(cache: &Cache) -> Result<()> {
                     ))
                 })?;
 
-            let url = bottle_file.url.clone();
-            let sha256 = bottle_file.sha256.clone();
-            let version = lock_pkg.version.clone();
-            let platform = lock_pkg.bottle.clone();
+            entries.push(SyncEntry {
+                name: name.clone(),
+                version: lock_pkg.version.clone(),
+                platform: lock_pkg.bottle.clone(),
+                url: bottle_file.url.clone(),
+                sha256: bottle_file.sha256.clone(),
+            });
+        }
+
+        // Probe all URLs concurrently for sizes so each download gets an appropriate
+        // connection count (larger files get more parallel connections).
+        let probe_tasks: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                let dl = Arc::clone(&downloader);
+                let url = e.url.clone();
+                tokio::spawn(async move { dl.probe_size(&url).await })
+            })
+            .collect();
+
+        let mut sizes: Vec<u64> = Vec::with_capacity(entries.len());
+        for task in probe_tasks {
+            sizes.push(task.await.unwrap_or(0));
+        }
+
+        let mut tasks = Vec::new();
+        for (entry, size) in entries.into_iter().zip(sizes) {
+            let conns = BottleDownloader::num_connections(
+                size,
+                BottleDownloader::MAX_CONNECTIONS_PER_DOWNLOAD,
+            );
 
             let downloader = Arc::clone(&downloader);
             let semaphore = Arc::clone(&semaphore);
             let temp_dir = Arc::clone(&temp_dir);
-            let conns = sync_connections_per_pkg;
 
             let pb = multi.add(ProgressBar::new(0));
             let style = ProgressStyle::default_bar()
@@ -224,27 +257,29 @@ pub async fn sync(cache: &Cache) -> Result<()> {
                 .unwrap()
                 .progress_chars(PROGRESS_BAR_CHARS);
             pb.set_style(style);
-            pb.set_message(name.clone());
+            pb.set_message(entry.name.clone());
 
-            let name_clone = name.clone();
             let task = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
+                let permit = semaphore.acquire().await.unwrap();
 
                 let tarball_path = temp_dir
                     .path()
-                    .join(format!("{}-{}.tar.gz", name_clone, version));
+                    .join(format!("{}-{}.tar.gz", entry.name, entry.version));
 
                 downloader
-                    .download(&url, &tarball_path, Some(&pb), conns)
+                    .download(&entry.url, &tarball_path, Some(&pb), conns)
                     .await?;
                 pb.finish_and_clear();
 
-                BottleDownloader::verify_checksum(&tarball_path, &sha256)?;
+                // Release permit before extraction so another download can start.
+                drop(permit);
 
-                let extract_dir = temp_dir.path().join(&name_clone);
+                BottleDownloader::verify_checksum(&tarball_path, &entry.sha256)?;
+
+                let extract_dir = temp_dir.path().join(&entry.name);
                 BottleDownloader::extract(&tarball_path, &extract_dir)?;
 
-                Ok::<_, WaxError>((name_clone, version, platform, extract_dir))
+                Ok::<_, WaxError>((entry.name, entry.version, entry.platform, extract_dir))
             });
 
             tasks.push(task);

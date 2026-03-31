@@ -32,7 +32,10 @@ impl BottleDownloader {
     const MULTIPART_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB
 
     /// Global connection pool shared across all concurrent downloads.
-    pub const GLOBAL_CONNECTION_POOL: usize = 16;
+    pub const GLOBAL_CONNECTION_POOL: usize = 32;
+
+    /// Maximum connections a single download may use.
+    pub const MAX_CONNECTIONS_PER_DOWNLOAD: usize = 8;
 
     /// Probe a URL to get its download size. Used before starting downloads to
     /// allocate connections proportionally across packages by file size.
@@ -50,7 +53,7 @@ impl BottleDownloader {
 
     /// Returns how many connections to use for a file of the given size,
     /// capped by `max_connections` (the caller's share of the global pool).
-    fn num_connections(size: u64, max_connections: usize) -> usize {
+    pub fn num_connections(size: u64, max_connections: usize) -> usize {
         let ideal = match size {
             s if s < 10 * 1024 * 1024 => 4, // <10 MB → up to 4
             s if s < 50 * 1024 * 1024 => 6, // <50 MB → up to 6
