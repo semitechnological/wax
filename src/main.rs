@@ -12,6 +12,7 @@ mod install;
 mod lockfile;
 mod signal;
 mod sudo;
+mod system;
 mod system_pm;
 mod tap;
 mod ui;
@@ -294,6 +295,27 @@ enum SystemAction {
         #[arg(required = true, help = "Package name(s) to install")]
         packages: Vec<String>,
     },
+    #[command(about = "Declare and install packages (adds to desired state)")]
+    Add {
+        #[arg(required = true, help = "Package name(s) to add")]
+        packages: Vec<String>,
+    },
+    #[command(about = "Remove packages and drop from desired state")]
+    Remove {
+        #[arg(required = true, help = "Package name(s) to remove")]
+        packages: Vec<String>,
+    },
+    #[command(about = "Converge live system to declared package set")]
+    Sync,
+    #[command(about = "Show current generation, distro, and package status")]
+    Status,
+    #[command(about = "List all system generations")]
+    Generations,
+    #[command(about = "Roll back to a previous generation  [alias: rb]", visible_alias = "rb")]
+    Rollback {
+        #[arg(help = "Generation ID to roll back to (defaults to previous)")]
+        generation: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -479,14 +501,89 @@ async fn main() -> Result<()> {
             }
         }
         Commands::System { action } => match action {
-            SystemAction::Upgrade => handle_system_upgrade().await,
+            SystemAction::Upgrade => {
+                match system::SystemManager::detect().await? {
+                    Some(mgr) => mgr.upgrade_all().await,
+                    None => handle_system_upgrade().await,
+                }
+            }
             SystemAction::Install { packages } => {
-                use crate::system_pm::SystemPm;
-                match SystemPm::detect().await {
-                    Some(pm) => {
-                        println!("installing via {}", pm.name());
-                        pm.install(&packages).await
+                match system::SystemManager::detect().await? {
+                    Some(mgr) => mgr.install(&packages).await,
+                    None => Err(crate::error::WaxError::PlatformNotSupported(
+                        "No supported system package manager found".to_string(),
+                    )),
+                }
+            }
+            SystemAction::Add { packages } => {
+                match system::SystemManager::detect().await? {
+                    Some(mgr) => mgr.install(&packages).await,
+                    None => Err(crate::error::WaxError::PlatformNotSupported(
+                        "No supported system package manager found".to_string(),
+                    )),
+                }
+            }
+            SystemAction::Remove { packages } => {
+                match system::SystemManager::detect().await? {
+                    Some(mgr) => mgr.remove(&packages).await,
+                    None => Err(crate::error::WaxError::PlatformNotSupported(
+                        "No supported system package manager found".to_string(),
+                    )),
+                }
+            }
+            SystemAction::Sync => {
+                match system::SystemManager::detect().await? {
+                    Some(mgr) => mgr.sync_declared().await,
+                    None => Err(crate::error::WaxError::PlatformNotSupported(
+                        "No supported system package manager found".to_string(),
+                    )),
+                }
+            }
+            SystemAction::Status => {
+                match system::SystemManager::detect().await? {
+                    Some(mgr) => mgr.status().await,
+                    None => {
+                        eprintln!("no supported system package manager found");
+                        Ok(())
                     }
+                }
+            }
+            SystemAction::Generations => {
+                match system::SystemManager::detect().await? {
+                    Some(mgr) => {
+                        let gens = mgr.list_generations().await?;
+                        if gens.is_empty() {
+                            println!("no generations yet");
+                            return Ok(());
+                        }
+                        let current = mgr.list_generations().await?;
+                        let current_id = current.last().map(|g| g.id);
+                        for gen in &gens {
+                            let marker = if Some(gen.id) == current_id {
+                                console::style("▶").green().to_string()
+                            } else {
+                                console::style(" ").dim().to_string()
+                            };
+                            println!(
+                                "{} gen-{:04}  {:>4} pkgs  {}  {}",
+                                marker,
+                                console::style(gen.id).bold(),
+                                gen.packages.len(),
+                                console::style(gen.age_string()).dim(),
+                                console::style(&gen.reason).cyan()
+                            );
+                        }
+                        Ok(())
+                    }
+                    None => {
+                        eprintln!("no supported system package manager found");
+                        Ok(())
+                    }
+                }
+            }
+            SystemAction::Rollback { generation } => {
+                match system::SystemManager::detect().await? {
+                    Some(mgr) => mgr.rollback(generation).await,
                     None => Err(crate::error::WaxError::PlatformNotSupported(
                         "No supported system package manager found".to_string(),
                     )),

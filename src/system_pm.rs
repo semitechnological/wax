@@ -43,8 +43,9 @@ impl SystemPm {
     /// Detect the first available system package manager on the current host.
     /// Returns `None` on macOS or when no supported PM is found.
     pub async fn detect() -> Option<Self> {
-        #[cfg(target_os = "macos")]
-        return None;
+        if cfg!(target_os = "macos") {
+            return None;
+        }
 
         let candidates: &[(&str, Self)] = &[
             ("apt-get", Self::Apt),
@@ -180,6 +181,11 @@ async fn which(bin: &str) -> bool {
         .await
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Public re-export used by `system/mod.rs` for remove operations.
+pub async fn run_visible_pub(program: &str, args: &[&str]) -> Result<()> {
+    run_visible(program, args).await
 }
 
 /// Run a command, inheriting stdin/stdout/stderr so the user sees all output
