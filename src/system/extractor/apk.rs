@@ -1,0 +1,84 @@
+/// Extract an Alpine .apk package to dest_dir.
+///
+/// .apk files are concatenated gzip streams:
+///   - First stream: signature (skip it)
+///   - Second stream: actual tar archive with the package contents
+use crate::error::{Result, WaxError};
+use flate2::read::GzDecoder;
+use std::io::Read;
+use std::path::Path;
+use tar::Archive;
+
+pub fn extract(path: &Path, dest_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest_dir)?;
+    let data = std::fs::read(path)?;
+
+    // Find the second gzip magic (0x1f 0x8b) to skip the signature stream
+    let payload_start = find_second_gz_magic(&data).ok_or_else(|| {
+        WaxError::InstallError("Could not find second gzip stream in .apk file".to_string())
+    })?;
+
+    let payload = &data[payload_start..];
+    let decoder = GzDecoder::new(payload);
+    untar(decoder, dest_dir)
+}
+
+fn find_second_gz_magic(data: &[u8]) -> Option<usize> {
+    if data.len() < 2 {
+        return None;
+    }
+    // Skip the first gzip stream by finding gzip EOF, then look for the next magic
+    // Strategy: scan from byte 2 onwards for the 0x1f 0x8b magic
+    let mut i = 2;
+    while i + 1 < data.len() {
+        if data[i] == 0x1f && data[i + 1] == 0x8b {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn untar<R: Read>(reader: R, dest_dir: &Path) -> Result<()> {
+    let mut archive = Archive::new(reader);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?;
+        let entry_str = entry_path.to_string_lossy().to_string();
+
+        // Skip APK control files
+        if entry_str == ".PKGINFO"
+            || entry_str == ".INSTALL"
+            || entry_str.starts_with(".SIGN.")
+        {
+            continue;
+        }
+
+        let stripped = entry_str.strip_prefix("./").unwrap_or(&entry_str);
+        if stripped.is_empty() || stripped.contains("..") {
+            continue;
+        }
+
+        let dest = dest_dir.join(stripped);
+
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&dest)?;
+        } else if entry.header().entry_type().is_symlink() {
+            if let Some(link_target) = entry.link_name()? {
+                let _ = std::fs::remove_file(&dest);
+                let _ = std::fs::remove_dir_all(&dest);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(link_target.as_ref(), &dest)?;
+            }
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&dest)?;
+        }
+    }
+    Ok(())
+}

@@ -11,6 +11,10 @@ mod install;
 mod lockfile;
 mod signal;
 mod sudo;
+#[allow(dead_code)]
+mod system;
+#[allow(dead_code)]
+mod system_pm;
 mod tap;
 mod ui;
 mod version;

@@ -1,0 +1,212 @@
+/// Nix-inspired atomic generation management for system packages.
+///
+/// Every mutating system operation (install, remove, upgrade) captures a
+/// point-in-time snapshot of the installed package set into an immutable
+/// generation manifest.  A `current` symlink always points at the active
+/// generation.  Rolling back is an O(1) symlink swap followed by converging
+/// the live system to the target generation's package set.
+use crate::error::{Result, WaxError};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+fn generations_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| WaxError::InstallError("HOME not set".into()))?;
+    Ok(PathBuf::from(home)
+        .join(".wax")
+        .join("system")
+        .join("generations"))
+}
+
+fn current_link(dir: &PathBuf) -> PathBuf {
+    dir.join("current")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageRecord {
+    pub name: String,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Generation {
+    pub id: u32,
+    pub timestamp: i64,
+    pub reason: String,
+    pub packages: Vec<PackageRecord>,
+}
+
+impl Generation {
+    /// Human-readable age string.
+    pub fn age_string(&self) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let secs = (now - self.timestamp).max(0) as u64;
+        if secs < 60 {
+            "just now".to_string()
+        } else if secs < 3600 {
+            format!("{}m ago", secs / 60)
+        } else if secs < 86400 {
+            format!("{}h ago", secs / 3600)
+        } else {
+            format!("{}d ago", secs / 86400)
+        }
+    }
+}
+
+pub struct GenerationManager {
+    dir: PathBuf,
+}
+
+impl GenerationManager {
+    pub async fn new() -> Result<Self> {
+        let dir = generations_dir()?;
+        tokio::fs::create_dir_all(&dir).await?;
+        Ok(Self { dir })
+    }
+
+    fn manifest_path(&self, id: u32) -> PathBuf {
+        self.dir.join(format!("gen-{:04}.json", id))
+    }
+
+    /// Next unused generation ID.
+    async fn next_id(&self) -> Result<u32> {
+        let mut max = 0u32;
+        let mut entries = tokio::fs::read_dir(&self.dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix("gen-") {
+                if let Some(num) = rest.strip_suffix(".json") {
+                    if let Ok(n) = num.parse::<u32>() {
+                        max = max.max(n);
+                    }
+                }
+            }
+        }
+        Ok(max + 1)
+    }
+
+    /// Persist a new generation and atomically update the `current` symlink.
+    pub async fn create(
+        &self,
+        reason: &str,
+        packages: Vec<(String, Option<String>)>,
+    ) -> Result<Generation> {
+        let id = self.next_id().await?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let gen = Generation {
+            id,
+            timestamp,
+            reason: reason.to_string(),
+            packages: packages
+                .into_iter()
+                .map(|(name, version)| PackageRecord { name, version })
+                .collect(),
+        };
+
+        let path = self.manifest_path(id);
+        let raw = serde_json::to_string_pretty(&gen)?;
+        tokio::fs::write(&path, raw).await?;
+
+        // Atomic symlink swap: write to a temp link then rename.
+        let link = current_link(&self.dir);
+        let tmp = self.dir.join(".current.tmp");
+        if tmp.exists() {
+            tokio::fs::remove_file(&tmp).await?;
+        }
+        #[cfg(unix)]
+        tokio::fs::symlink(path.file_name().unwrap(), &tmp).await?;
+        tokio::fs::rename(&tmp, &link).await?;
+
+        Ok(gen)
+    }
+
+    /// Load the current (active) generation, if any.
+    pub async fn current(&self) -> Result<Option<Generation>> {
+        let link = current_link(&self.dir);
+        if !link.exists() {
+            return Ok(None);
+        }
+        let target = tokio::fs::read_link(&link).await?;
+        let manifest = self.dir.join(target);
+        if !manifest.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&manifest).await?;
+        Ok(Some(serde_json::from_str(&raw)?))
+    }
+
+    /// Load all generations, sorted ascending by ID.
+    pub async fn list(&self) -> Result<Vec<Generation>> {
+        let mut gens = Vec::new();
+        let mut entries = tokio::fs::read_dir(&self.dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("gen-") && name.ends_with(".json") {
+                let raw = tokio::fs::read_to_string(entry.path()).await?;
+                if let Ok(gen) = serde_json::from_str::<Generation>(&raw) {
+                    gens.push(gen);
+                }
+            }
+        }
+        gens.sort_by_key(|g| g.id);
+        Ok(gens)
+    }
+
+    /// Load a specific generation by ID.
+    pub async fn get(&self, id: u32) -> Result<Option<Generation>> {
+        let path = self.manifest_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path).await?;
+        Ok(Some(serde_json::from_str(&raw)?))
+    }
+
+    /// Compute what needs to change to go from `from` to `to`.
+    /// Returns (to_install, to_remove).
+    pub fn diff(
+        from: &[PackageRecord],
+        to: &[PackageRecord],
+    ) -> (Vec<PackageRecord>, Vec<PackageRecord>) {
+        let from_names: std::collections::HashSet<_> = from.iter().map(|p| &p.name).collect();
+        let to_names: std::collections::HashSet<_> = to.iter().map(|p| &p.name).collect();
+
+        let to_install: Vec<_> = to
+            .iter()
+            .filter(|p| !from_names.contains(&p.name))
+            .cloned()
+            .collect();
+
+        let to_remove: Vec<_> = from
+            .iter()
+            .filter(|p| !to_names.contains(&p.name))
+            .cloned()
+            .collect();
+
+        (to_install, to_remove)
+    }
+
+    /// ID of the previous generation (one before current), if any.
+    pub async fn previous_id(&self) -> Result<Option<u32>> {
+        let current = self.current().await?;
+        let current_id = match current {
+            Some(g) => g.id,
+            None => return Ok(None),
+        };
+        let all = self.list().await?;
+        let prev = all
+            .iter()
+            .rev()
+            .find(|g| g.id < current_id)
+            .map(|g| g.id);
+        Ok(prev)
+    }
+}

@@ -1,0 +1,219 @@
+use super::{PackageIndex, PackageMetadata};
+use crate::error::{Result, WaxError};
+use flate2::read::GzDecoder;
+use std::io::Read;
+use std::time::{Duration, SystemTime};
+use tar::Archive;
+use tracing::{debug, warn};
+
+pub struct ApkRegistry {
+    mirror: String,
+    branch: String,
+    repos: Vec<String>,
+    arch: String,
+}
+
+impl ApkRegistry {
+    pub fn new(mirror: &str, branch: &str) -> Self {
+        let arch = std::env::consts::ARCH;
+        let apk_arch = match arch {
+            "x86_64" => "x86_64",
+            "aarch64" => "aarch64",
+            "arm" => "armv7",
+            _ => "x86_64",
+        };
+        Self {
+            mirror: mirror.to_string(),
+            branch: branch.to_string(),
+            repos: vec!["main".to_string(), "community".to_string()],
+            arch: apk_arch.to_string(),
+        }
+    }
+
+    pub fn alpine_default() -> Self {
+        Self::new("http://dl-cdn.alpinelinux.org/alpine", "v3.19")
+    }
+
+    fn cache_path(&self) -> Result<std::path::PathBuf> {
+        let dir = crate::ui::dirs::wax_cache_dir()?.join("system");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join(format!("apk-{}.json", self.branch.replace('/', "-"))))
+    }
+
+    fn is_cache_fresh(path: &std::path::Path) -> bool {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
+                    return elapsed < Duration::from_secs(24 * 3600);
+                }
+            }
+        }
+        false
+    }
+
+    pub async fn load(&self, client: &reqwest::Client) -> Result<PackageIndex> {
+        let cache_path = self.cache_path()?;
+
+        if Self::is_cache_fresh(&cache_path) {
+            debug!("Loading APK index from cache: {:?}", cache_path);
+            let data = std::fs::read_to_string(&cache_path)?;
+            let packages: Vec<PackageMetadata> = serde_json::from_str(&data)?;
+            return Ok(PackageIndex { packages });
+        }
+
+        debug!(
+            "Fetching APK index for {} branch={}",
+            self.mirror, self.branch
+        );
+
+        let mut all_packages: Vec<PackageMetadata> = Vec::new();
+
+        for repo in &self.repos {
+            let url = format!(
+                "{}/{}/{}/APKINDEX.tar.gz",
+                self.mirror, self.branch, repo
+            );
+            debug!("Fetching {}", url);
+
+            let resp = client.get(&url).send().await.map_err(|e| {
+                WaxError::InstallError(format!("Failed to fetch APK index from {}: {}", url, e))
+            })?;
+
+            if !resp.status().is_success() {
+                warn!(
+                    "APK index fetch failed for repo {}: HTTP {}",
+                    repo,
+                    resp.status()
+                );
+                continue;
+            }
+
+            let bytes = resp.bytes().await.map_err(|e| {
+                WaxError::InstallError(format!("Failed to read APK index body: {}", e))
+            })?;
+
+            // APKINDEX.tar.gz is a gzipped tar containing an "APKINDEX" file
+            let decoder = GzDecoder::new(&bytes[..]);
+            let mut archive = Archive::new(decoder);
+
+            for entry in archive.entries().map_err(|e| {
+                WaxError::InstallError(format!("Failed to read APKINDEX tar: {}", e))
+            })? {
+                let mut entry = entry.map_err(|e| {
+                    WaxError::InstallError(format!("Failed to read tar entry: {}", e))
+                })?;
+
+                let path = entry.path().map_err(|e| {
+                    WaxError::InstallError(format!("Failed to get entry path: {}", e))
+                })?;
+
+                if path.to_string_lossy() == "APKINDEX" {
+                    let mut content = String::new();
+                    entry.read_to_string(&mut content).map_err(|e| {
+                        WaxError::InstallError(format!("Failed to read APKINDEX: {}", e))
+                    })?;
+
+                    let pkgs = parse_apkindex(
+                        &content,
+                        &self.mirror,
+                        &self.branch,
+                        repo,
+                        &self.arch,
+                    );
+                    debug!("Parsed {} packages from {}/{}", pkgs.len(), self.branch, repo);
+                    all_packages.extend(pkgs);
+                    break;
+                }
+            }
+        }
+
+        // Deduplicate
+        let mut seen = std::collections::HashSet::new();
+        all_packages.retain(|p| seen.insert(p.name.clone()));
+
+        let json = serde_json::to_string(&all_packages)?;
+        std::fs::write(&cache_path, &json)?;
+
+        Ok(PackageIndex {
+            packages: all_packages,
+        })
+    }
+}
+
+fn parse_apkindex(
+    content: &str,
+    mirror: &str,
+    branch: &str,
+    repo: &str,
+    arch: &str,
+) -> Vec<PackageMetadata> {
+    let mut packages = Vec::new();
+
+    for stanza in content.split("\n\n") {
+        let stanza = stanza.trim();
+        if stanza.is_empty() {
+            continue;
+        }
+
+        let mut name = String::new();
+        let mut version = String::new();
+        let mut description = String::new();
+        let mut installed_size: u64 = 0;
+        let mut depends: Vec<String> = Vec::new();
+        let mut provides: Vec<String> = Vec::new();
+
+        for line in stanza.lines() {
+            if line.len() < 2 || line.as_bytes()[1] != b':' {
+                continue;
+            }
+            let key = &line[..1];
+            let val = line[2..].trim();
+
+            match key {
+                "P" => name = val.to_string(),
+                "V" => version = val.to_string(),
+                "T" => description = val.to_string(),
+                "I" => installed_size = val.parse().unwrap_or(0),
+                "D" => {
+                    for dep in val.split_whitespace() {
+                        let dname = super::parse_dep_name(dep);
+                        if !dname.is_empty() && !dname.starts_with('!') {
+                            depends.push(dname.to_string());
+                        }
+                    }
+                }
+                "p" => {
+                    for prov in val.split_whitespace() {
+                        let pname = super::parse_dep_name(prov);
+                        if !pname.is_empty() {
+                            provides.push(pname.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if name.is_empty() || version.is_empty() {
+            continue;
+        }
+
+        let download_url = format!(
+            "{}/{}/{}/{}/{}-{}.apk",
+            mirror, branch, repo, arch, name, version
+        );
+
+        packages.push(PackageMetadata {
+            name,
+            version,
+            description,
+            download_url,
+            sha256: None,
+            installed_size,
+            depends,
+            provides,
+        });
+    }
+
+    packages
+}
