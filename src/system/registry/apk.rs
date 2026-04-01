@@ -69,10 +69,7 @@ impl ApkRegistry {
         let mut all_packages: Vec<PackageMetadata> = Vec::new();
 
         for repo in &self.repos {
-            let url = format!(
-                "{}/{}/{}/APKINDEX.tar.gz",
-                self.mirror, self.branch, repo
-            );
+            let url = format!("{}/{}/{}/APKINDEX.tar.gz", self.mirror, self.branch, repo);
             debug!("Fetching {}", url);
 
             let resp = client.get(&url).send().await.map_err(|e| {
@@ -113,14 +110,14 @@ impl ApkRegistry {
                         WaxError::InstallError(format!("Failed to read APKINDEX: {}", e))
                     })?;
 
-                    let pkgs = parse_apkindex(
-                        &content,
-                        &self.mirror,
-                        &self.branch,
-                        repo,
-                        &self.arch,
+                    let pkgs =
+                        parse_apkindex(&content, &self.mirror, &self.branch, repo, &self.arch);
+                    debug!(
+                        "Parsed {} packages from {}/{}",
+                        pkgs.len(),
+                        self.branch,
+                        repo
                     );
-                    debug!("Parsed {} packages from {}/{}", pkgs.len(), self.branch, repo);
                     all_packages.extend(pkgs);
                     break;
                 }

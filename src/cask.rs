@@ -412,6 +412,32 @@ impl CaskInstaller {
     }
 
     pub async fn detect_writable_bin_dir() -> Result<PathBuf> {
+        if let Ok(path_var) = std::env::var("PATH") {
+            for candidate in std::env::split_paths(&path_var) {
+                if candidate.as_os_str().is_empty() {
+                    continue;
+                }
+                if !Self::looks_like_bin_dir(&candidate) {
+                    continue;
+                }
+
+                if !candidate.exists() && Self::should_create_path_dir(&candidate) {
+                    if let Err(err) = tokio::fs::create_dir_all(&candidate).await {
+                        debug!(
+                            "Skipping PATH bin directory {:?}; failed to create: {}",
+                            candidate, err
+                        );
+                        continue;
+                    }
+                }
+
+                if candidate.exists() && Self::is_dir_writable(&candidate).await {
+                    debug!("Using writable PATH bin directory: {:?}", candidate);
+                    return Ok(candidate);
+                }
+            }
+        }
+
         let candidates = vec![
             crate::bottle::homebrew_prefix().join("bin"),
             PathBuf::from("/usr/local/bin"),
@@ -429,6 +455,18 @@ impl CaskInstaller {
         tokio::fs::create_dir_all(&local_bin).await?;
         debug!("Using fallback bin directory: {:?}", local_bin);
         Ok(local_bin)
+    }
+
+    fn should_create_path_dir(path: &Path) -> bool {
+        let Ok(home) = dirs::home_dir() else {
+            return false;
+        };
+
+        path.is_absolute() && path.starts_with(&home) && Self::looks_like_bin_dir(path)
+    }
+
+    fn looks_like_bin_dir(path: &Path) -> bool {
+        path.file_name().map(|name| name == "bin").unwrap_or(false)
     }
 
     async fn is_dir_writable(path: &Path) -> bool {
@@ -699,7 +737,7 @@ impl CaskInstaller {
         source_rel: &str,
         target_name: Option<&str>,
         cask_name: Option<&str>,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Vec<PathBuf>> {
         let source = self.resolve_source_path(staging, source_rel);
         let name = target_name.unwrap_or_else(|| {
             Path::new(source_rel)
@@ -741,20 +779,15 @@ impl CaskInstaller {
             println!(
                 "  ⚠️  skipping binary: source not found (possibly requires preflight script)"
             );
-            return Ok(None);
+            return Ok(Vec::new());
         }
+
+        validate_binary_for_host(&source).await?;
 
         let bin_dest_dir = Self::detect_writable_bin_dir().await?;
         let binary_dest_path = bin_dest_dir.join(name);
 
-        if let Ok(metadata) = tokio::fs::symlink_metadata(&binary_dest_path).await {
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() || file_type.is_file() {
-                tokio::fs::remove_file(&binary_dest_path).await.ok();
-            } else if file_type.is_dir() {
-                tokio::fs::remove_dir_all(&binary_dest_path).await.ok();
-            }
-        }
+        Self::remove_existing_path(&binary_dest_path).await;
 
         rollback.add(binary_dest_path.clone());
 
@@ -780,19 +813,160 @@ impl CaskInstaller {
             let mut perms = tokio::fs::metadata(&link_target).await?.permissions();
             perms.set_mode(0o755);
             tokio::fs::set_permissions(&link_target, perms).await?;
+
+            let mut installed_paths = vec![binary_dest_path.clone()];
+            let compatibility_links =
+                Self::install_compatibility_links(name, &binary_dest_path, &link_target, rollback)
+                    .await?;
+            installed_paths.extend(compatibility_links);
+
+            info!(
+                "Successfully installed {} to {}",
+                name,
+                bin_dest_dir.display()
+            );
+
+            if let Ok(path_var) = std::env::var("PATH") {
+                let on_path = std::env::split_paths(&path_var).any(|entry| entry == bin_dest_dir);
+                if !on_path {
+                    println!(
+                        "  {} {} is not on PATH; add it to use {} directly",
+                        console::style("!").yellow(),
+                        bin_dest_dir.display(),
+                        name
+                    );
+                }
+            }
+
+            if Self::should_print_shell_refresh_hint(name, &binary_dest_path) {
+                println!(
+                    "  {} shell may still use an older {} path; run `{}` or open a new shell",
+                    console::style("!").yellow(),
+                    name,
+                    shell_refresh_command()
+                );
+            }
+
+            return Ok(installed_paths);
         }
         #[cfg(not(unix))]
         {
             tokio::fs::copy(&source, &binary_dest_path).await?;
+            info!(
+                "Successfully installed {} to {}",
+                name,
+                bin_dest_dir.display()
+            );
+
+            if let Ok(path_var) = std::env::var("PATH") {
+                let on_path = std::env::split_paths(&path_var).any(|entry| entry == bin_dest_dir);
+                if !on_path {
+                    println!(
+                        "  {} {} is not on PATH; add it to use {} directly",
+                        console::style("!").yellow(),
+                        bin_dest_dir.display(),
+                        name
+                    );
+                }
+            }
+
+            Ok(vec![binary_dest_path])
+        }
+    }
+
+    async fn install_compatibility_links(
+        name: &str,
+        primary_path: &Path,
+        link_target: &Path,
+        rollback: &mut RollbackContext,
+    ) -> Result<Vec<PathBuf>> {
+        let mut created = Vec::new();
+        let Ok(home) = dirs::home_dir() else {
+            return Ok(created);
+        };
+
+        let Ok(path_var) = std::env::var("PATH") else {
+            return Ok(created);
+        };
+
+        for entry in std::env::split_paths(&path_var) {
+            if entry == primary_path.parent().unwrap_or(Path::new("")) {
+                continue;
+            }
+            if !entry.starts_with(&home) || !entry.exists() || !Self::is_dir_writable(&entry).await
+            {
+                continue;
+            }
+            if !Self::should_repair_user_bin_dir(&entry) {
+                continue;
+            }
+
+            let candidate = entry.join(name);
+            match tokio::fs::symlink_metadata(&candidate).await {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        if let Ok(target) = tokio::fs::read_link(&candidate).await {
+                            let resolved = if target.is_absolute() {
+                                target
+                            } else {
+                                candidate.parent().unwrap_or(Path::new("/")).join(target)
+                            };
+                            if !resolved.exists() {
+                                Self::remove_existing_path(&candidate).await;
+                                tokio::fs::symlink(link_target, &candidate).await?;
+                                rollback.add(candidate.clone());
+                                created.push(candidate);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    tokio::fs::symlink(link_target, &candidate).await?;
+                    rollback.add(candidate.clone());
+                    created.push(candidate);
+                    break;
+                }
+            }
         }
 
-        info!(
-            "Successfully installed {} to {}",
-            name,
-            bin_dest_dir.display()
-        );
+        Ok(created)
+    }
 
-        Ok(Some(binary_dest_path))
+    fn should_repair_user_bin_dir(path: &Path) -> bool {
+        let Ok(home) = dirs::home_dir() else {
+            return false;
+        };
+        if !path.starts_with(&home) {
+            return false;
+        }
+
+        let path_str = path.to_string_lossy();
+        path_str.ends_with("/.local/bin")
+            || path_str.ends_with("/.npm-global/bin")
+            || path_str.ends_with("/bin")
+    }
+
+    async fn remove_existing_path(path: &Path) {
+        if let Ok(metadata) = tokio::fs::symlink_metadata(path).await {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() || file_type.is_file() {
+                tokio::fs::remove_file(path).await.ok();
+            } else if file_type.is_dir() {
+                tokio::fs::remove_dir_all(path).await.ok();
+            }
+        }
+    }
+
+    fn should_print_shell_refresh_hint(name: &str, primary_path: &Path) -> bool {
+        let Ok(path_var) = std::env::var("PATH") else {
+            return false;
+        };
+
+        std::env::split_paths(&path_var).any(|entry| {
+            let candidate = entry.join(name);
+            candidate != primary_path && candidate.exists()
+        })
     }
 
     #[instrument(skip(self, staging, rollback))]
@@ -834,7 +1008,6 @@ impl CaskInstaller {
         rollback: &mut RollbackContext,
         source_rel: &str,
     ) -> Result<()> {
-
         let source = self.resolve_source_path(staging, source_rel);
         let man_name = Path::new(source_rel)
             .file_name()
@@ -871,7 +1044,6 @@ impl CaskInstaller {
         source_rel: &str,
         target_path: &str,
     ) -> Result<()> {
-
         let source = self.resolve_source_path(staging, source_rel);
         let dest = PathBuf::from(target_path);
 
@@ -913,7 +1085,6 @@ impl CaskInstaller {
         source_rel: &str,
         dest_parent: &Path,
     ) -> Result<()> {
-
         let source = self.resolve_source_path(staging, source_rel);
         let name = Path::new(source_rel)
             .file_name()
@@ -962,8 +1133,6 @@ impl CaskInstaller {
         token: &str,
         target_name: Option<&str>,
     ) -> Result<()> {
-
-
         let source = self.resolve_source_path(staging, source_rel);
 
         if !source.exists() {
@@ -1019,6 +1188,36 @@ impl CaskInstaller {
         }
 
         Ok(())
+    }
+}
+
+async fn validate_binary_for_host(path: &Path) -> Result<()> {
+    let content = tokio::fs::read(path).await?;
+    if content.len() < 4 {
+        return Ok(());
+    }
+
+    let is_elf = &content[0..4] == b"\x7fELF";
+    let is_macho = crate::bottle::is_mach_o(&content);
+
+    match std::env::consts::OS {
+        "linux" if is_macho => Err(WaxError::InstallError(format!(
+            "Refusing to install macOS Mach-O binary on Linux: {}",
+            path.display()
+        ))),
+        "macos" if is_elf => Err(WaxError::InstallError(format!(
+            "Refusing to install Linux ELF binary on macOS: {}",
+            path.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn shell_refresh_command() -> &'static str {
+    match std::env::var("SHELL") {
+        Ok(shell) if shell.contains("zsh") => "rehash",
+        Ok(shell) if shell.contains("fish") => "exec fish",
+        _ => "hash -r",
     }
 }
 

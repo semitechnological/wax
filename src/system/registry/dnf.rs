@@ -19,9 +19,7 @@ impl DnfRegistry {
     }
 
     pub fn fedora_default() -> Self {
-        Self::new(
-            "https://dl.fedoraproject.org/pub/fedora/linux/releases/39/Everything/x86_64/os/",
-        )
+        Self::new("https://dl.fedoraproject.org/pub/fedora/linux/releases/39/Everything/x86_64/os/")
     }
 
     fn cache_path(&self) -> Result<std::path::PathBuf> {
@@ -67,9 +65,10 @@ impl DnfRegistry {
         debug!("Fetching DNF repomd.xml from {}", self.baseurl);
 
         let repomd_url = format!("{}/repodata/repomd.xml", self.baseurl);
-        let resp = client.get(&repomd_url).send().await.map_err(|e| {
-            WaxError::InstallError(format!("Failed to fetch repomd.xml: {}", e))
-        })?;
+        let resp =
+            client.get(&repomd_url).send().await.map_err(|e| {
+                WaxError::InstallError(format!("Failed to fetch repomd.xml: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             return Err(WaxError::InstallError(format!(
@@ -78,9 +77,10 @@ impl DnfRegistry {
             )));
         }
 
-        let repomd_xml = resp.text().await.map_err(|e| {
-            WaxError::InstallError(format!("Failed to read repomd.xml: {}", e))
-        })?;
+        let repomd_xml = resp
+            .text()
+            .await
+            .map_err(|e| WaxError::InstallError(format!("Failed to read repomd.xml: {}", e)))?;
 
         let primary_location = find_primary_location(&repomd_xml).ok_or_else(|| {
             WaxError::InstallError("Could not find primary.xml in repomd.xml".to_string())
@@ -89,9 +89,10 @@ impl DnfRegistry {
         let primary_url = format!("{}/{}", self.baseurl, primary_location);
         debug!("Fetching primary index: {}", primary_url);
 
-        let resp = client.get(&primary_url).send().await.map_err(|e| {
-            WaxError::InstallError(format!("Failed to fetch primary.xml: {}", e))
-        })?;
+        let resp =
+            client.get(&primary_url).send().await.map_err(|e| {
+                WaxError::InstallError(format!("Failed to fetch primary.xml: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             return Err(WaxError::InstallError(format!(
@@ -100,9 +101,10 @@ impl DnfRegistry {
             )));
         }
 
-        let bytes = resp.bytes().await.map_err(|e| {
-            WaxError::InstallError(format!("Failed to read primary index: {}", e))
-        })?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| WaxError::InstallError(format!("Failed to read primary index: {}", e)))?;
 
         let xml_content = if primary_location.ends_with(".gz") {
             let mut decoder = GzDecoder::new(&bytes[..]);
@@ -126,9 +128,8 @@ impl DnfRegistry {
             })?
         };
 
-        let packages = parse_primary_xml(&xml_content, &self.baseurl).map_err(|e| {
-            WaxError::InstallError(format!("Failed to parse primary.xml: {}", e))
-        })?;
+        let packages = parse_primary_xml(&xml_content, &self.baseurl)
+            .map_err(|e| WaxError::InstallError(format!("Failed to parse primary.xml: {}", e)))?;
 
         debug!("Parsed {} packages from DNF repo", packages.len());
 

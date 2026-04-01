@@ -200,6 +200,20 @@ impl GenerationManager {
         (to_install, to_remove)
     }
 
+    pub fn diff_records(
+        from: &[(String, Option<String>)],
+        to: &[PackageRecord],
+    ) -> (Vec<PackageRecord>, Vec<PackageRecord>) {
+        let from_records: Vec<PackageRecord> = from
+            .iter()
+            .map(|(name, version)| PackageRecord {
+                name: name.clone(),
+                version: version.clone(),
+            })
+            .collect();
+        Self::diff(&from_records, to)
+    }
+
     /// ID of the previous generation (one before current), if any.
     pub async fn previous_id(&self) -> Result<Option<u32>> {
         let current = self.current().await?;
@@ -208,11 +222,7 @@ impl GenerationManager {
             None => return Ok(None),
         };
         let all = self.list().await?;
-        let prev = all
-            .iter()
-            .rev()
-            .find(|g| g.id < current_id)
-            .map(|g| g.id);
+        let prev = all.iter().rev().find(|g| g.id < current_id).map(|g| g.id);
         Ok(prev)
     }
 }
@@ -326,12 +336,24 @@ mod tests {
     #[test]
     fn test_diff_mixed() {
         let from = vec![
-            PackageRecord { name: "curl".to_string(), version: None },
-            PackageRecord { name: "wget".to_string(), version: None },
+            PackageRecord {
+                name: "curl".to_string(),
+                version: None,
+            },
+            PackageRecord {
+                name: "wget".to_string(),
+                version: None,
+            },
         ];
         let to = vec![
-            PackageRecord { name: "wget".to_string(), version: None },
-            PackageRecord { name: "nginx".to_string(), version: None },
+            PackageRecord {
+                name: "wget".to_string(),
+                version: None,
+            },
+            PackageRecord {
+                name: "nginx".to_string(),
+                version: None,
+            },
         ];
         let (install, remove) = GenerationManager::diff(&from, &to);
         assert_eq!(install.len(), 1);

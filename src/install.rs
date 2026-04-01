@@ -1,4 +1,6 @@
-use crate::bottle::{detect_platform, homebrew_prefix, run_command_with_timeout};
+use crate::bottle::{
+    detect_platform, homebrew_prefix, managed_homebrew_prefix, run_command_with_timeout,
+};
 use crate::error::{Result, WaxError};
 use crate::sudo;
 use crate::ui::dirs;
@@ -18,10 +20,10 @@ pub enum InstallMode {
 
 impl InstallMode {
     pub fn detect() -> Self {
-        let prefix = homebrew_prefix();
+        let prefix = managed_homebrew_prefix().unwrap_or_else(homebrew_prefix);
 
         let cellar = prefix.join("Cellar");
-        if (cellar.exists() || prefix.exists()) && is_writable(&prefix) {
+        if cellar.exists() && is_writable(&prefix) {
             return InstallMode::Global;
         }
 
@@ -41,7 +43,11 @@ impl InstallMode {
 
     pub fn validate(&self) -> Result<()> {
         if *self == InstallMode::Global {
-            let prefix = homebrew_prefix();
+            let prefix = managed_homebrew_prefix().ok_or_else(|| {
+                WaxError::InstallError(
+                    "Global installs require an existing Homebrew/Linuxbrew prefix. Use --user or set WAX_HOMEBREW_PREFIX to a managed prefix.".to_string(),
+                )
+            })?;
             if !is_writable(&prefix) {
                 return Err(WaxError::InstallError(format!(
                     "Cannot write to {}. This usually means:\n  \
@@ -206,7 +212,10 @@ impl InstallState {
     }
 
     fn detect_install_mode(&self, cellar: &Path) -> InstallMode {
-        if cellar.starts_with("/opt/homebrew") || cellar.starts_with("/usr/local") {
+        if cellar.starts_with("/opt/homebrew")
+            || cellar.starts_with("/usr/local")
+            || cellar.starts_with("/home/linuxbrew/.linuxbrew")
+        {
             InstallMode::Global
         } else {
             InstallMode::User

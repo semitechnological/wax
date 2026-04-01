@@ -83,16 +83,20 @@ impl AptRegistry {
                 if let Err(e) = verify_gpg(&bytes).await {
                     warn!("GPG verification of InRelease failed: {}", e);
                 }
-                Some(parse_inrelease_hashes(
-                    &String::from_utf8_lossy(&bytes),
-                ))
+                Some(parse_inrelease_hashes(&String::from_utf8_lossy(&bytes)))
             }
             Ok(resp) => {
-                warn!("InRelease not available (HTTP {}), skipping hash verification", resp.status());
+                warn!(
+                    "InRelease not available (HTTP {}), skipping hash verification",
+                    resp.status()
+                );
                 None
             }
             Err(e) => {
-                warn!("Could not fetch InRelease ({}), skipping hash verification", e);
+                warn!(
+                    "Could not fetch InRelease ({}), skipping hash verification",
+                    e
+                );
                 None
             }
         };
@@ -101,10 +105,7 @@ impl AptRegistry {
 
         for component in &self.components {
             let packages_gz_path = format!("{}/binary-{}/Packages.gz", component, self.arch);
-            let url = format!(
-                "{}/dists/{}/{}",
-                self.mirror, self.suite, packages_gz_path
-            );
+            let url = format!("{}/dists/{}/{}", self.mirror, self.suite, packages_gz_path);
             debug!("Fetching {}", url);
 
             let resp = client.get(&url).send().await.map_err(|e| {
@@ -180,9 +181,8 @@ async fn verify_gpg(inrelease_bytes: &[u8]) -> Result<()> {
     let mut tmp = NamedTempFile::new().map_err(|e| {
         WaxError::InstallError(format!("Failed to create temp file for GPG: {}", e))
     })?;
-    tmp.write_all(inrelease_bytes).map_err(|e| {
-        WaxError::InstallError(format!("Failed to write temp file for GPG: {}", e))
-    })?;
+    tmp.write_all(inrelease_bytes)
+        .map_err(|e| WaxError::InstallError(format!("Failed to write temp file for GPG: {}", e)))?;
     tmp.flush().ok();
 
     let path = tmp.path().to_path_buf();
@@ -198,7 +198,10 @@ async fn verify_gpg(inrelease_bytes: &[u8]) -> Result<()> {
             return Ok(());
         }
         Err(e) => {
-            debug!("gpg execution error ({}), skipping signature verification", e);
+            debug!(
+                "gpg execution error ({}), skipping signature verification",
+                e
+            );
             return Ok(());
         }
     };

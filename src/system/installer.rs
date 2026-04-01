@@ -3,7 +3,7 @@ use crate::error::{Result, WaxError};
 use crate::system::extractor::extract_package_tracked;
 use crate::system::manifest::FileManifest;
 use crate::system::registry::PackageMetadata;
-use crate::ui::{PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE};
+use crate::ui::{ProgressBarGuard, PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::Digest;
 use std::io::Read;
@@ -95,13 +95,15 @@ impl SystemInstaller {
             let pb_clone = pb.clone();
 
             tasks.push(tokio::spawn(async move {
-                let _permit = sem.acquire_many(max_conns as u32).await.map_err(|e| {
-                    WaxError::InstallError(format!("Semaphore error: {}", e))
-                })?;
+                let _permit = sem
+                    .acquire_many(max_conns as u32)
+                    .await
+                    .map_err(|e| WaxError::InstallError(format!("Semaphore error: {}", e)))?;
 
                 debug!("Downloading {} from {}", pkg_name, url);
+                let mut clear_guard = ProgressBarGuard::new(&pb_clone);
                 dl.download(&url, &dest, Some(&pb_clone), max_conns).await?;
-                pb_clone.finish_and_clear();
+                clear_guard.clear_now();
 
                 // Verify SHA256 if available
                 if let Some(ref expected) = sha256 {
@@ -129,7 +131,10 @@ impl SystemInstaller {
                 debug!("Extracted {} to {:?}", pkg_name, prefix_buf);
 
                 Ok::<(String, String, Vec<PathBuf>, Vec<PathBuf>), WaxError>((
-                    pkg_name, pkg_version, files, dirs,
+                    pkg_name,
+                    pkg_version,
+                    files,
+                    dirs,
                 ))
             }));
         }
@@ -161,7 +166,10 @@ impl SystemInstaller {
                     .as_secs() as i64,
             };
             if let Err(e) = manifest.save().await {
-                warn!("Failed to save file manifest for {}: {}", manifest.package, e);
+                warn!(
+                    "Failed to save file manifest for {}: {}",
+                    manifest.package, e
+                );
             }
         }
 

@@ -13,6 +13,7 @@ use tracing::debug;
 /// A detected system package manager.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SystemPm {
+    Brew,
     Apt,
     Dnf,
     Pacman,
@@ -28,6 +29,7 @@ impl SystemPm {
     /// Human-readable name.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Brew => "brew",
             Self::Apt => "apt",
             Self::Dnf => "dnf",
             Self::Pacman => "pacman",
@@ -40,11 +42,10 @@ impl SystemPm {
         }
     }
 
-    /// Detect the first available system package manager on the current host.
-    /// Returns `None` on macOS or when no supported PM is found.
+    /// Detect the most appropriate system package manager on the current host.
     pub async fn detect() -> Option<Self> {
         if cfg!(target_os = "macos") {
-            return None;
+            return which("brew").await.then_some(Self::Brew);
         }
 
         let candidates: &[(&str, Self)] = &[
@@ -57,6 +58,7 @@ impl SystemPm {
             ("yum", Self::Yum),
             ("xbps-install", Self::Xbps),
             ("nix-env", Self::Nix),
+            ("brew", Self::Brew),
         ];
 
         for (bin, pm) in candidates {
@@ -74,6 +76,10 @@ impl SystemPm {
     pub async fn upgrade_all(&self) -> Result<()> {
         // For apt we need to do "update" then "upgrade" as two steps.
         match self {
+            Self::Brew => {
+                run_visible("brew", &["update"]).await?;
+                run_visible("brew", &["upgrade"]).await?;
+            }
             Self::Apt => {
                 run_visible("sudo", &["apt-get", "update", "-q"]).await?;
                 run_visible("sudo", &["apt-get", "upgrade", "-y"]).await?;
@@ -121,6 +127,11 @@ impl SystemPm {
         let pkg_args: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
 
         match self {
+            Self::Brew => {
+                let mut args = vec!["install"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("brew", &args).await?;
+            }
             Self::Apt => {
                 let mut args = vec!["apt-get", "install", "-y"];
                 args.extend_from_slice(&pkg_args);
@@ -169,6 +180,90 @@ impl SystemPm {
         }
         Ok(())
     }
+
+    /// List packages currently installed by this package manager.
+    pub async fn list_installed(&self) -> Result<Vec<(String, Option<String>)>> {
+        match self {
+            Self::Brew => list_installed_with("brew", &["list", "--versions"]).await,
+            Self::Apt => {
+                list_installed_with("dpkg-query", &["-W", r#"-f=${Package}\t${Version}\n"#]).await
+            }
+            Self::Dnf | Self::Yum | Self::Zypper => {
+                list_installed_with(
+                    "rpm",
+                    &["-qa", "--queryformat", "%{NAME}\t%{VERSION}-%{RELEASE}\n"],
+                )
+                .await
+            }
+            Self::Pacman => list_installed_with("pacman", &["-Q"]).await,
+            Self::Apk => list_installed_with("apk", &["info", "-v"]).await,
+            Self::Emerge => list_installed_with("qlist", &["-ICv"]).await,
+            Self::Xbps => list_installed_with("xbps-query", &["-l"]).await,
+            Self::Nix => list_installed_with("nix-env", &["-q"]).await,
+        }
+    }
+
+    pub async fn remove(&self, packages: &[String]) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        let pkg_args: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
+
+        match self {
+            Self::Brew => {
+                let mut args = vec!["uninstall"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("brew", &args).await?;
+            }
+            Self::Apt => {
+                let mut args = vec!["apt-get", "remove", "-y"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("sudo", &args).await?;
+            }
+            Self::Dnf => {
+                let mut args = vec!["dnf", "remove", "-y"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("sudo", &args).await?;
+            }
+            Self::Pacman => {
+                let mut args = vec!["pacman", "-R", "--noconfirm"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("sudo", &args).await?;
+            }
+            Self::Apk => {
+                let mut args = vec!["apk", "del"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("sudo", &args).await?;
+            }
+            Self::Zypper => {
+                let mut args = vec!["zypper", "remove", "-y"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("sudo", &args).await?;
+            }
+            Self::Emerge => {
+                let mut args = vec!["emerge", "--unmerge"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("sudo", &args).await?;
+            }
+            Self::Yum => {
+                let mut args = vec!["yum", "remove", "-y"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("sudo", &args).await?;
+            }
+            Self::Xbps => {
+                let mut args = vec!["xbps-remove", "-R"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("sudo", &args).await?;
+            }
+            Self::Nix => {
+                let mut args = vec!["-e"];
+                args.extend_from_slice(&pkg_args);
+                run_visible("nix-env", &args).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Check if a binary exists on PATH.
@@ -181,11 +276,6 @@ async fn which(bin: &str) -> bool {
         .await
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-/// Public re-export used by `system/mod.rs` for remove operations.
-pub async fn run_visible_pub(program: &str, args: &[&str]) -> Result<()> {
-    run_visible(program, args).await
 }
 
 /// Run a command, inheriting stdin/stdout/stderr so the user sees all output
@@ -215,4 +305,74 @@ async fn run_visible(program: &str, args: &[&str]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+async fn list_installed_with(
+    program: &str,
+    args: &[&str],
+) -> Result<Vec<(String, Option<String>)>> {
+    let output = Command::new(program).args(args).output().await;
+    let Ok(output) = output else {
+        return Ok(Vec::new());
+    };
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let mut packages = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let (name, version) = if program == "apk" {
+            if let Some(idx) = line.rfind('-') {
+                let name = &line[..idx];
+                let version = &line[idx + 1..];
+                if version
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                {
+                    (name.to_string(), Some(version.to_string()))
+                } else {
+                    (line.to_string(), None)
+                }
+            } else {
+                (line.to_string(), None)
+            }
+        } else if program == "xbps-query" {
+            let rest = line.strip_prefix("ii ").unwrap_or(line);
+            if let Some((name, version)) = rest.rsplit_once('-') {
+                (name.to_string(), Some(version.to_string()))
+            } else {
+                (rest.to_string(), None)
+            }
+        } else if program == "nix-env" {
+            if let Some((name, version)) = line.rsplit_once('-') {
+                (name.to_string(), Some(version.to_string()))
+            } else {
+                (line.to_string(), None)
+            }
+        } else if let Some((name, version)) = line.split_once('\t') {
+            (name.trim().to_string(), Some(version.trim().to_string()))
+        } else {
+            let mut split = line.split_whitespace();
+            let Some(name) = split.next() else {
+                continue;
+            };
+            (name.to_string(), split.next().map(|s| s.to_string()))
+        };
+
+        if name.is_empty() {
+            continue;
+        }
+        packages.push((name, version));
+    }
+
+    packages.sort_by(|a, b| a.0.cmp(&b.0));
+    packages.dedup_by(|a, b| a.0 == b.0);
+    Ok(packages)
 }

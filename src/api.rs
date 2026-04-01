@@ -1,5 +1,6 @@
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tracing::{info, instrument};
 
 const FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula.json";
@@ -83,6 +84,14 @@ pub struct CaskDetails {
     pub url: String,
     pub sha256: String,
     pub artifacts: Option<Vec<CaskArtifact>>,
+    #[serde(default)]
+    pub variations: HashMap<String, CaskVariation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaskVariation {
+    pub url: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +175,15 @@ impl Formula {
             .and_then(|b| b.stable.as_ref())
             .map(|s| s.rebuild)
             .unwrap_or(0)
+    }
+}
+
+impl CaskDetails {
+    pub fn select_download_for_platform(&mut self, platform: &str) {
+        if let Some(variation) = self.variations.get(platform) {
+            self.url = variation.url.clone();
+            self.sha256 = variation.sha256.clone();
+        }
     }
 }
 

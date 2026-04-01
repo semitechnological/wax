@@ -1,5 +1,5 @@
 use crate::api::{CaskArtifact, Formula};
-use crate::bottle::{detect_platform, BottleDownloader};
+use crate::bottle::{detect_platform, should_prefer_source_build, BottleDownloader};
 use crate::builder::Builder;
 use crate::cache::Cache;
 use crate::cask::{
@@ -14,7 +14,8 @@ use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackag
 use crate::signal::{check_cancelled, CriticalSection};
 use crate::tap::TapManager;
 use crate::ui::{
-    copy_dir_all, dirs, PROGRESS_BAR_CHARS, PROGRESS_BAR_PREFIX_TEMPLATE, PROGRESS_BAR_TEMPLATE,
+    copy_dir_all, dirs, ProgressBarGuard, PROGRESS_BAR_CHARS, PROGRESS_BAR_PREFIX_TEMPLATE,
+    PROGRESS_BAR_TEMPLATE,
 };
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -441,6 +442,12 @@ async fn install_impl(
         return Ok(());
     }
 
+    let force_source_on_host = should_prefer_source_build();
+    let build_from_source = build_from_source || force_source_on_host;
+    if force_source_on_host && !quiet {
+        println!("building from source on this Linux host to avoid incompatible binary bottles");
+    }
+
     let platform = detect_platform();
     debug!("Detected platform: {}", platform);
 
@@ -641,11 +648,12 @@ async fn install_impl(
             crate::signal::set_current_op(format!("downloading {}", name));
 
             let tarball_path = temp_dir.path().join(format!("{}-{}.tar.gz", name, version));
+            let mut clear_guard = ProgressBarGuard::new(&pb);
 
             downloader
                 .download(&url, &tarball_path, Some(&pb), conns)
                 .await?;
-            pb.finish_and_clear();
+            clear_guard.clear_now();
 
             // Release the download permit before extraction so the next package
             // can start downloading immediately rather than waiting for CPU-bound work.
@@ -710,12 +718,8 @@ async fn install_impl(
     let extracted_packages_count = extracted_packages.len();
     check_cancelled()?;
 
-    // Drop MultiProgress before the install phase so its draw layer releases
-    // stdout and plain println! calls in install_extracted_bottle are visible.
-    drop(multi);
-
-    if !quiet {
-        println!();
+    if !quiet && extracted_packages_count > 0 {
+        let _ = multi.println(String::new());
     }
     for (name, version, extract_dir, bottle_sha, bottle_rebuild) in extracted_packages {
         let spinner = if quiet {
@@ -731,6 +735,7 @@ async fn install_impl(
             pb.enable_steady_tick(std::time::Duration::from_millis(80));
             pb
         };
+        let _spinner_guard = ProgressBarGuard::new(&spinner);
         install_extracted_bottle(
             &name,
             &version,
@@ -742,17 +747,16 @@ async fn install_impl(
             &platform,
             &state,
             quiet,
-            None,
+            Some(&multi),
             Some(spinner.clone()),
         )
         .await?;
-        spinner.finish_and_clear();
         if !quiet {
-            println!(
+            let _ = multi.println(format!(
                 "+ {}@{}",
                 style(&name).magenta(),
                 style(&version).dim()
-            );
+            ));
         }
     }
 
@@ -911,6 +915,9 @@ pub async fn install_extracted_bottle(
         )?;
     }
 
+    step!("validating runtime...");
+    BottleDownloader::validate_runtime(&formula_cellar)?;
+
     step!("symlinking...");
     create_symlinks(name, &cellar_version, cellar, false, install_mode).await?;
 
@@ -964,13 +971,13 @@ struct DownloadedCask {
 #[instrument(skip(cache))]
 async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> Result<()> {
     let start = std::time::Instant::now();
+    let cask_platform = detect_platform();
 
     // Reuse the globally active MultiProgress if one is running (e.g. upgrade),
     // so download bars appear inside the existing render layer instead of a
     // competing one that causes terminal tearing.
-    let multi: Arc<MultiProgress> = Arc::new(
-        crate::signal::clone_active_multi().unwrap_or_else(MultiProgress::new),
-    );
+    let multi: Arc<MultiProgress> =
+        Arc::new(crate::signal::clone_active_multi().unwrap_or_else(MultiProgress::new));
 
     let casks = cache.load_casks().await?;
     let _state = CaskState::new()?;
@@ -1034,9 +1041,23 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
             let inst = Arc::clone(&installer);
             let sem = Arc::clone(&semaphore);
             let name = name.clone();
+            let platform = cask_platform.clone();
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                let details = api.fetch_cask_details(&name).await?;
+                let mut details = api.fetch_cask_details(&name).await?;
+                details.select_download_for_platform(&platform);
+
+                if platform.ends_with("_linux")
+                    && (details.url.contains("/darwin")
+                        || details.url.contains("/macos")
+                        || details.url.contains("apple-darwin"))
+                {
+                    return Err(WaxError::InstallError(format!(
+                        "Cask '{}' does not provide a Linux artifact for platform {}. Refusing to download macOS binary: {}",
+                        name, platform, details.url
+                    )));
+                }
+
                 let artifact_type = if let Some(t) = detect_artifact_type(&details.url) {
                     t
                 } else if let Some(t) = inst.probe_artifact_type(&details.url).await {
@@ -1095,10 +1116,11 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
                         .progress_chars(PROGRESS_BAR_CHARS),
                 );
                 pb.set_prefix(name.clone());
+                let mut clear_guard = ProgressBarGuard::new(&pb);
 
                 inst.download_cask(&details.url, &download_path, Some(&pb))
                     .await?;
-                pb.finish_and_clear();
+                clear_guard.clear_now();
 
                 Ok::<_, WaxError>(DownloadedCask {
                     name,
@@ -1120,9 +1142,6 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    // Drop multi before the install phase so its draw layer releases stdout.
-    drop(multi);
-
     // --- Phase 3: verify checksums + install serially ---
     let mut installed_count = 0;
     let mut failed = Vec::new();
@@ -1141,17 +1160,19 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
             continue;
         }
 
-        let result = install_from_downloaded(&d.details, d.artifact_type, &d.download_path).await;
+        let result =
+            install_from_downloaded(&d.details, d.artifact_type, &d.download_path, Some(&multi))
+                .await;
         match result {
             Ok(installed_cask) => {
                 let state = CaskState::new()?;
                 state.add(installed_cask).await?;
-                println!(
+                let _ = multi.println(format!(
                     "{} {} (cask) {}",
                     style("✓").green().bold(),
                     style(&d.name).magenta(),
                     style(&d.details.version).dim()
-                );
+                ));
                 installed_count += 1;
             }
             Err(e) => {
@@ -1260,10 +1281,15 @@ async fn install_from_downloaded(
     cask: &crate::api::CaskDetails,
     artifact_type: &'static str,
     download_path: &std::path::Path,
+    multi: Option<&MultiProgress>,
 ) -> Result<InstalledCask> {
     let installer = CaskInstaller::new();
 
-    let spinner = ProgressBar::new_spinner();
+    let spinner = if let Some(multi) = multi {
+        multi.insert_from_back(1, ProgressBar::new_spinner())
+    } else {
+        ProgressBar::new_spinner()
+    };
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.cyan} {msg}")
@@ -1271,6 +1297,7 @@ async fn install_from_downloaded(
             .tick_chars(crate::ui::SPINNER_TICK_CHARS),
     );
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    let _spinner_guard = ProgressBarGuard::new(&spinner);
 
     macro_rules! step {
         ($msg:expr) => {
@@ -1334,7 +1361,7 @@ async fn install_from_downloaded(
                             None
                         };
                         step!(format!("installing binary: {}", source));
-                        if let Some(path) = installer
+                        for path in installer
                             .install_binary(
                                 &staging,
                                 &mut rollback,
@@ -1568,7 +1595,6 @@ async fn install_from_downloaded(
 
     step!("registering...");
     rollback.commit();
-    spinner.finish_and_clear();
 
     Ok(InstalledCask {
         name: cask.token.clone(),

@@ -1,7 +1,7 @@
-pub mod apt;
 pub mod apk;
-pub mod pacman;
+pub mod apt;
 pub mod dnf;
+pub mod pacman;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,14 +23,11 @@ pub struct PackageIndex {
 
 impl PackageIndex {
     pub fn find(&self, name: &str) -> Option<&PackageMetadata> {
-        self.packages
-            .iter()
-            .find(|p| p.name == name)
-            .or_else(|| {
-                self.packages
-                    .iter()
-                    .find(|p| p.provides.iter().any(|prov| prov == name))
-            })
+        self.packages.iter().find(|p| p.name == name).or_else(|| {
+            self.packages
+                .iter()
+                .find(|p| p.provides.iter().any(|prov| prov == name))
+        })
     }
 }
 

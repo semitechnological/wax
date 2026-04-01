@@ -650,25 +650,6 @@ impl BottleDownloader {
             std::fs::set_permissions(path, perms)?;
         }
 
-        let interpreter = format!("{}/lib/ld.so", prefix);
-        if Path::new(&interpreter).exists() {
-            let output = Command::new(&patchelf)
-                .args([
-                    "--set-interpreter",
-                    &interpreter,
-                    path.to_str().unwrap_or_default(),
-                ])
-                .output();
-            if let Ok(out) = output {
-                if !out.status.success() {
-                    debug!(
-                        "patchelf set-interpreter failed: {:?}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                }
-            }
-        }
-
         if let Ok(output) = Command::new(&patchelf)
             .args(["--print-rpath", path.to_str().unwrap_or_default()])
             .output()
@@ -697,6 +678,13 @@ impl BottleDownloader {
         }
 
         Ok(())
+    }
+
+    pub fn validate_runtime(dir: &Path) -> Result<()> {
+        if std::env::consts::OS != "linux" {
+            return Ok(());
+        }
+        validate_runtime_dir(dir)
     }
 
     fn relocate_macho(path: &Path, prefix: &str, cellar: &str) -> Result<()> {
@@ -921,6 +909,78 @@ fn which_patchelf() -> Option<String> {
     None
 }
 
+fn validate_runtime_dir(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            validate_runtime_dir(&path)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let content = match std::fs::read(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+
+        if content.len() < 4 || &content[0..4] != b"\x7fELF" {
+            continue;
+        }
+
+        if let Some(interpreter) = elf_interpreter(&path) {
+            if interpreter.starts_with('/') && !Path::new(&interpreter).exists() {
+                return Err(WaxError::InstallError(format!(
+                    "Installed binary has missing runtime loader: {} -> {}",
+                    path.display(),
+                    interpreter
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn elf_interpreter(path: &Path) -> Option<String> {
+    if let Some(patchelf) = which_patchelf() {
+        if let Ok(output) = Command::new(&patchelf)
+            .args(["--print-interpreter", path.to_str()?])
+            .output()
+        {
+            if output.status.success() {
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    if let Ok(output) = Command::new("readelf")
+        .args(["-l", path.to_str()?])
+        .output()
+    {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let (Some(start), Some(end)) = (line.find('['), line.find(']')) {
+                    let value = line[start + 1..end].trim();
+                    if value.starts_with('/') {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 impl Default for BottleDownloader {
     fn default() -> Self {
         Self::new()
@@ -1000,6 +1060,13 @@ fn macos_version() -> String {
 }
 
 pub fn homebrew_prefix() -> PathBuf {
+    if let Ok(prefix) = std::env::var("WAX_HOMEBREW_PREFIX") {
+        let path = PathBuf::from(prefix);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
 
@@ -1012,8 +1079,10 @@ pub fn homebrew_prefix() -> PathBuf {
             let linuxbrew = PathBuf::from("/home/linuxbrew/.linuxbrew");
             if linuxbrew.join("Cellar").exists() {
                 linuxbrew
-            } else {
+            } else if PathBuf::from("/usr/local").join("Cellar").exists() {
                 PathBuf::from("/usr/local")
+            } else {
+                linuxbrew
             }
         }
         _ => PathBuf::from("/usr/local"),
@@ -1033,4 +1102,47 @@ pub fn homebrew_prefix() -> PathBuf {
     }
 
     standard_prefix
+}
+
+pub fn managed_homebrew_prefix() -> Option<PathBuf> {
+    if let Ok(prefix) = std::env::var("WAX_HOMEBREW_PREFIX") {
+        let path = PathBuf::from(prefix);
+        if path.join("Cellar").exists() {
+            return Some(path);
+        }
+    }
+
+    if let Some(prefix_str) = run_command_with_timeout("brew", &["--prefix"], 2) {
+        let path = PathBuf::from(prefix_str);
+        if path.join("Cellar").exists() {
+            return Some(path);
+        }
+    }
+
+    for candidate in [
+        PathBuf::from("/opt/homebrew"),
+        PathBuf::from("/usr/local"),
+        PathBuf::from("/home/linuxbrew/.linuxbrew"),
+    ] {
+        if candidate.join("Cellar").exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+pub fn should_prefer_source_build() -> bool {
+    if std::env::consts::OS != "linux" {
+        return false;
+    }
+
+    let Ok(raw) = std::fs::read_to_string("/etc/os-release") else {
+        return false;
+    };
+
+    raw.lines().any(|line| {
+        let value = line.trim();
+        value == "ID=nixos" || value == "ID=\"nixos\"" || value.contains("ID_LIKE=nixos")
+    })
 }

@@ -3,10 +3,11 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PackageFormat {
-    Deb,  // apt / dpkg
-    Rpm,  // dnf / rpm
+    Brew,
+    Deb, // apt / dpkg
+    Rpm, // dnf / rpm
     Pacman,
-    Apk,  // Alpine
+    Apk, // Alpine
     Other,
 }
 
@@ -21,6 +22,18 @@ pub struct DistroInfo {
 
 impl DistroInfo {
     pub async fn detect() -> Result<Option<Self>> {
+        if cfg!(target_os = "macos") {
+            let version =
+                crate::bottle::run_command_with_timeout("sw_vers", &["-productVersion"], 1)
+                    .unwrap_or_default();
+            return Ok(Some(DistroInfo {
+                id: "macos".to_string(),
+                name: "macOS".to_string(),
+                version,
+                format: PackageFormat::Brew,
+            }));
+        }
+
         let path = "/etc/os-release";
         let Ok(raw) = tokio::fs::read_to_string(path).await else {
             return Ok(None);
@@ -36,10 +49,7 @@ impl DistroInfo {
             .collect();
 
         let id = fields.get("ID").cloned().unwrap_or_default();
-        let name = fields
-            .get("NAME")
-            .cloned()
-            .unwrap_or_else(|| id.clone());
+        let name = fields.get("NAME").cloned().unwrap_or_else(|| id.clone());
         let version = fields
             .get("VERSION_ID")
             .cloned()
@@ -62,8 +72,18 @@ fn detect_format(id: &str, id_like: &str) -> PackageFormat {
     let id = id.to_lowercase();
     let like = id_like.to_lowercase();
 
-    let deb_ids = ["debian", "ubuntu", "linuxmint", "pop", "elementary", "kali", "parrot"];
-    let rpm_ids = ["fedora", "rhel", "centos", "rocky", "alma", "opensuse", "suse", "oracle"];
+    let deb_ids = [
+        "debian",
+        "ubuntu",
+        "linuxmint",
+        "pop",
+        "elementary",
+        "kali",
+        "parrot",
+    ];
+    let rpm_ids = [
+        "fedora", "rhel", "centos", "rocky", "alma", "opensuse", "suse", "oracle",
+    ];
     let pacman_ids = ["arch", "manjaro", "endeavouros", "garuda", "artix"];
     let apk_ids = ["alpine"];
 
@@ -71,7 +91,10 @@ fn detect_format(id: &str, id_like: &str) -> PackageFormat {
         PackageFormat::Deb
     } else if rpm_ids.iter().any(|d| id.contains(d) || like.contains(d)) {
         PackageFormat::Rpm
-    } else if pacman_ids.iter().any(|d| id.contains(d) || like.contains(d)) {
+    } else if pacman_ids
+        .iter()
+        .any(|d| id.contains(d) || like.contains(d))
+    {
         PackageFormat::Pacman
     } else if apk_ids.iter().any(|d| id.contains(d) || like.contains(d)) {
         PackageFormat::Apk

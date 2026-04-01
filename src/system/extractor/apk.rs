@@ -51,10 +51,7 @@ fn untar<R: Read>(reader: R, dest_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathB
         let entry_str = entry_path.to_string_lossy().to_string();
 
         // Skip APK control files
-        if entry_str == ".PKGINFO"
-            || entry_str == ".INSTALL"
-            || entry_str.starts_with(".SIGN.")
-        {
+        if entry_str == ".PKGINFO" || entry_str == ".INSTALL" || entry_str.starts_with(".SIGN.") {
             continue;
         }
 

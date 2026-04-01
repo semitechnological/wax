@@ -3,9 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 fn manifest_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map_err(|_| WaxError::InstallError("HOME not set".into()))?;
-    Ok(PathBuf::from(home).join(".wax").join("system").join("manifests"))
+    let home = std::env::var("HOME").map_err(|_| WaxError::InstallError("HOME not set".into()))?;
+    Ok(PathBuf::from(home)
+        .join(".wax")
+        .join("system")
+        .join("manifests"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +67,27 @@ impl FileManifest {
         Ok(None)
     }
 
+    pub async fn list_all() -> Result<Vec<Self>> {
+        let dir = manifest_dir()?;
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut manifests = Vec::new();
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let raw = match tokio::fs::read_to_string(entry.path()).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            if let Ok(manifest) = serde_json::from_str::<Self>(&raw) {
+                manifests.push(manifest);
+            }
+        }
+        manifests.sort_by(|a, b| a.package.cmp(&b.package));
+        Ok(manifests)
+    }
+
     fn path(package: &str, version: &str) -> Result<PathBuf> {
         Ok(manifest_dir()?.join(format!("{}-{}.json", package, version)))
     }
@@ -75,14 +98,20 @@ impl FileManifest {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn home_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[tokio::test]
     async fn test_save_and_load() {
+        let _guard = home_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 
@@ -110,6 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_nonexistent() {
+        let _guard = home_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 

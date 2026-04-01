@@ -105,17 +105,22 @@ impl PacmanRegistry {
     }
 }
 
-fn parse_pacman_db(bytes: &[u8], mirror: &str, repo: &str, arch: &str) -> Result<Vec<PackageMetadata>> {
+fn parse_pacman_db(
+    bytes: &[u8],
+    mirror: &str,
+    repo: &str,
+    arch: &str,
+) -> Result<Vec<PackageMetadata>> {
     let decoder = GzDecoder::new(bytes);
     let mut archive = Archive::new(decoder);
     let mut packages: HashMap<String, PackageMetadata> = HashMap::new();
 
-    for entry in archive.entries().map_err(|e| {
-        WaxError::InstallError(format!("Failed to read pacman tar: {}", e))
-    })? {
-        let mut entry = entry.map_err(|e| {
-            WaxError::InstallError(format!("Failed to read tar entry: {}", e))
-        })?;
+    for entry in archive
+        .entries()
+        .map_err(|e| WaxError::InstallError(format!("Failed to read pacman tar: {}", e)))?
+    {
+        let mut entry = entry
+            .map_err(|e| WaxError::InstallError(format!("Failed to read tar entry: {}", e)))?;
 
         let entry_path = entry
             .path()
@@ -129,9 +134,9 @@ fn parse_pacman_db(bytes: &[u8], mirror: &str, repo: &str, arch: &str) -> Result
         }
 
         let mut content = String::new();
-        entry.read_to_string(&mut content).map_err(|e| {
-            WaxError::InstallError(format!("Failed to read desc: {}", e))
-        })?;
+        entry
+            .read_to_string(&mut content)
+            .map_err(|e| WaxError::InstallError(format!("Failed to read desc: {}", e)))?;
 
         if let Some(pkg) = parse_desc(&content, mirror, repo, arch) {
             packages.insert(pkg.name.clone(), pkg);
@@ -156,10 +161,7 @@ fn parse_desc(content: &str, mirror: &str, repo: &str, arch: &str) -> Option<Pac
         .and_then(|v| v.first())
         .cloned()
         .unwrap_or_default();
-    let sha256 = fields
-        .get("SHA256SUM")
-        .and_then(|v| v.first())
-        .cloned();
+    let sha256 = fields.get("SHA256SUM").and_then(|v| v.first()).cloned();
     let installed_size: u64 = fields
         .get("ISIZE")
         .and_then(|v| v.first())
@@ -183,7 +185,10 @@ fn parse_desc(content: &str, mirror: &str, repo: &str, arch: &str) -> Option<Pac
         .collect();
 
     let download_url = if filename.is_empty() {
-        format!("{}/{}/os/{}/{}-{}-{}.pkg.tar.zst", mirror, repo, arch, name, version, arch)
+        format!(
+            "{}/{}/os/{}/{}-{}-{}.pkg.tar.zst",
+            mirror, repo, arch, name, version, arch
+        )
     } else {
         format!("{}/{}/os/{}/{}", mirror, repo, arch, filename)
     };

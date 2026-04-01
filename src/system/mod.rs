@@ -1,24 +1,10 @@
 /// Nix-inspired system package management for wax.
 ///
-/// Key design principles borrowed from Nix:
-///
-/// 1. **Atomic generations** — every mutating operation (install, remove, upgrade)
-///    first snapshots the current installed set into a numbered, immutable
-///    generation manifest.  The active generation is tracked via a `current`
-///    symlink.  Any generation can be re-activated instantly.
-///
-/// 2. **Declarative desired state** — users declare the set of system packages
-///    they want (`wax system add`).  `wax system sync` converges the live
-///    system to match that declared set, adding missing and removing extraneous
-///    packages.
-///
-/// 3. **Full rollback** — `wax system rollback [N]` reverts to any previous
-///    generation by computing the diff and driving the native package manager
-///    to install/remove the delta.
-///
-/// Installs use the fully native pipeline (registry fetch → dependency
-/// resolution → parallel download → extraction) for distros where a registry
-/// is available.  For other distros the native OS PM is used as a fallback.
+/// Wax keeps its own declarative state and immutable generations while using
+/// the host package manager as the execution backend. This keeps the UX
+/// platform-neutral: the active backend may be Homebrew on macOS or a native
+/// OS package manager on Linux, but wax-owned state remains the source of
+/// truth for managed packages.
 pub mod distro;
 pub mod extractor;
 pub mod generations;
@@ -30,245 +16,67 @@ pub mod resolver;
 pub mod state;
 
 use crate::error::{Result, WaxError};
-use crate::system::distro::{DistroInfo, PackageFormat};
+use crate::system::distro::DistroInfo;
 use crate::system::generations::{Generation, GenerationManager};
-use crate::system::installer::SystemInstaller;
 use crate::system::manifest::FileManifest;
-use crate::system::query::list_installed;
-use crate::system::registry::PackageIndex;
-use crate::system::resolver::Resolver;
 use crate::system::state::SystemState;
 use crate::system_pm::SystemPm;
 use console::style;
-use tracing::warn;
+use std::collections::{HashMap, HashSet};
 
 pub struct SystemManager {
     pm: SystemPm,
-    distro: DistroInfo,
+    platform_label: String,
     gen_mgr: GenerationManager,
 }
 
 impl SystemManager {
-    /// Detect the running Linux distro and system PM.  Returns `None` on macOS
-    /// or when no supported PM is found.
     pub async fn detect() -> Result<Option<Self>> {
-        if cfg!(target_os = "macos") {
-            return Ok(None);
-        }
-
-        let Some(distro) = DistroInfo::detect().await? else {
-            return Ok(None);
-        };
-
         let Some(pm) = SystemPm::detect().await else {
             return Ok(None);
         };
 
-        let gen_mgr = GenerationManager::new().await?;
-
-        Ok(Some(Self { pm, distro, gen_mgr }))
-    }
-
-    /// Name of the detected distro (e.g. "Ubuntu 22.04").
-    pub fn distro_label(&self) -> String {
-        if self.distro.version.is_empty() {
-            self.distro.name.clone()
+        let platform_label = if cfg!(target_os = "macos") {
+            "macOS".to_string()
+        } else if let Some(distro) = DistroInfo::detect().await? {
+            if distro.version.is_empty() {
+                distro.name
+            } else {
+                format!("{} {}", distro.name, distro.version)
+            }
         } else {
-            format!("{} {}", self.distro.name, self.distro.version)
-        }
+            std::env::consts::OS.to_string()
+        };
+
+        let gen_mgr = GenerationManager::new().await?;
+        Ok(Some(Self {
+            pm,
+            platform_label,
+            gen_mgr,
+        }))
     }
 
-    /// Build a native registry for the current distro, or return None for
-    /// distros that don't have a native registry yet.
-    async fn build_index(&self) -> Option<PackageIndex> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .ok()?;
-
-        match &self.distro.format {
-            PackageFormat::Deb => {
-                let reg = match self.distro.name.to_lowercase() {
-                    n if n.contains("debian") => registry::apt::AptRegistry::debian_default(),
-                    _ => registry::apt::AptRegistry::ubuntu_default(),
-                };
-                reg.load(&client).await.ok()
-            }
-            PackageFormat::Pacman => {
-                let reg = registry::pacman::PacmanRegistry::arch_default();
-                reg.load(&client).await.ok()
-            }
-            PackageFormat::Apk => {
-                let reg = registry::apk::ApkRegistry::alpine_default();
-                reg.load(&client).await.ok()
-            }
-            PackageFormat::Rpm => {
-                let reg = registry::dnf::DnfRegistry::fedora_default();
-                reg.load(&client).await.ok()
-            }
-            PackageFormat::Other => None,
-        }
+    pub fn distro_label(&self) -> &str {
+        &self.platform_label
     }
 
-    /// Snapshot current live packages into a new generation, then upgrade all.
     pub async fn upgrade_all(&self) -> Result<()> {
         println!(
-            "{} upgrading {} packages via {}",
+            "{} upgrading managed packages via {}",
             style("→").cyan(),
-            style(&self.distro_label()).dim(),
             style(self.pm.name()).bold()
         );
 
-        // Snapshot *before* the upgrade so we can diff forward/back.
         self.snapshot("pre-upgrade").await?;
-
-        // Try native upgrade path first
-        if let Some(index) = self.build_index().await {
-            let st = SystemState::load().await?;
-            let declared = st.declared.clone();
-
-            if !declared.is_empty() {
-                let resolver = Resolver::new(&index);
-                let to_install = resolver.resolve(&declared)?;
-
-                if !to_install.is_empty() {
-                    println!(
-                        "  {} upgrading {} packages natively",
-                        style("→").cyan(),
-                        to_install.len()
-                    );
-                    let installer = SystemInstaller::new();
-                    let prefix = SystemInstaller::install_prefix();
-                    let installed = installer
-                        .install_packages(&to_install.iter().map(|p| (*p).clone()).collect::<Vec<_>>(), &prefix)
-                        .await?;
-
-                    let mut state = SystemState::load().await?;
-                    for (name, version) in &installed {
-                        state.mark_installed(name, Some(version.clone()), declared.contains(name));
-                    }
-                    state.save().await?;
-
-                    let live = self.live_packages().await?;
-                    let gen = self.gen_mgr.create("upgrade (native)", live).await?;
-                    println!(
-                        "  {} generation {} created",
-                        style("✓").green(),
-                        style(gen.id).bold()
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        // Fallback: shell-out upgrade
         self.pm.upgrade_all().await?;
 
-        // Snapshot *after* so rollback undoes the upgrade.
-        let pkgs = self.live_packages().await?;
-        let after = self.gen_mgr.create("upgrade", pkgs).await?;
-
-        println!(
-            "  {} generation {} created",
-            style("✓").green(),
-            style(after.id).bold()
-        );
-        Ok(())
-    }
-
-    /// Install packages, creating a new generation around the operation.
-    pub async fn install(&self, packages: &[String]) -> Result<()> {
-        if packages.is_empty() {
-            return Ok(());
-        }
-
-        self.snapshot(&format!("pre-install {}", packages.join(" "))).await?;
-
-        // Record the packages as declared in state
-        let mut st = SystemState::load().await?;
-        for pkg in packages {
-            st.declare(pkg);
-        }
-        st.save().await?;
-
-        // Try native install path
-        if let Some(index) = self.build_index().await {
-            let resolver = Resolver::new(&index);
-            match resolver.resolve(packages) {
-                Ok(to_install) if !to_install.is_empty() => {
-                    println!(
-                        "  {} installing {} packages (+ deps) natively",
-                        style("→").cyan(),
-                        to_install.len()
-                    );
-                    for pkg in &to_install {
-                        println!(
-                            "    {} {}@{}",
-                            style("+").green(),
-                            style(&pkg.name).magenta(),
-                            style(&pkg.version).dim()
-                        );
-                    }
-
-                    let installer = SystemInstaller::new();
-                    let prefix = SystemInstaller::install_prefix();
-                    let installed_list = installer
-                        .install_packages(
-                            &to_install.iter().map(|p| (*p).clone()).collect::<Vec<_>>(),
-                            &prefix,
-                        )
-                        .await?;
-
-                    let mut state = SystemState::load().await?;
-                    let declared_set: std::collections::HashSet<_> =
-                        packages.iter().map(|s| s.as_str()).collect();
-                    for (name, version) in &installed_list {
-                        state.mark_installed(
-                            name,
-                            Some(version.clone()),
-                            declared_set.contains(name.as_str()),
-                        );
-                    }
-                    state.save().await?;
-
-                    let live = self.live_packages().await?;
-                    let gen = self
-                        .gen_mgr
-                        .create(&format!("install {}", packages.join(" ")), live)
-                        .await?;
-
-                    println!(
-                        "  {} generation {} created",
-                        style("✓").green(),
-                        style(gen.id).bold()
-                    );
-                    return Ok(());
-                }
-                Ok(_) => {
-                    warn!("Native install resolved 0 packages — falling back to system PM");
-                }
-                Err(e) => {
-                    warn!("Native resolver failed ({}), falling back to system PM", e);
-                }
-            }
-        }
-
-        // Fallback: shell-out to native PM
-        self.pm.install(packages).await?;
-
-        // Refresh the live list so the generation reflects reality.
-        let live = self.live_packages().await?;
         let mut state = SystemState::load().await?;
-        for pkg in packages {
-            if !state.installed.contains_key(pkg.as_str()) {
-                state.mark_installed(pkg, None, true);
-            }
-        }
+        self.refresh_tracked_state(&mut state).await?;
         state.save().await?;
 
         let gen = self
             .gen_mgr
-            .create(&format!("install {}", packages.join(" ")), live)
+            .create("upgrade", state.installed_packages())
             .await?;
 
         println!(
@@ -279,61 +87,88 @@ impl SystemManager {
         Ok(())
     }
 
-    /// Remove packages, creating a new generation around the operation.
+    pub async fn install(&self, packages: &[String]) -> Result<()> {
+        self.apply_install(packages, false).await
+    }
+
+    pub async fn add(&self, packages: &[String]) -> Result<()> {
+        self.apply_install(packages, true).await
+    }
+
+    async fn apply_install(&self, packages: &[String], declare: bool) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        self.snapshot(&format!(
+            "pre-{} {}",
+            if declare { "add" } else { "install" },
+            packages.join(" ")
+        ))
+        .await?;
+
+        let mut state = SystemState::load().await?;
+        if declare {
+            for pkg in packages {
+                state.declare(pkg);
+            }
+            state.save().await?;
+        }
+
+        self.pm.install(packages).await?;
+
+        let live = self.live_packages().await?;
+        let live_map: HashMap<String, Option<String>> = live.into_iter().collect();
+        for pkg in packages {
+            let version = live_map.get(pkg).cloned().unwrap_or(None);
+            state.mark_installed(pkg, version, declare || state.is_declared(pkg));
+        }
+        self.refresh_tracked_state(&mut state).await?;
+        state.save().await?;
+
+        let gen = self
+            .gen_mgr
+            .create(
+                &format!(
+                    "{} {}",
+                    if declare { "add" } else { "install" },
+                    packages.join(" ")
+                ),
+                state.installed_packages(),
+            )
+            .await?;
+
+        println!(
+            "  {} generation {} created",
+            style("✓").green(),
+            style(gen.id).bold()
+        );
+        Ok(())
+    }
+
     pub async fn remove(&self, packages: &[String]) -> Result<()> {
         if packages.is_empty() {
             return Ok(());
         }
 
-        self.snapshot(&format!("pre-remove {}", packages.join(" "))).await?;
+        self.snapshot(&format!("pre-remove {}", packages.join(" ")))
+            .await?;
+        self.remove_managed_packages(packages).await?;
 
-        let mut st = SystemState::load().await?;
+        let mut state = SystemState::load().await?;
         for pkg in packages {
-            st.undeclare(pkg);
+            state.undeclare(pkg);
+            state.mark_removed(pkg);
         }
+        self.refresh_tracked_state(&mut state).await?;
+        state.save().await?;
 
-        // Try manifest-based removal first; fall back to native PM per package.
-        for pkg_name in packages {
-            if let Ok(Some(manifest)) = FileManifest::load_any_version(pkg_name).await {
-                println!(
-                    "  {} removing {} (manifest-based)",
-                    style("→").cyan(),
-                    style(pkg_name).magenta()
-                );
-
-                // Remove files (reverse order)
-                for file in manifest.files.iter().rev() {
-                    if file.exists() || file.symlink_metadata().is_ok() {
-                        let _ = tokio::fs::remove_file(file).await;
-                    }
-                }
-
-                // Remove empty dirs deepest-first
-                let mut dirs = manifest.dirs.clone();
-                dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
-                for dir in &dirs {
-                    let _ = tokio::fs::remove_dir(dir).await;
-                }
-
-                // Delete the manifest itself
-                if let Ok(mpath) = FileManifest::manifest_path_pub(pkg_name, &manifest.version) {
-                    let _ = tokio::fs::remove_file(mpath).await;
-                }
-            } else {
-                // Fall back to native PM removal
-                self.run_remove(&[pkg_name.to_string()]).await?;
-            }
-        }
-
-        for pkg in packages {
-            st.mark_removed(pkg);
-        }
-        st.save().await?;
-
-        let live = self.live_packages().await?;
         let gen = self
             .gen_mgr
-            .create(&format!("remove {}", packages.join(" ")), live)
+            .create(
+                &format!("remove {}", packages.join(" ")),
+                state.installed_packages(),
+            )
             .await?;
 
         println!(
@@ -344,26 +179,59 @@ impl SystemManager {
         Ok(())
     }
 
-    /// Converge the live system to the declared package set.
     pub async fn sync_declared(&self) -> Result<()> {
-        let st = SystemState::load().await?;
-        if st.declared.is_empty() {
+        let mut state = SystemState::load().await?;
+        self.refresh_tracked_state(&mut state).await?;
+        state.save().await?;
+
+        if state.declared.is_empty() {
             println!("no declared system packages");
             return Ok(());
         }
 
-        let live_set: std::collections::HashSet<_> =
-            st.installed.keys().map(|s| s.as_str()).collect();
-        let declared_set: std::collections::HashSet<_> =
-            st.declared.iter().map(|s| s.as_str()).collect();
+        let live_set: HashSet<_> = state.installed.keys().map(|s| s.as_str()).collect();
+        let declared_set: HashSet<_> = state.declared.iter().map(|s| s.as_str()).collect();
 
         let to_install: Vec<String> = declared_set
             .difference(&live_set)
             .map(|s| s.to_string())
             .collect();
+        let to_remove: Vec<String> = live_set
+            .difference(&declared_set)
+            .map(|s| s.to_string())
+            .collect();
+
+        if to_install.is_empty() && to_remove.is_empty() {
+            println!(
+                "{} all declared system packages are installed",
+                style("✓").green()
+            );
+            return Ok(());
+        }
+
+        if !to_remove.is_empty() {
+            println!("removing {} undeclared managed packages:", to_remove.len());
+            for pkg in &to_remove {
+                println!("  {} {}", style("-").yellow(), style(pkg).magenta());
+            }
+            self.remove_managed_packages(&to_remove).await?;
+            for pkg in &to_remove {
+                state.mark_removed(pkg);
+            }
+            state.save().await?;
+        }
 
         if to_install.is_empty() {
-            println!("{} all declared system packages are installed", style("✓").green());
+            state.save().await?;
+            let gen = self
+                .gen_mgr
+                .create("sync", state.installed_packages())
+                .await?;
+            println!(
+                "  {} generation {} created",
+                style("✓").green(),
+                style(gen.id).bold()
+            );
             return Ok(());
         }
 
@@ -372,41 +240,41 @@ impl SystemManager {
             println!("  {} {}", style("+").green(), style(pkg).magenta());
         }
 
-        self.install(&to_install).await
+        self.apply_install(&to_install, true).await
     }
 
-    /// List all generations.
     pub async fn list_generations(&self) -> Result<Vec<Generation>> {
         self.gen_mgr.list().await
     }
 
-    /// Roll back to generation `id`, or to the previous generation if `None`.
+    pub async fn current_generation(&self) -> Result<Option<Generation>> {
+        self.gen_mgr.current().await
+    }
+
     pub async fn rollback(&self, id: Option<u32>) -> Result<()> {
         let target_id = match id {
             Some(i) => i,
-            None => self
-                .gen_mgr
-                .previous_id()
-                .await?
-                .ok_or_else(|| WaxError::InstallError("no previous generation to roll back to".into()))?,
+            None => self.gen_mgr.previous_id().await?.ok_or_else(|| {
+                WaxError::InstallError("no previous generation to roll back to".into())
+            })?,
         };
 
-        let target = self
-            .gen_mgr
-            .get(target_id)
-            .await?
-            .ok_or_else(|| WaxError::InstallError(format!("generation {} not found", target_id)))?;
+        let target =
+            self.gen_mgr.get(target_id).await?.ok_or_else(|| {
+                WaxError::InstallError(format!("generation {} not found", target_id))
+            })?;
 
-        let current = self.gen_mgr.current().await?;
-        let current_pkgs = current.as_ref().map(|g| g.packages.as_slice()).unwrap_or(&[]);
+        let mut state = SystemState::load().await?;
+        self.refresh_tracked_state(&mut state).await?;
 
-        let (to_install, to_remove) = GenerationManager::diff(current_pkgs, &target.packages);
+        let current = state.installed_packages();
+        let (to_install, to_remove) = GenerationManager::diff_records(&current, &target.packages);
 
         if to_install.is_empty() && to_remove.is_empty() {
             println!(
-                "{} already at generation {} — nothing to do",
+                "{} already at generation {}",
                 style("✓").green(),
-                target_id
+                style(target_id).bold()
             );
             return Ok(());
         }
@@ -421,20 +289,35 @@ impl SystemManager {
         if !to_remove.is_empty() {
             let names: Vec<String> = to_remove.iter().map(|p| p.name.clone()).collect();
             println!("  removing: {}", names.join(", "));
-            self.run_remove(&names).await?;
+            self.remove_managed_packages(&names).await?;
+            for name in &names {
+                state.mark_removed(name);
+            }
         }
 
         if !to_install.is_empty() {
             let names: Vec<String> = to_install.iter().map(|p| p.name.clone()).collect();
             println!("  installing: {}", names.join(", "));
-            self.install(&names).await?;
+            self.pm.install(&names).await?;
+            let declared_names: HashSet<String> = state.declared.iter().cloned().collect();
+            for pkg in &to_install {
+                state.mark_installed(
+                    &pkg.name,
+                    pkg.version.clone(),
+                    declared_names.contains(&pkg.name),
+                );
+            }
         }
 
-        // Record the rollback as its own generation so the history is complete.
-        let live = self.live_packages().await?;
+        self.refresh_tracked_state(&mut state).await?;
+        state.save().await?;
+
         let new_gen = self
             .gen_mgr
-            .create(&format!("rollback to gen-{}", target_id), live)
+            .create(
+                &format!("rollback to gen-{}", target_id),
+                state.installed_packages(),
+            )
             .await?;
 
         println!(
@@ -445,52 +328,49 @@ impl SystemManager {
         Ok(())
     }
 
-    /// Print a status summary.
     pub async fn status(&self) -> Result<()> {
-        let st = SystemState::load().await?;
+        let mut state = SystemState::load().await?;
+        self.refresh_tracked_state(&mut state).await?;
+        state.save().await?;
         let current = self.gen_mgr.current().await?;
 
         println!(
             "{} {}",
-            style("distro").bold(),
-            style(&self.distro_label()).cyan()
+            style("platform").bold(),
+            style(self.distro_label()).cyan()
         );
         println!(
             "{} {}",
-            style("pm    ").bold(),
+            style("pm      ").bold(),
             style(self.pm.name()).cyan()
         );
 
         if let Some(gen) = &current {
             println!(
                 "{} gen-{} ({}, {})",
-                style("gen   ").bold(),
+                style("gen     ").bold(),
                 style(gen.id).bold(),
                 style(&gen.reason).dim(),
                 gen.age_string()
             );
         } else {
-            println!("{} none", style("gen   ").bold());
+            println!("{} none", style("gen     ").bold());
         }
 
         println!(
             "{} {} declared, {} installed",
-            style("pkgs  ").bold(),
-            st.declared.len(),
-            st.installed.len()
+            style("pkgs    ").bold(),
+            state.declared.len(),
+            state.installed.len()
         );
 
-        if !st.declared.is_empty() {
+        if !state.declared.is_empty() {
             println!();
             println!("{}:", style("declared").bold());
-            let live: std::collections::HashSet<_> = st.installed.keys().collect();
-            for pkg in &st.declared {
+            let live: HashSet<_> = state.installed.keys().collect();
+            for pkg in &state.declared {
                 if live.contains(pkg) {
-                    println!(
-                        "  {} {}",
-                        style("✓").green(),
-                        style(pkg).magenta()
-                    );
+                    println!("  {} {}", style("✓").green(), style(pkg).magenta());
                 } else {
                     println!(
                         "  {} {} {}",
@@ -505,72 +385,87 @@ impl SystemManager {
         Ok(())
     }
 
-    // ── internals ──────────────────────────────────────────────────────────
-
-    /// Query live installed packages from the native PM.
     async fn live_packages(&self) -> Result<Vec<(String, Option<String>)>> {
-        list_installed(&self.distro.format).await
+        let mut packages = self.pm.list_installed().await?;
+        for manifest in FileManifest::list_all().await? {
+            if let Some(existing) = packages
+                .iter_mut()
+                .find(|(name, _)| *name == manifest.package)
+            {
+                existing.1 = Some(manifest.version.clone());
+            } else {
+                packages.push((manifest.package.clone(), Some(manifest.version.clone())));
+            }
+        }
+        packages.sort_by(|a, b| a.0.cmp(&b.0));
+        packages.dedup_by(|a, b| a.0 == b.0);
+        Ok(packages)
     }
 
-    /// Create a pre-op snapshot if there are any live packages to record.
     async fn snapshot(&self, reason: &str) -> Result<()> {
-        let pkgs = self.live_packages().await?;
-        if !pkgs.is_empty() {
-            self.gen_mgr.create(reason, pkgs).await?;
+        let mut state = SystemState::load().await?;
+        self.refresh_tracked_state(&mut state).await?;
+        state.save().await?;
+
+        let packages = state.installed_packages();
+        if !packages.is_empty() {
+            self.gen_mgr.create(reason, packages).await?;
         }
         Ok(())
     }
 
-    /// Remove packages via the native PM.
-    async fn run_remove(&self, packages: &[String]) -> Result<()> {
-        use crate::system_pm;
-        let args: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
-        match &self.pm {
-            SystemPm::Apt => {
-                let mut a = vec!["apt-get", "remove", "-y"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("sudo", &a).await
-            }
-            SystemPm::Dnf => {
-                let mut a = vec!["dnf", "remove", "-y"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("sudo", &a).await
-            }
-            SystemPm::Pacman => {
-                let mut a = vec!["pacman", "-R", "--noconfirm"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("sudo", &a).await
-            }
-            SystemPm::Apk => {
-                let mut a = vec!["apk", "del"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("sudo", &a).await
-            }
-            SystemPm::Zypper => {
-                let mut a = vec!["zypper", "remove", "-y"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("sudo", &a).await
-            }
-            SystemPm::Emerge => {
-                let mut a = vec!["emerge", "--unmerge"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("sudo", &a).await
-            }
-            SystemPm::Yum => {
-                let mut a = vec!["yum", "remove", "-y"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("sudo", &a).await
-            }
-            SystemPm::Xbps => {
-                let mut a = vec!["xbps-remove", "-R"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("sudo", &a).await
-            }
-            SystemPm::Nix => {
-                let mut a = vec!["-e"];
-                a.extend_from_slice(&args);
-                system_pm::run_visible_pub("nix-env", &a).await
+    async fn refresh_tracked_state(&self, state: &mut SystemState) -> Result<()> {
+        let live = self.live_packages().await?;
+        let live_map: HashMap<String, Option<String>> = live.into_iter().collect();
+        let installed_names: Vec<String> = state.installed.keys().cloned().collect();
+
+        for name in installed_names {
+            if let Some(version) = live_map.get(&name) {
+                let declared = state.is_declared(&name);
+                state.mark_installed(&name, version.clone(), declared);
+            } else {
+                state.mark_removed(&name);
             }
         }
+
+        for pkg in &state.declared.clone() {
+            if let Some(version) = live_map.get(pkg) {
+                state.mark_installed(pkg, version.clone(), true);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn remove_managed_packages(&self, packages: &[String]) -> Result<()> {
+        let mut pm_packages = Vec::new();
+
+        for package in packages {
+            if let Some(manifest) = FileManifest::load_any_version(package).await? {
+                for file in manifest.files.iter().rev() {
+                    if file.exists() || file.symlink_metadata().is_ok() {
+                        let _ = tokio::fs::remove_file(file).await;
+                    }
+                }
+
+                let mut dirs = manifest.dirs.clone();
+                dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+                for dir in &dirs {
+                    let _ = tokio::fs::remove_dir(dir).await;
+                }
+
+                if let Ok(path) = FileManifest::manifest_path_pub(package, &manifest.version) {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+            } else {
+                pm_packages.push(package.clone());
+            }
+        }
+
+        if !pm_packages.is_empty() {
+            self.pm.remove(&pm_packages).await?;
+        }
+
+        Ok(())
     }
 }

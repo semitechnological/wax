@@ -1,4 +1,4 @@
-use crate::bottle::{detect_platform, BottleDownloader};
+use crate::bottle::{detect_platform, should_prefer_source_build, BottleDownloader};
 use crate::cache::Cache;
 use crate::error::{Result, WaxError};
 use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackage};
@@ -181,6 +181,12 @@ pub async fn version_install(
     user: bool,
     global: bool,
 ) -> Result<()> {
+    if should_prefer_source_build() {
+        return Err(WaxError::InstallError(
+            "Versioned bottle installs are disabled on this Linux host. Use a source build or a non-versioned install.".to_string(),
+        ));
+    }
+
     let start = std::time::Instant::now();
 
     cache.ensure_fresh().await?;
@@ -342,6 +348,8 @@ pub async fn version_install(
             prefix.to_str().unwrap_or(default_prefix),
         )?;
     }
+
+    BottleDownloader::validate_runtime(&formula_cellar)?;
 
     create_symlinks(formula_name, version, &cellar, false, install_mode).await?;
 

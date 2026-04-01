@@ -94,6 +94,30 @@ pub fn create_spinner(message: &str) -> ProgressBar {
     spinner
 }
 
+pub struct ProgressBarGuard {
+    pb: Option<ProgressBar>,
+}
+
+impl ProgressBarGuard {
+    pub fn new(pb: &ProgressBar) -> Self {
+        Self {
+            pb: Some(pb.clone()),
+        }
+    }
+
+    pub fn clear_now(&mut self) {
+        if let Some(pb) = self.pb.take() {
+            pb.finish_and_clear();
+        }
+    }
+}
+
+impl Drop for ProgressBarGuard {
+    fn drop(&mut self) {
+        self.clear_now();
+    }
+}
+
 pub mod dirs {
     use crate::error::{Result, WaxError};
     use std::path::PathBuf;

@@ -260,9 +260,9 @@ mod tests {
         let size_str = format!("{:<10}", size);
         h[0..16].copy_from_slice(fname.as_bytes());
         h[16..28].copy_from_slice(b"0           "); // mtime
-        h[28..34].copy_from_slice(b"0     ");       // uid
-        h[34..40].copy_from_slice(b"0     ");       // gid
-        h[40..48].copy_from_slice(b"100644  ");     // mode
+        h[28..34].copy_from_slice(b"0     "); // uid
+        h[34..40].copy_from_slice(b"0     "); // gid
+        h[40..48].copy_from_slice(b"100644  "); // mode
         h[48..58].copy_from_slice(size_str.as_bytes());
         h[58..60].copy_from_slice(b"`\n");
         h

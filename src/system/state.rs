@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 fn state_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").map_err(|_| WaxError::InstallError("HOME not set".into()))?;
-    Ok(PathBuf::from(home).join(".wax").join("system").join("state.json"))
+    Ok(PathBuf::from(home)
+        .join(".wax")
+        .join("system")
+        .join("state.json"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +68,10 @@ impl SystemState {
         self.installed.remove(name);
     }
 
+    pub fn is_declared(&self, name: &str) -> bool {
+        self.declared.iter().any(|pkg| pkg == name)
+    }
+
     pub fn declare(&mut self, name: &str) {
         if !self.declared.iter().any(|p| p == name) {
             self.declared.push(name.to_string());
@@ -79,6 +86,16 @@ impl SystemState {
         if let Some(pkg) = self.installed.get_mut(name) {
             pkg.declared = false;
         }
+    }
+
+    pub fn installed_packages(&self) -> Vec<(String, Option<String>)> {
+        let mut packages: Vec<_> = self
+            .installed
+            .values()
+            .map(|pkg| (pkg.name.clone(), pkg.version.clone()))
+            .collect();
+        packages.sort_by(|a, b| a.0.cmp(&b.0));
+        packages
     }
 }
 
@@ -114,7 +131,10 @@ mod tests {
 
         // Declaring twice should not duplicate
         st.declare("nginx");
-        assert_eq!(st.declared.iter().filter(|p| p.as_str() == "nginx").count(), 1);
+        assert_eq!(
+            st.declared.iter().filter(|p| p.as_str() == "nginx").count(),
+            1
+        );
 
         st.undeclare("nginx");
         assert!(!st.declared.contains(&"nginx".to_string()));
