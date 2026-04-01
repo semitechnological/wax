@@ -101,28 +101,41 @@ pub async fn reinstall(cache: &Cache, packages: &[String], cask: bool, all: bool
         }
         spinner.finish_and_clear();
 
-        // Progress bar for download/install phase (inserted above the overall bar)
-        let pb = multi.insert_from_back(1, ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(&format!("{}{}", prefix, PROGRESS_BAR_TEMPLATE))
-                .unwrap()
-                .progress_chars(PROGRESS_BAR_CHARS),
-        );
-        pb.set_message(style(name).magenta().to_string());
-
         let pkg_start = Instant::now();
-        set_current_op(format!("downloading {}", name));
-        install::install_quiet_with_progress(
-            cache,
-            std::slice::from_ref(name),
-            is_cask,
-            user_flag,
-            global_flag,
-            &pb,
-        )
-        .await?;
-        pb.finish_and_clear();
+        if is_cask {
+            set_current_op(format!("installing {}", name));
+            install::install_quiet(
+                cache,
+                std::slice::from_ref(name),
+                true,
+                user_flag,
+                global_flag,
+            )
+            .await?;
+        } else {
+            // Formula reinstall keeps the outer package bar because the formula
+            // install path renders into the provided progress bar.
+            let pb = multi.insert_from_back(1, ProgressBar::new(0));
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(&format!("{}{}", prefix, PROGRESS_BAR_TEMPLATE))
+                    .unwrap()
+                    .progress_chars(PROGRESS_BAR_CHARS),
+            );
+            pb.set_message(style(name).magenta().to_string());
+
+            set_current_op(format!("downloading {}", name));
+            install::install_quiet_with_progress(
+                cache,
+                std::slice::from_ref(name),
+                false,
+                user_flag,
+                global_flag,
+                &pb,
+            )
+            .await?;
+            pb.finish_and_clear();
+        }
         if let Some(ref opb) = overall_pb {
             opb.inc(1);
         }
