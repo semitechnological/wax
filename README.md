@@ -30,11 +30,15 @@ Wax reimagines package management by replacing Homebrew's git-based tap system w
 ## Installation
 
 ```bash
-# Using Cargo (recommended)
+# Homebrew tap (recommended)
+brew tap semitechnological/tap
+brew install --HEAD wax
+
+# Using Cargo
 cargo install waxpkg
 
 # From source
-git clone https://github.com/plyght/wax.git
+git clone https://github.com/semitechnological/wax.git
 cd wax
 cargo build --release
 sudo cp target/release/wax /usr/local/bin/
