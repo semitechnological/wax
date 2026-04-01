@@ -77,7 +77,10 @@ enum Commands {
 
     #[command(about = "List installed packages  [alias: ls]")]
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        #[arg(long, help = "Only show packages with available updates")]
+        upgradable: bool,
+    },
 
     #[command(about = "Install one or more formulae or casks  [alias: i, add]")]
     #[command(visible_alias = "i")]
@@ -209,10 +212,12 @@ enum Commands {
         installed: bool,
     },
 
-    #[command(about = "Pin a formula to its current version")]
+    #[command(about = "Pin a formula to its current version  [alias: pin list]")]
     Pin {
-        #[arg(required = true)]
+        #[arg(required_unless_present = "list", help = "Package name(s) to pin")]
         packages: Vec<String>,
+        #[arg(long, help = "List all pinned packages")]
+        list: bool,
     },
 
     #[command(about = "Unpin a formula to allow upgrades")]
@@ -220,6 +225,12 @@ enum Commands {
         #[arg(required = true)]
         packages: Vec<String>,
     },
+
+    #[command(about = "List experimental feature flags")]
+    Features,
+
+    #[command(about = "Show wax installation info (paths, version, active taps)")]
+    WaxInfo,
 
     #[command(about = "Generate lockfile from installed packages")]
     Lock,
@@ -446,7 +457,7 @@ async fn main() -> Result<()> {
         Commands::Info { formula, cask } => {
             commands::info::info(&api_client, &cache, &formula, cask).await
         }
-        Commands::List => commands::list::list().await,
+        Commands::List { upgradable } => commands::list::list(Some(&cache), upgradable).await,
         Commands::Install {
             packages,
             dry_run,
@@ -593,7 +604,13 @@ async fn main() -> Result<()> {
             tree,
             installed,
         } => commands::show_deps::deps(&cache, &formula, tree, installed).await,
-        Commands::Pin { packages } => commands::pin::pin(&packages).await,
+        Commands::Pin { packages, list } => {
+            if list || packages.is_empty() {
+                commands::pin::list_pinned().await
+            } else {
+                commands::pin::pin(&packages).await
+            }
+        }
         Commands::Unpin { packages } => commands::pin::unpin(&packages).await,
         Commands::Lock => commands::lock::lock(&cache).await,
         Commands::Sync => commands::sync::sync(&cache).await,
@@ -625,6 +642,8 @@ async fn main() -> Result<()> {
             commands::info::info(&api_client, &cache, &formula, false).await
         }
         Commands::Audit => commands::audit::audit(&cache).await,
+        Commands::Features => commands::features::features(),
+        Commands::WaxInfo => commands::wax_info::wax_info(),
     };
 
     if let Err(e) = result {

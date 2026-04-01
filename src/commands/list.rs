@@ -1,12 +1,51 @@
 use crate::bottle::homebrew_prefix;
+use crate::cache::Cache;
 use crate::cask::CaskState;
+use crate::commands::upgrade::get_outdated_packages;
 use crate::error::Result;
 use crate::install::InstallState;
 use console::style;
 use tracing::instrument;
 
-#[instrument]
-pub async fn list() -> Result<()> {
+#[instrument(skip(cache))]
+pub async fn list(cache: Option<&Cache>, upgradable: bool) -> Result<()> {
+    // When --upgradable is set, delegate to the outdated view (with upgrade arrows)
+    if upgradable {
+        let cache = match cache {
+            Some(c) => c,
+            None => {
+                println!("no packages installed");
+                return Ok(());
+            }
+        };
+        let outdated = get_outdated_packages(cache).await?;
+        if outdated.is_empty() {
+            println!("all packages are up to date");
+            return Ok(());
+        }
+        println!();
+        for pkg in &outdated {
+            let tag = if pkg.is_cask {
+                format!(" {}", style("(cask)").yellow())
+            } else {
+                String::new()
+            };
+            println!(
+                "{}{} {} → {}",
+                style(&pkg.name).magenta(),
+                tag,
+                style(&pkg.installed_version).dim(),
+                style(&pkg.latest_version).green()
+            );
+        }
+        println!(
+            "\n{} package{} can be upgraded",
+            style(outdated.len()).cyan(),
+            if outdated.len() == 1 { "" } else { "s" }
+        );
+        return Ok(());
+    }
+
     let candidates = [
         homebrew_prefix().join("Cellar"),
         crate::ui::dirs::home_dir()
@@ -43,12 +82,11 @@ pub async fn list() -> Result<()> {
                     }
                 }
 
-                let from_source = installed_packages
-                    .get(&package_name)
-                    .map(|p| p.from_source)
-                    .unwrap_or(false);
+                let pkg_meta = installed_packages.get(&package_name);
+                let from_source = pkg_meta.map(|p| p.from_source).unwrap_or(false);
+                let pinned = pkg_meta.map(|p| p.pinned).unwrap_or(false);
 
-                packages.push((package_name, versions, from_source));
+                packages.push((package_name, versions, from_source, pinned));
             }
         }
     }
@@ -63,18 +101,25 @@ pub async fn list() -> Result<()> {
     if !packages.is_empty() {
         packages.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for (package, versions, from_source) in &packages {
+        for (package, versions, from_source, pinned) in &packages {
             let version_str = versions.join(", ");
-            if *from_source {
-                println!(
-                    "{} {} {}",
-                    style(package).magenta(),
-                    style(&version_str).dim(),
-                    style("(source)").yellow()
-                );
+            let pin_marker = if *pinned {
+                format!(" {}", style("(pinned)").cyan())
             } else {
-                println!("{} {}", style(package).magenta(), style(&version_str).dim());
-            }
+                String::new()
+            };
+            let src_marker = if *from_source {
+                format!(" {}", style("(source)").yellow())
+            } else {
+                String::new()
+            };
+            println!(
+                "{} {}{}{}",
+                style(package).magenta(),
+                style(&version_str).dim(),
+                src_marker,
+                pin_marker
+            );
         }
     }
 
