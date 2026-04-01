@@ -1,6 +1,7 @@
 use crate::cache::Cache;
 use crate::cask::CaskState;
 use crate::error::{Result, WaxError};
+use crate::ui::dirs;
 use crate::install::{remove_symlinks, InstallState};
 use crate::signal::{clear_current_op, set_current_op};
 use crate::ui::{OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, SPINNER_TICK_CHARS};
@@ -304,14 +305,44 @@ async fn uninstall_cask(
         _ => {
             #[cfg(target_os = "macos")]
             {
-                let app_name = cask
+                // Normalize the stored app_name to just the .app bundle filename,
+                // in case a deeper path was stored (e.g. "Foo.app/Contents/MacOS/foo").
+                let raw_name = cask
                     .app_name
                     .clone()
                     .unwrap_or_else(|| format!("{}.app", cask_name));
-                let app_path = std::path::PathBuf::from("/Applications").join(&app_name);
+                let app_basename = std::path::Path::new(&raw_name)
+                    .components()
+                    .find(|c| {
+                        matches!(c, std::path::Component::Normal(n)
+                            if n.to_string_lossy().ends_with(".app"))
+                    })
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .unwrap_or(raw_name);
 
-                if app_path.exists() {
-                    tokio::fs::remove_dir_all(&app_path).await?;
+                // Check /Applications first, then ~/Applications as fallback.
+                let candidates = [
+                    std::path::PathBuf::from("/Applications").join(&app_basename),
+                    dirs::home_dir()
+                        .map(|h| h.join("Applications").join(&app_basename))
+                        .unwrap_or_default(),
+                ];
+
+                let mut removed = false;
+                for app_path in &candidates {
+                    if app_path.exists() {
+                        tokio::fs::remove_dir_all(app_path).await?;
+                        removed = true;
+                        break;
+                    }
+                }
+
+                if !removed && !quiet {
+                    eprintln!(
+                        "warning: could not find {}.app in /Applications — \
+                        you may need to remove it manually",
+                        cask_name
+                    );
                 }
             }
 
