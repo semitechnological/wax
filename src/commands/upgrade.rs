@@ -10,7 +10,7 @@ use crate::signal::{
     check_cancelled, clear_active_multi, clear_current_op, set_active_multi, set_current_op,
     CriticalSection,
 };
-use crate::ui::{PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE, SPINNER_TICK_CHARS};
+use crate::ui::{OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE, SPINNER_TICK_CHARS};
 use crate::version::is_same_or_newer;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -158,6 +158,21 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
     set_active_multi(multi.clone());
     let _guard = UpgradeMultiGuard;
 
+    // Anchor an overall progress bar at the very bottom so per-package bars
+    // inserted above it never cause it to "flash" or jump.
+    let overall_pb = if total > 1 {
+        let pb = multi.insert_from_back(0, ProgressBar::new(total as u64));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(OVERALL_PROGRESS_TEMPLATE)
+                .unwrap()
+                .progress_chars(PROGRESS_BAR_CHARS),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
     // --- Phase 0: pre-download all formula bottles concurrently ---
     let platform = detect_platform();
     let formula_by_name: HashMap<&str, &crate::api::Formula> =
@@ -214,15 +229,18 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
         let total_size: u64 = sizes.values().sum();
         let pool = BottleDownloader::GLOBAL_CONNECTION_POOL;
         let n = formula_bottle_urls.len().max(1);
+        // Guarantee at least 2 connections per package when the pool allows it
+        // (multipart requires max_connections > 1 to activate).
+        let min_conns = if pool / n >= 2 { 2usize } else { 1usize };
         let mut allocs: Vec<(String, usize, f64)> = sizes
             .iter()
             .map(|(name, &size)| {
                 if total_size == 0 {
                     let base = pool / n;
-                    (name.clone(), base.max(1), 0.0)
+                    (name.clone(), base.max(min_conns), 0.0)
                 } else {
                     let exact = pool as f64 * size as f64 / total_size as f64;
-                    let base = (exact.floor() as usize).max(1);
+                    let base = (exact.floor() as usize).max(min_conns);
                     (name.clone(), base, exact - base as f64)
                 }
             })
@@ -271,7 +289,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                 crate::signal::check_cancelled()?;
 
                 let tarball = tmp.path().join(format!("{}-{}.tar.gz", name, version));
-                let pb = multi_ref.add(ProgressBar::new(0));
+                let pb = multi_ref.insert_from_back(1, ProgressBar::new(0));
                 pb.set_style(
                     ProgressStyle::default_bar()
                         .template(PROGRESS_BAR_TEMPLATE)
@@ -332,7 +350,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
 
         let label = format!("({}/{}) {}", i + 1, total, pkg.name);
 
-        let spinner = multi.add(ProgressBar::new_spinner());
+        let spinner = multi.insert_from_back(1, ProgressBar::new_spinner());
         spinner.set_style(
             ProgressStyle::default_spinner()
                 .template("{spinner:.cyan} {msg}")
@@ -360,7 +378,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
 
                 if pkg.is_cask {
                     // Casks: use the normal install path
-                    let pb = multi.add(ProgressBar::new(0));
+                    let pb = multi.insert_from_back(1, ProgressBar::new(0));
                     pb.set_style(
                         ProgressStyle::default_bar()
                             .template(&format!(
@@ -383,10 +401,20 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                     pb.finish_and_clear();
                     r
                 } else if let Some(dl) = pre_downloaded.remove(&pkg.name) {
-                    // Formula: use pre-downloaded bottle
+                    // Formula: use pre-downloaded bottle.
+                    // Pass a spinner as existing_pb so step!() messages update
+                    // it in-place instead of printing new lines.
                     let pkg_install_mode = pkg.install_mode.unwrap_or(install_mode_global);
                     let pkg_cellar = pkg_install_mode.cellar_path()?;
-                    install::install_extracted_bottle(
+                    let install_pb = multi.insert_from_back(1, ProgressBar::new_spinner());
+                    install_pb.set_style(
+                        ProgressStyle::default_spinner()
+                            .template("{spinner:.cyan} {msg}")
+                            .unwrap()
+                            .tick_chars(SPINNER_TICK_CHARS),
+                    );
+                    install_pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                    let r = install::install_extracted_bottle(
                         &dl.name,
                         &dl.version,
                         &dl.extract_dir,
@@ -398,9 +426,11 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                         &install_state,
                         false,
                         Some(&multi),
-                        None,
+                        Some(install_pb.clone()),
                     )
-                    .await
+                    .await;
+                    install_pb.finish_and_clear();
+                    r
                 } else {
                     // Fallback: bottle wasn't pre-downloaded (e.g. source-only)
                     let (user_flag, global_flag) = match pkg.install_mode {
@@ -408,7 +438,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                         Some(InstallMode::Global) => (false, true),
                         _ => (false, false),
                     };
-                    let pb = multi.add(ProgressBar::new(0));
+                    let pb = multi.insert_from_back(1, ProgressBar::new(0));
                     pb.set_style(
                         ProgressStyle::default_bar()
                             .template(&format!(
@@ -465,6 +495,9 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                 failed_names.push(pkg.name.clone());
             }
         }
+        if let Some(ref pb) = overall_pb {
+            pb.inc(1);
+        }
     }
 
     // Reinstall all affected dependents — each exactly once.
@@ -486,7 +519,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                 _ => (false, false),
             };
 
-            let spinner = multi.add(ProgressBar::new_spinner());
+            let spinner = multi.insert_from_back(1, ProgressBar::new_spinner());
             spinner.set_style(
                 ProgressStyle::default_spinner()
                     .template("{spinner:.cyan} {msg}")
@@ -531,6 +564,10 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                 }
             }
         }
+    }
+
+    if let Some(pb) = overall_pb {
+        pb.finish_and_clear();
     }
 
     let elapsed = start.elapsed();
