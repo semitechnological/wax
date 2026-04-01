@@ -200,15 +200,35 @@ impl FormulaParser {
     }
 
     fn extract_configure_args(install_block: &str) -> Vec<String> {
-        let re =
-            Regex::new(r#""(?P<arg>(?:--[a-z0-9\-_=#{}/]+|-D[A-Za-z0-9_=\-#{}/.:+]+))""#).unwrap();
+        // Match args in double quotes: "--flag" or "-DFLAG=val"
+        let re_quoted =
+            Regex::new(r#""(?P<arg>(?:--[a-z0-9\-_=#{}/]+|-D[A-Za-z0-9_=\-#{}/.:+]+))""#)
+                .unwrap();
+        // Match bare args inside %W[...] or %w[...] word arrays (no quotes)
+        let re_word_array =
+            Regex::new(r#"%[Ww]\[(?P<body>[^\]]*)\]"#).unwrap();
+        let re_bare_arg =
+            Regex::new(r"(?P<arg>(?:--[a-z0-9\-_=]+|-D[A-Za-z0-9_=\-.:+]+))").unwrap();
+
         let mut args = Vec::new();
 
-        for cap in re.captures_iter(install_block) {
+        for cap in re_quoted.captures_iter(install_block) {
             let arg = &cap["arg"];
             if !arg.contains("#{") {
-                // Skip dynamic args for now as we can't easily resolve them
                 args.push(arg.to_string());
+            }
+        }
+
+        for cap in re_word_array.captures_iter(install_block) {
+            let body = &cap["body"];
+            for token in body.split_whitespace() {
+                if let Some(m) = re_bare_arg.find(token) {
+                    let arg = m.as_str();
+                    // Skip tokens containing interpolation (#{...})
+                    if !token.contains("#{") {
+                        args.push(arg.to_string());
+                    }
+                }
             }
         }
 
@@ -388,6 +408,26 @@ system "cmake", "-S", ".", "-B", "build", "-DBUILD_FLASHFETCH=OFF", "-DENABLE_SY
         "#;
 
         let args = FormulaParser::extract_configure_args(install_block);
+        assert!(args.contains(&"-DBUILD_FLASHFETCH=OFF".to_string()));
+        assert!(args.contains(&"-DENABLE_SYSTEM_YYJSON=ON".to_string()));
+    }
+
+    #[test]
+    fn test_extract_cmake_define_args_from_word_array() {
+        // Fastfetch-style: args defined in %W[...] then splatted into system call
+        let install_block = r#"
+    args = %W[
+      -DCMAKE_INSTALL_SYSCONFDIR=#{etc}
+      -DBUILD_FLASHFETCH=OFF
+      -DENABLE_SYSTEM_YYJSON=ON
+    ]
+    system "cmake", "-S", ".", "-B", "build", *args, *std_cmake_args
+        "#;
+
+        let args = FormulaParser::extract_configure_args(install_block);
+        // Interpolated arg must be skipped
+        assert!(!args.iter().any(|a| a.contains("#{") || a.contains("etc}")));
+        // Static -D args must be captured
         assert!(args.contains(&"-DBUILD_FLASHFETCH=OFF".to_string()));
         assert!(args.contains(&"-DENABLE_SYSTEM_YYJSON=ON".to_string()));
     }
