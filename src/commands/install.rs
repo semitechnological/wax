@@ -14,8 +14,7 @@ use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackag
 use crate::signal::{check_cancelled, CriticalSection};
 use crate::tap::TapManager;
 use crate::ui::{
-    copy_dir_all, dirs, ProgressBarGuard, PROGRESS_BAR_CHARS, PROGRESS_BAR_PREFIX_TEMPLATE,
-    PROGRESS_BAR_TEMPLATE,
+    copy_dir_all, dirs, PROGRESS_BAR_CHARS, PROGRESS_BAR_PREFIX_TEMPLATE, PROGRESS_BAR_TEMPLATE,
 };
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -648,12 +647,11 @@ async fn install_impl(
             crate::signal::set_current_op(format!("downloading {}", name));
 
             let tarball_path = temp_dir.path().join(format!("{}-{}.tar.gz", name, version));
-            let mut clear_guard = ProgressBarGuard::new(&pb);
 
             downloader
                 .download(&url, &tarball_path, Some(&pb), conns)
                 .await?;
-            clear_guard.clear_now();
+            pb.finish_and_clear();
 
             // Release the download permit before extraction so the next package
             // can start downloading immediately rather than waiting for CPU-bound work.
@@ -718,8 +716,9 @@ async fn install_impl(
     let extracted_packages_count = extracted_packages.len();
     check_cancelled()?;
 
-    if !quiet && extracted_packages_count > 0 {
-        let _ = multi.println(String::new());
+    drop(multi);
+    if !quiet {
+        println!();
     }
     for (name, version, extract_dir, bottle_sha, bottle_rebuild) in extracted_packages {
         let spinner = if quiet {
@@ -735,7 +734,6 @@ async fn install_impl(
             pb.enable_steady_tick(std::time::Duration::from_millis(80));
             pb
         };
-        let _spinner_guard = ProgressBarGuard::new(&spinner);
         install_extracted_bottle(
             &name,
             &version,
@@ -747,16 +745,13 @@ async fn install_impl(
             &platform,
             &state,
             quiet,
-            Some(&multi),
+            None,
             Some(spinner.clone()),
         )
         .await?;
+        spinner.finish_and_clear();
         if !quiet {
-            let _ = multi.println(format!(
-                "+ {}@{}",
-                style(&name).magenta(),
-                style(&version).dim()
-            ));
+            println!("+ {}@{}", style(&name).magenta(), style(&version).dim());
         }
     }
 
@@ -1107,11 +1102,10 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
                         .progress_chars(PROGRESS_BAR_CHARS),
                 );
                 pb.set_prefix(name.clone());
-                let mut clear_guard = ProgressBarGuard::new(&pb);
 
                 inst.download_cask(&details.url, &download_path, Some(&pb))
                     .await?;
-                clear_guard.clear_now();
+                pb.finish_and_clear();
 
                 Ok::<_, WaxError>(DownloadedCask {
                     name,
@@ -1134,6 +1128,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
     }
 
     // --- Phase 3: verify checksums + install serially ---
+    drop(multi);
     let mut installed_count = 0;
     let mut failed = Vec::new();
 
@@ -1152,18 +1147,17 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
 
         let result =
-            install_from_downloaded(&d.details, d.artifact_type, &d.download_path, Some(&multi))
-                .await;
+            install_from_downloaded(&d.details, d.artifact_type, &d.download_path, None).await;
         match result {
             Ok(installed_cask) => {
                 let state = CaskState::new()?;
                 state.add(installed_cask).await?;
-                let _ = multi.println(format!(
+                println!(
                     "{} {} (cask) {}",
                     style("✓").green().bold(),
                     style(&d.name).magenta(),
                     style(&d.details.version).dim()
-                ));
+                );
                 installed_count += 1;
             }
             Err(e) => {
@@ -1288,7 +1282,6 @@ async fn install_from_downloaded(
             .tick_chars(crate::ui::SPINNER_TICK_CHARS),
     );
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-    let _spinner_guard = ProgressBarGuard::new(&spinner);
 
     macro_rules! step {
         ($msg:expr) => {
@@ -1586,6 +1579,7 @@ async fn install_from_downloaded(
 
     step!("registering...");
     rollback.commit();
+    spinner.finish_and_clear();
 
     Ok(InstalledCask {
         name: cask.token.clone(),

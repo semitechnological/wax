@@ -202,11 +202,9 @@ impl FormulaParser {
     fn extract_configure_args(install_block: &str) -> Vec<String> {
         // Match args in double quotes: "--flag" or "-DFLAG=val"
         let re_quoted =
-            Regex::new(r#""(?P<arg>(?:--[a-z0-9\-_=#{}/]+|-D[A-Za-z0-9_=\-#{}/.:+]+))""#)
-                .unwrap();
+            Regex::new(r#""(?P<arg>(?:--[a-z0-9\-_=#{}/]+|-D[A-Za-z0-9_=\-#{}/.:+]+))""#).unwrap();
         // Match bare args inside %W[...] or %w[...] word arrays (no quotes)
-        let re_word_array =
-            Regex::new(r#"%[Ww]\[(?P<body>[^\]]*)\]"#).unwrap();
+        let re_word_array = Regex::new(r#"%[Ww]\[(?P<body>[^\]]*)\]"#).unwrap();
         let re_bare_arg =
             Regex::new(r"(?P<arg>(?:--[a-z0-9\-_=]+|-D[A-Za-z0-9_=\-.:+]+))").unwrap();
 

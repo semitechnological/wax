@@ -11,8 +11,7 @@ use crate::signal::{
     CriticalSection,
 };
 use crate::ui::{
-    ProgressBarGuard, OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE,
-    SPINNER_TICK_CHARS,
+    OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE, SPINNER_TICK_CHARS,
 };
 use crate::version::is_same_or_newer;
 use console::style;
@@ -300,10 +299,9 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                         .progress_chars(PROGRESS_BAR_CHARS),
                 );
                 pb.set_message(name.clone());
-                let mut clear_guard = ProgressBarGuard::new(&pb);
 
                 dl.download(&url, &tarball, Some(&pb), conns).await?;
-                clear_guard.clear_now();
+                pb.finish_and_clear();
 
                 // Release the download permit before extraction.
                 drop(permit);
@@ -362,7 +360,6 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                 .tick_chars(SPINNER_TICK_CHARS),
         );
         spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-        let _spinner_guard = ProgressBarGuard::new(&spinner);
         set_current_op(format!("removing {}", pkg.name));
         spinner.set_message(format!(
             "{} removing {}...",
@@ -407,7 +404,6 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                             .tick_chars(SPINNER_TICK_CHARS),
                     );
                     install_pb.enable_steady_tick(std::time::Duration::from_millis(80));
-                    let _install_guard = ProgressBarGuard::new(&install_pb);
                     let r = install::install_extracted_bottle(
                         &dl.name,
                         &dl.version,
@@ -423,6 +419,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                         Some(install_pb.clone()),
                     )
                     .await;
+                    install_pb.finish_and_clear();
                     r
                 } else {
                     // Fallback: bottle wasn't pre-downloaded (e.g. source-only)
@@ -458,6 +455,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
             Err(e) => Err(e),
         };
 
+        spinner.finish_and_clear();
         clear_current_op();
 
         match result {
