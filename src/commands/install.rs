@@ -1015,15 +1015,6 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         return Ok(());
     }
 
-    let _ = multi.println(format!(
-        "installing {}\n",
-        to_install
-            .iter()
-            .map(|n| format!("{} (cask)", style(n).magenta()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
-
     if dry_run {
         let _ = multi.println("dry run - no changes made".to_string());
         return Ok(());
