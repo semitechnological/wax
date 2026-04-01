@@ -1,9 +1,9 @@
 use crate::cache::Cache;
 use crate::cask::CaskState;
 use crate::error::{Result, WaxError};
-use crate::ui::dirs;
 use crate::install::{remove_symlinks, InstallState};
 use crate::signal::{clear_current_op, set_current_op};
+use crate::ui::dirs;
 use crate::ui::{OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, SPINNER_TICK_CHARS};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};

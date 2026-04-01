@@ -373,7 +373,11 @@ async fn handle_system_upgrade() -> Result<()> {
     use crate::system_pm::SystemPm;
     match SystemPm::detect().await {
         Some(pm) => {
-            println!("\n{} upgrading OS packages via {}", console::style("→").cyan(), pm.name());
+            println!(
+                "\n{} upgrading OS packages via {}",
+                console::style("→").cyan(),
+                pm.name()
+            );
             pm.upgrade_all().await
         }
         None => {

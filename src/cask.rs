@@ -834,7 +834,6 @@ impl CaskInstaller {
         rollback: &mut RollbackContext,
         source_rel: &str,
     ) -> Result<()> {
-
         let source = self.resolve_source_path(staging, source_rel);
         let man_name = Path::new(source_rel)
             .file_name()
@@ -871,7 +870,6 @@ impl CaskInstaller {
         source_rel: &str,
         target_path: &str,
     ) -> Result<()> {
-
         let source = self.resolve_source_path(staging, source_rel);
         let dest = PathBuf::from(target_path);
 
@@ -913,7 +911,6 @@ impl CaskInstaller {
         source_rel: &str,
         dest_parent: &Path,
     ) -> Result<()> {
-
         let source = self.resolve_source_path(staging, source_rel);
         let name = Path::new(source_rel)
             .file_name()
@@ -962,8 +959,6 @@ impl CaskInstaller {
         token: &str,
         target_name: Option<&str>,
     ) -> Result<()> {
-
-
         let source = self.resolve_source_path(staging, source_rel);
 
         if !source.exists() {

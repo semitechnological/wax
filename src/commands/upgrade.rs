@@ -10,7 +10,9 @@ use crate::signal::{
     check_cancelled, clear_active_multi, clear_current_op, set_active_multi, set_current_op,
     CriticalSection,
 };
-use crate::ui::{OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE, SPINNER_TICK_CHARS};
+use crate::ui::{
+    OVERALL_PROGRESS_TEMPLATE, PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE, SPINNER_TICK_CHARS,
+};
 use crate::version::is_same_or_newer;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
