@@ -56,7 +56,7 @@ impl Generation {
 }
 
 pub struct GenerationManager {
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
 }
 
 impl GenerationManager {
@@ -64,6 +64,12 @@ impl GenerationManager {
         let dir = generations_dir()?;
         tokio::fs::create_dir_all(&dir).await?;
         Ok(Self { dir })
+    }
+
+    /// Construct a GenerationManager backed by an arbitrary directory (for tests).
+    #[cfg(test)]
+    pub(crate) fn with_dir(dir: std::path::PathBuf) -> Self {
+        Self { dir }
     }
 
     fn manifest_path(&self, id: u32) -> PathBuf {
@@ -208,5 +214,129 @@ impl GenerationManager {
             .find(|g| g.id < current_id)
             .map(|g| g.id);
         Ok(prev)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_create_and_list() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = GenerationManager::with_dir(tmp.path().to_path_buf());
+        tokio::fs::create_dir_all(&mgr.dir).await.unwrap();
+
+        let gen1 = mgr
+            .create(
+                "install curl",
+                vec![("curl".to_string(), Some("8.0.0".to_string()))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(gen1.id, 1);
+        assert_eq!(gen1.reason, "install curl");
+        assert_eq!(gen1.packages.len(), 1);
+
+        let gen2 = mgr
+            .create(
+                "install wget",
+                vec![
+                    ("curl".to_string(), Some("8.0.0".to_string())),
+                    ("wget".to_string(), Some("1.21.0".to_string())),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(gen2.id, 2);
+
+        let all = mgr.list().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, 1);
+        assert_eq!(all[1].id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_current_link() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = GenerationManager::with_dir(tmp.path().to_path_buf());
+        tokio::fs::create_dir_all(&mgr.dir).await.unwrap();
+
+        assert!(mgr.current().await.unwrap().is_none());
+
+        mgr.create("first", vec![]).await.unwrap();
+        let current = mgr.current().await.unwrap();
+        assert!(current.is_some());
+        assert_eq!(current.unwrap().id, 1);
+
+        mgr.create("second", vec![]).await.unwrap();
+        let current = mgr.current().await.unwrap();
+        assert_eq!(current.unwrap().id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_previous_id() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = GenerationManager::with_dir(tmp.path().to_path_buf());
+        tokio::fs::create_dir_all(&mgr.dir).await.unwrap();
+
+        assert!(mgr.previous_id().await.unwrap().is_none());
+
+        mgr.create("first", vec![]).await.unwrap();
+        assert!(mgr.previous_id().await.unwrap().is_none());
+
+        mgr.create("second", vec![]).await.unwrap();
+        assert_eq!(mgr.previous_id().await.unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_diff_empty() {
+        let (install, remove) = GenerationManager::diff(&[], &[]);
+        assert!(install.is_empty());
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn test_diff_install_only() {
+        let from = vec![];
+        let to = vec![PackageRecord {
+            name: "curl".to_string(),
+            version: Some("8.0.0".to_string()),
+        }];
+        let (install, remove) = GenerationManager::diff(&from, &to);
+        assert_eq!(install.len(), 1);
+        assert_eq!(install[0].name, "curl");
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn test_diff_remove_only() {
+        let from = vec![PackageRecord {
+            name: "curl".to_string(),
+            version: None,
+        }];
+        let to = vec![];
+        let (install, remove) = GenerationManager::diff(&from, &to);
+        assert!(install.is_empty());
+        assert_eq!(remove.len(), 1);
+        assert_eq!(remove[0].name, "curl");
+    }
+
+    #[test]
+    fn test_diff_mixed() {
+        let from = vec![
+            PackageRecord { name: "curl".to_string(), version: None },
+            PackageRecord { name: "wget".to_string(), version: None },
+        ];
+        let to = vec![
+            PackageRecord { name: "wget".to_string(), version: None },
+            PackageRecord { name: "nginx".to_string(), version: None },
+        ];
+        let (install, remove) = GenerationManager::diff(&from, &to);
+        assert_eq!(install.len(), 1);
+        assert_eq!(install[0].name, "nginx");
+        assert_eq!(remove.len(), 1);
+        assert_eq!(remove[0].name, "curl");
     }
 }

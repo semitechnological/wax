@@ -1,12 +1,13 @@
 use crate::bottle::BottleDownloader;
 use crate::error::{Result, WaxError};
-use crate::system::extractor::extract_package;
+use crate::system::extractor::extract_package_tracked;
+use crate::system::manifest::FileManifest;
 use crate::system::registry::PackageMetadata;
 use crate::ui::{PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::Digest;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
@@ -123,20 +124,44 @@ impl SystemInstaller {
                     }
                 }
 
-                // Extract package
-                extract_package(&dest, &prefix_buf)?;
+                // Extract package and track files
+                let (files, dirs) = extract_package_tracked(&dest, &prefix_buf)?;
                 debug!("Extracted {} to {:?}", pkg_name, prefix_buf);
 
-                Ok::<(String, String), WaxError>((pkg_name, pkg_version))
+                Ok::<(String, String, Vec<PathBuf>, Vec<PathBuf>), WaxError>((
+                    pkg_name, pkg_version, files, dirs,
+                ))
             }));
         }
 
         let mut installed = Vec::new();
+        let mut manifest_data: Vec<(String, String, Vec<PathBuf>, Vec<PathBuf>)> = Vec::new();
+
         for task in tasks {
             match task.await {
-                Ok(Ok(pair)) => installed.push(pair),
+                Ok(Ok((name, version, files, dirs))) => {
+                    manifest_data.push((name.clone(), version.clone(), files, dirs));
+                    installed.push((name, version));
+                }
                 Ok(Err(e)) => warn!("Package install failed: {}", e),
                 Err(e) => warn!("Task join error: {}", e),
+            }
+        }
+
+        // Save manifests for each successfully installed package
+        for (name, version, files, dirs) in manifest_data {
+            let manifest = FileManifest {
+                package: name,
+                version,
+                files,
+                dirs,
+                installed_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            };
+            if let Err(e) = manifest.save().await {
+                warn!("Failed to save file manifest for {}: {}", manifest.package, e);
             }
         }
 

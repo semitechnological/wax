@@ -3,8 +3,15 @@
 /// Fast path: uses `rpm2cpio` + `cpio` if available.
 /// TODO: implement pure-Rust RPM header + cpio parsing as fallback.
 use crate::error::{Result, WaxError};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Extract an RPM and return (files, dirs). RPM tracked removal is not yet
+/// supported, so empty vecs are returned.
+pub fn extract_tracked(path: &Path, dest_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    extract(path, dest_dir)?;
+    Ok((vec![], vec![]))
+}
 
 pub fn extract(path: &Path, dest_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dest_dir)?;

@@ -6,10 +6,11 @@
 use crate::error::{Result, WaxError};
 use flate2::read::GzDecoder;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tar::Archive;
 
-pub fn extract(path: &Path, dest_dir: &Path) -> Result<()> {
+/// Extract an APK package and return (files, dirs) of absolute paths written.
+pub fn extract_tracked(path: &Path, dest_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     std::fs::create_dir_all(dest_dir)?;
     let data = std::fs::read(path)?;
 
@@ -39,8 +40,11 @@ fn find_second_gz_magic(data: &[u8]) -> Option<usize> {
     None
 }
 
-fn untar<R: Read>(reader: R, dest_dir: &Path) -> Result<()> {
+fn untar<R: Read>(reader: R, dest_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut archive = Archive::new(reader);
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+
     for entry in archive.entries()? {
         let mut entry = entry?;
         let entry_path = entry.path()?;
@@ -63,6 +67,7 @@ fn untar<R: Read>(reader: R, dest_dir: &Path) -> Result<()> {
 
         if entry.header().entry_type().is_dir() {
             std::fs::create_dir_all(&dest)?;
+            dirs.push(dest);
         } else if entry.header().entry_type().is_symlink() {
             if let Some(link_target) = entry.link_name()? {
                 let _ = std::fs::remove_file(&dest);
@@ -72,13 +77,15 @@ fn untar<R: Read>(reader: R, dest_dir: &Path) -> Result<()> {
                 }
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(link_target.as_ref(), &dest)?;
+                files.push(dest);
             }
         } else {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             entry.unpack(&dest)?;
+            files.push(dest);
         }
     }
-    Ok(())
+    Ok((files, dirs))
 }

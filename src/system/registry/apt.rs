@@ -1,6 +1,8 @@
 use super::{PackageIndex, PackageMetadata};
 use crate::error::{Result, WaxError};
 use flate2::read::GzDecoder;
+use sha2::Digest;
+use std::collections::HashMap;
 use std::io::Read;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, warn};
@@ -69,12 +71,39 @@ impl AptRegistry {
             self.mirror, self.suite, self.arch
         );
 
+        // Fetch InRelease for hash chain verification
+        let inrelease_url = format!("{}/dists/{}/InRelease", self.mirror, self.suite);
+        debug!("Fetching InRelease from {}", inrelease_url);
+        let inrelease_hashes = match client.get(&inrelease_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let bytes = resp.bytes().await.map_err(|e| {
+                    WaxError::InstallError(format!("Failed to read InRelease body: {}", e))
+                })?;
+                // Attempt GPG verification (best-effort, warn only)
+                if let Err(e) = verify_gpg(&bytes).await {
+                    warn!("GPG verification of InRelease failed: {}", e);
+                }
+                Some(parse_inrelease_hashes(
+                    &String::from_utf8_lossy(&bytes),
+                ))
+            }
+            Ok(resp) => {
+                warn!("InRelease not available (HTTP {}), skipping hash verification", resp.status());
+                None
+            }
+            Err(e) => {
+                warn!("Could not fetch InRelease ({}), skipping hash verification", e);
+                None
+            }
+        };
+
         let mut all_packages: Vec<PackageMetadata> = Vec::new();
 
         for component in &self.components {
+            let packages_gz_path = format!("{}/binary-{}/Packages.gz", component, self.arch);
             let url = format!(
-                "{}/dists/{}/{}/binary-{}/Packages.gz",
-                self.mirror, self.suite, component, self.arch
+                "{}/dists/{}/{}",
+                self.mirror, self.suite, packages_gz_path
             );
             debug!("Fetching {}", url);
 
@@ -94,6 +123,22 @@ impl AptRegistry {
             let bytes = resp.bytes().await.map_err(|e| {
                 WaxError::InstallError(format!("Failed to read APT index body: {}", e))
             })?;
+
+            // Verify SHA256 against InRelease if we have the hash
+            if let Some(ref hashes) = inrelease_hashes {
+                if let Some(expected) = hashes.get(&packages_gz_path) {
+                    let mut hasher = sha2::Sha256::new();
+                    hasher.update(&bytes);
+                    let actual = format!("{:x}", hasher.finalize());
+                    if actual != *expected {
+                        return Err(WaxError::ChecksumMismatch {
+                            expected: expected.clone(),
+                            actual,
+                        });
+                    }
+                    debug!("SHA256 verified for {}", packages_gz_path);
+                }
+            }
 
             let mut decoder = GzDecoder::new(&bytes[..]);
             let mut decompressed = String::new();
@@ -124,7 +169,95 @@ impl AptRegistry {
     }
 }
 
-fn parse_packages_file(content: &str, mirror: &str) -> Vec<PackageMetadata> {
+/// Attempt GPG signature verification of InRelease content.
+/// Returns Ok(()) if gpg is not available (graceful degradation).
+/// Returns Err if gpg IS available and verification fails.
+async fn verify_gpg(inrelease_bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // Write content to a temp file
+    let mut tmp = NamedTempFile::new().map_err(|e| {
+        WaxError::InstallError(format!("Failed to create temp file for GPG: {}", e))
+    })?;
+    tmp.write_all(inrelease_bytes).map_err(|e| {
+        WaxError::InstallError(format!("Failed to write temp file for GPG: {}", e))
+    })?;
+    tmp.flush().ok();
+
+    let path = tmp.path().to_path_buf();
+
+    let output = match tokio::process::Command::new("gpg")
+        .args(["--verify", &path.to_string_lossy()])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("gpg not found, skipping InRelease signature verification");
+            return Ok(());
+        }
+        Err(e) => {
+            debug!("gpg execution error ({}), skipping signature verification", e);
+            return Ok(());
+        }
+    };
+
+    if output.status.success() {
+        debug!("GPG signature verification of InRelease succeeded");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(WaxError::InstallError(format!(
+            "GPG signature verification of InRelease failed: {}",
+            stderr.trim()
+        )))
+    }
+}
+
+/// Parse the SHA256 section from an InRelease file (PGP clearsigned).
+/// Returns a map of relative path → SHA256 hash.
+pub(crate) fn parse_inrelease_hashes(content: &str) -> HashMap<String, String> {
+    let mut hashes = HashMap::new();
+
+    // Strip PGP armor: content between the blank line after the armor header
+    // and "-----BEGIN PGP SIGNATURE-----"
+    let body = if let Some(start) = content.find("\n\n") {
+        let after_header = &content[start + 2..];
+        if let Some(sig_start) = after_header.find("-----BEGIN PGP SIGNATURE-----") {
+            &after_header[..sig_start]
+        } else {
+            after_header
+        }
+    } else {
+        content
+    };
+
+    let mut in_sha256 = false;
+    for line in body.lines() {
+        if line.starts_with("SHA256:") {
+            in_sha256 = true;
+            continue;
+        }
+        // Any non-indented line ends the SHA256 section
+        if in_sha256 && !line.starts_with(' ') {
+            in_sha256 = false;
+        }
+        if in_sha256 {
+            // Format: " <hash>  <size>  <path>"
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let hash = parts[0].to_string();
+                let path = parts[2].to_string();
+                hashes.insert(path, hash);
+            }
+        }
+    }
+
+    hashes
+}
+
+pub(crate) fn parse_packages_file(content: &str, mirror: &str) -> Vec<PackageMetadata> {
     let mut packages = Vec::new();
 
     for stanza in content.split("\n\n") {
@@ -215,4 +348,88 @@ fn parse_packages_file(content: &str, mirror: &str) -> Vec<PackageMetadata> {
     }
 
     packages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_packages_file_basic() {
+        let sample = r#"Package: curl
+Version: 7.81.0-1ubuntu1.13
+Architecture: amd64
+Installed-Size: 411
+Depends: libc6 (>= 2.17), libcurl4 (= 7.81.0-1ubuntu1.13), zlib1g (>= 1:1.1.4)
+Filename: pool/main/c/curl/curl_7.81.0-1ubuntu1.13_amd64.deb
+SHA256: abc123def456abc123def456abc123def456abc123def456abc123def456abc123
+Description: command line tool for transferring data with URL syntax
+
+Package: wget
+Version: 1.21.2-2ubuntu1
+Architecture: amd64
+Installed-Size: 502
+Depends: libc6 (>= 2.14), libpcre2-8-0 (>= 10.22)
+Filename: pool/main/w/wget/wget_1.21.2-2ubuntu1_amd64.deb
+SHA256: def456abc123def456abc123def456abc123def456abc123def456abc123def456
+Description: retrieves files from the web
+
+"#;
+        let pkgs = parse_packages_file(sample, "http://archive.ubuntu.com/ubuntu");
+        assert_eq!(pkgs.len(), 2);
+
+        let curl = pkgs.iter().find(|p| p.name == "curl").unwrap();
+        assert_eq!(curl.version, "7.81.0-1ubuntu1.13");
+        assert_eq!(
+            curl.sha256.as_deref(),
+            Some("abc123def456abc123def456abc123def456abc123def456abc123def456abc123")
+        );
+        assert!(curl.depends.contains(&"libc6".to_string()));
+        assert!(curl.depends.contains(&"libcurl4".to_string()));
+        assert!(curl.depends.contains(&"zlib1g".to_string()));
+        assert_eq!(
+            curl.download_url,
+            "http://archive.ubuntu.com/ubuntu/pool/main/c/curl/curl_7.81.0-1ubuntu1.13_amd64.deb"
+        );
+
+        let wget = pkgs.iter().find(|p| p.name == "wget").unwrap();
+        assert_eq!(wget.version, "1.21.2-2ubuntu1");
+    }
+
+    #[test]
+    fn test_parse_packages_multiline_description() {
+        let sample = r#"Package: vim
+Version: 2:8.2.3995-1ubuntu2.13
+Installed-Size: 3741
+Depends: vim-common (= 2:8.2.3995-1ubuntu2.13), vim-runtime (= 2:8.2.3995-1ubuntu2.13), libacl1 (>= 2.2.23)
+Filename: pool/main/v/vim/vim_2.3995-1ubuntu2.13_amd64.deb
+SHA256: aabbcc
+Description: Vi IMproved - enhanced vi editor
+ Vim is an almost compatible version of the UNIX editor vi.
+
+"#;
+        let pkgs = parse_packages_file(sample, "http://mirror.example.com");
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].description, "Vi IMproved - enhanced vi editor");
+    }
+
+    #[test]
+    fn test_parse_inrelease_hashes() {
+        let inrelease = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nOrigin: Ubuntu\nSuite: jammy\nSHA256:\n abc1111111111111111111111111111111111111111111111111111111111111111  12345  main/binary-amd64/Packages.gz\n def2222222222222222222222222222222222222222222222222222222222222222  67890  main/binary-amd64/Packages\n fed3333333333333333333333333333333333333333333333333333333333333333  11111  universe/binary-amd64/Packages.gz\n-----BEGIN PGP SIGNATURE-----\n\nfakeSignatureData\n-----END PGP SIGNATURE-----\n";
+        let hashes = parse_inrelease_hashes(inrelease);
+        assert_eq!(
+            hashes
+                .get("main/binary-amd64/Packages.gz")
+                .map(|s| s.as_str()),
+            Some("abc1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            hashes
+                .get("universe/binary-amd64/Packages.gz")
+                .map(|s| s.as_str()),
+            Some("fed3333333333333333333333333333333333333333333333333333333333333333")
+        );
+        // Non-.gz variant should also be present (we store all hashes)
+        assert!(hashes.contains_key("main/binary-amd64/Packages"));
+    }
 }

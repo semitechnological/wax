@@ -44,3 +44,56 @@ pub fn parse_dep_name(dep: &str) -> &str {
         .unwrap_or(dep)
         .trim()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_dep_name_simple() {
+        assert_eq!(parse_dep_name("libc6"), "libc6");
+    }
+
+    #[test]
+    fn test_parse_dep_name_with_version() {
+        assert_eq!(parse_dep_name("libc6 (>= 2.17)"), "libc6");
+    }
+
+    #[test]
+    fn test_parse_dep_name_with_arch() {
+        assert_eq!(parse_dep_name("libgcc-s1:amd64"), "libgcc-s1:amd64");
+    }
+
+    #[test]
+    fn test_package_index_find_by_name() {
+        let index = PackageIndex {
+            packages: vec![
+                PackageMetadata {
+                    name: "curl".to_string(),
+                    version: "8.0.0".to_string(),
+                    description: "".to_string(),
+                    download_url: "".to_string(),
+                    sha256: None,
+                    installed_size: 0,
+                    depends: vec![],
+                    provides: vec![],
+                },
+                PackageMetadata {
+                    name: "libssl3".to_string(),
+                    version: "3.0.0".to_string(),
+                    description: "".to_string(),
+                    download_url: "".to_string(),
+                    sha256: None,
+                    installed_size: 0,
+                    depends: vec![],
+                    provides: vec!["libssl".to_string()],
+                },
+            ],
+        };
+
+        assert!(index.find("curl").is_some());
+        assert!(index.find("libssl3").is_some());
+        assert!(index.find("libssl").is_some()); // via provides
+        assert!(index.find("nonexistent").is_none());
+    }
+}

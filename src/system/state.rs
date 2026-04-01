@@ -81,3 +81,56 @@ impl SystemState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_state() -> SystemState {
+        SystemState::default()
+    }
+
+    #[test]
+    fn test_mark_installed_and_remove() {
+        let mut st = make_state();
+        st.mark_installed("curl", Some("8.0.0".to_string()), true);
+
+        assert!(st.installed.contains_key("curl"));
+        assert_eq!(st.installed["curl"].version, Some("8.0.0".to_string()));
+        assert!(st.installed["curl"].declared);
+
+        st.mark_removed("curl");
+        assert!(!st.installed.contains_key("curl"));
+    }
+
+    #[test]
+    fn test_declare_and_undeclare() {
+        let mut st = make_state();
+        st.declare("nginx");
+        st.declare("curl");
+
+        assert!(st.declared.contains(&"nginx".to_string()));
+        assert!(st.declared.contains(&"curl".to_string()));
+
+        // Declaring twice should not duplicate
+        st.declare("nginx");
+        assert_eq!(st.declared.iter().filter(|p| p.as_str() == "nginx").count(), 1);
+
+        st.undeclare("nginx");
+        assert!(!st.declared.contains(&"nginx".to_string()));
+        assert!(st.declared.contains(&"curl".to_string()));
+    }
+
+    #[test]
+    fn test_declare_updates_installed_flag() {
+        let mut st = make_state();
+        st.mark_installed("curl", None, false);
+        assert!(!st.installed["curl"].declared);
+
+        st.declare("curl");
+        assert!(st.installed["curl"].declared);
+
+        st.undeclare("curl");
+        assert!(!st.installed["curl"].declared);
+    }
+}

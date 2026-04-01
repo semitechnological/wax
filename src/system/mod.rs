@@ -23,6 +23,7 @@ pub mod distro;
 pub mod extractor;
 pub mod generations;
 pub mod installer;
+pub mod manifest;
 pub mod query;
 pub mod registry;
 pub mod resolver;
@@ -32,6 +33,7 @@ use crate::error::{Result, WaxError};
 use crate::system::distro::{DistroInfo, PackageFormat};
 use crate::system::generations::{Generation, GenerationManager};
 use crate::system::installer::SystemInstaller;
+use crate::system::manifest::FileManifest;
 use crate::system::query::list_installed;
 use crate::system::registry::PackageIndex;
 use crate::system::resolver::Resolver;
@@ -290,8 +292,38 @@ impl SystemManager {
             st.undeclare(pkg);
         }
 
-        // Shell out to the native PM for actual removal.
-        self.run_remove(packages).await?;
+        // Try manifest-based removal first; fall back to native PM per package.
+        for pkg_name in packages {
+            if let Ok(Some(manifest)) = FileManifest::load_any_version(pkg_name).await {
+                println!(
+                    "  {} removing {} (manifest-based)",
+                    style("→").cyan(),
+                    style(pkg_name).magenta()
+                );
+
+                // Remove files (reverse order)
+                for file in manifest.files.iter().rev() {
+                    if file.exists() || file.symlink_metadata().is_ok() {
+                        let _ = tokio::fs::remove_file(file).await;
+                    }
+                }
+
+                // Remove empty dirs deepest-first
+                let mut dirs = manifest.dirs.clone();
+                dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+                for dir in &dirs {
+                    let _ = tokio::fs::remove_dir(dir).await;
+                }
+
+                // Delete the manifest itself
+                if let Ok(mpath) = FileManifest::manifest_path_pub(pkg_name, &manifest.version) {
+                    let _ = tokio::fs::remove_file(mpath).await;
+                }
+            } else {
+                // Fall back to native PM removal
+                self.run_remove(&[pkg_name.to_string()]).await?;
+            }
+        }
 
         for pkg in packages {
             st.mark_removed(pkg);
