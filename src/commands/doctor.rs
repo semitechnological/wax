@@ -5,6 +5,7 @@ use crate::cask::CaskState;
 use crate::error::Result;
 use crate::install::{create_symlinks, InstallMode, InstallState};
 use console::style;
+use std::collections::HashSet;
 use std::path::Path;
 
 struct DiagResult {
@@ -70,8 +71,7 @@ pub async fn doctor(cache: &Cache, fix: bool) -> Result<()> {
     check_unrelocated_bottles(&mut d).await;
     check_invalid_signatures(&mut d).await;
     check_tools(&mut d);
-    check_glibc_version(&mut d);
-    check_metal_toolchain(&mut d);
+    check_os_specific(cache, &mut d).await;
 
     println!();
     let mut parts = vec![format!("{} passed", style(d.passed).green())];
@@ -95,6 +95,21 @@ pub async fn doctor(cache: &Cache, fix: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn check_os_specific(cache: &Cache, d: &mut DiagResult) {
+    match std::env::consts::OS {
+        "linux" => {
+            check_linux_runtime(d).await;
+            check_linux_user_bin_links(cache, d).await;
+            check_glibc_version(d);
+            check_linux_gpu_toolchain(d);
+        }
+        "macos" => {
+            check_metal_toolchain(d);
+        }
+        _ => {}
+    }
 }
 
 fn check_platform(d: &mut DiagResult) {
@@ -655,40 +670,255 @@ fn check_metal_toolchain(d: &mut DiagResult) {
             }
         }
     }
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        let mut found_gpu = false;
+fn check_linux_gpu_toolchain(d: &mut DiagResult) {
+    let mut found_gpu = false;
 
-        if let Some(output) = run_command_with_timeout("vulkaninfo", &["--summary"], 3) {
-            if output.contains("apiVersion") || output.contains("Vulkan Instance") {
+    if let Some(output) = run_command_with_timeout("vulkaninfo", &["--summary"], 3) {
+        if output.contains("apiVersion") || output.contains("Vulkan Instance") {
+            let version = output
+                .lines()
+                .find(|l| l.contains("apiVersion"))
+                .map(|l| l.trim())
+                .unwrap_or("detected");
+            d.pass(&format!("Vulkan: {}", version));
+            found_gpu = true;
+        }
+    }
+
+    if !found_gpu {
+        if let Some(output) = run_command_with_timeout("glxinfo", &["-B"], 3) {
+            if output.contains("OpenGL version") {
                 let version = output
                     .lines()
-                    .find(|l| l.contains("apiVersion"))
+                    .find(|l| l.contains("OpenGL version"))
                     .map(|l| l.trim())
                     .unwrap_or("detected");
-                d.pass(&format!("Vulkan: {}", version));
+                d.pass(&format!("GPU: {}", version));
                 found_gpu = true;
             }
         }
+    }
 
-        if !found_gpu {
-            if let Some(output) = run_command_with_timeout("glxinfo", &["-B"], 3) {
-                if output.contains("OpenGL version") {
-                    let version = output
-                        .lines()
-                        .find(|l| l.contains("OpenGL version"))
-                        .map(|l| l.trim())
-                        .unwrap_or("detected");
-                    d.pass(&format!("GPU: {}", version));
-                    found_gpu = true;
+    if !found_gpu {
+        d.warn("no GPU toolchain detected (vulkaninfo/glxinfo not found)");
+    }
+}
+
+async fn check_linux_runtime(d: &mut DiagResult) {
+    if std::env::consts::OS != "linux" {
+        return;
+    }
+
+    let state = match InstallState::new() {
+        Ok(state) => state,
+        Err(e) => {
+            d.warn(&format!("cannot inspect Linux runtime state: {}", e));
+            return;
+        }
+    };
+
+    let installed = match state.load().await {
+        Ok(installed) => installed,
+        Err(e) => {
+            d.warn(&format!(
+                "cannot load install state for runtime checks: {}",
+                e
+            ));
+            return;
+        }
+    };
+
+    let mut broken = Vec::new();
+    for (name, pkg) in installed {
+        let Ok(cellar) = pkg.install_mode.cellar_path() else {
+            continue;
+        };
+        let version_dir = cellar.join(&name).join(&pkg.version);
+        if !version_dir.exists() {
+            continue;
+        }
+
+        if let Err(err) = BottleDownloader::validate_runtime(&version_dir) {
+            broken.push((name, pkg.version, err.to_string()));
+        }
+    }
+
+    if broken.is_empty() {
+        d.pass("linux runtime relocation/linkage looks healthy");
+        return;
+    }
+
+    for (idx, (name, version, err)) in broken.iter().enumerate() {
+        if idx < 5 {
+            d.fail(&format!(
+                "broken Linux runtime: {}@{} ({})",
+                style(name).magenta(),
+                version,
+                err
+            ));
+        }
+    }
+    if broken.len() > 5 {
+        d.fail(&format!(
+            "... and {} more broken Linux runtimes",
+            broken.len() - 5
+        ));
+    }
+
+    d.warn(&format!(
+        "run {} with a patched build to reinstall affected formulae; wax now prefers source builds on Linux when ELF relocation tools are unavailable",
+        style("wax reinstall <name>").yellow()
+    ));
+}
+
+async fn check_linux_user_bin_links(_cache: &Cache, d: &mut DiagResult) {
+    if std::env::consts::OS != "linux" {
+        return;
+    }
+
+    let Ok(path_var) = std::env::var("PATH") else {
+        d.warn("PATH unavailable for Linux user bin checks");
+        return;
+    };
+    let Ok(home) = crate::ui::dirs::home_dir() else {
+        d.warn("HOME unavailable for Linux user bin checks");
+        return;
+    };
+
+    let cask_state = match CaskState::new() {
+        Ok(state) => state,
+        Err(e) => {
+            d.warn(&format!(
+                "cannot inspect cask state for Linux bin links: {}",
+                e
+            ));
+            return;
+        }
+    };
+    let installed_casks = match cask_state.load().await {
+        Ok(casks) => casks,
+        Err(e) => {
+            d.warn(&format!(
+                "cannot load cask state for Linux bin links: {}",
+                e
+            ));
+            return;
+        }
+    };
+
+    let user_bin_dirs: Vec<_> = std::env::split_paths(&path_var)
+        .filter(|entry| entry.starts_with(&home))
+        .filter(|entry| {
+            let path_str = entry.to_string_lossy();
+            path_str.ends_with("/.local/bin")
+                || path_str.ends_with("/.npm-global/bin")
+                || path_str.ends_with("/bin")
+        })
+        .collect();
+
+    let mut checked = 0usize;
+    let mut repaired = 0usize;
+    let mut broken = 0usize;
+    let mut seen = HashSet::new();
+
+    for cask in installed_casks.values() {
+        let Some(binary_paths) = &cask.binary_paths else {
+            continue;
+        };
+        for binary_path in binary_paths {
+            let target = Path::new(binary_path);
+            let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            for dir in &user_bin_dirs {
+                if !seen.insert((dir.clone(), name.to_string())) {
+                    continue;
+                }
+                let candidate = dir.join(name);
+                checked += 1;
+
+                let needs_fix = match std::fs::symlink_metadata(&candidate) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        match std::fs::read_link(&candidate) {
+                            Ok(link) => {
+                                let resolved = if link.is_absolute() {
+                                    link
+                                } else {
+                                    candidate.parent().unwrap_or(Path::new("/")).join(link)
+                                };
+                                !resolved.exists()
+                            }
+                            Err(_) => true,
+                        }
+                    }
+                    Ok(_) => false,
+                    Err(_) => true,
+                };
+
+                if !needs_fix {
+                    continue;
+                }
+
+                broken += 1;
+                if d.fix {
+                    if let Err(err) = std::fs::create_dir_all(dir) {
+                        d.fail(&format!("cannot create {}: {}", dir.display(), err));
+                        continue;
+                    }
+                    if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+                        if meta.file_type().is_symlink() || meta.is_file() {
+                            let _ = std::fs::remove_file(&candidate);
+                        }
+                    }
+                    #[cfg(unix)]
+                    match std::os::unix::fs::symlink(target, &candidate) {
+                        Ok(_) => {
+                            repaired += 1;
+                            if repaired <= 10 {
+                                d.fixed(&format!(
+                                    "repaired Linux user bin link: {} -> {}",
+                                    candidate.display(),
+                                    target.display()
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            d.fail(&format!(
+                                "cannot repair {} -> {}: {}",
+                                candidate.display(),
+                                target.display(),
+                                err
+                            ));
+                        }
+                    }
+                } else if broken <= 10 {
+                    d.warn(&format!(
+                        "missing or broken user bin link: {} (target {})",
+                        candidate.display(),
+                        target.display()
+                    ));
                 }
             }
         }
+    }
 
-        if !found_gpu {
-            d.warn("no GPU toolchain detected (vulkaninfo/glxinfo not found)");
-        }
+    if broken == 0 {
+        d.pass(&format!(
+            "linux user bin links healthy across {} candidate paths",
+            checked
+        ));
+    } else if d.fix && repaired > 10 {
+        d.fixed(&format!(
+            "... and {} more Linux user bin links repaired",
+            repaired - 10
+        ));
+    } else if !d.fix && broken > 10 {
+        d.warn(&format!(
+            "... and {} more Linux user bin links need repair",
+            broken - 10
+        ));
     }
 }
 

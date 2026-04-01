@@ -893,11 +893,22 @@ impl CaskInstaller {
             if entry == primary_path.parent().unwrap_or(Path::new("")) {
                 continue;
             }
-            if !entry.starts_with(&home) || !entry.exists() || !Self::is_dir_writable(&entry).await
-            {
+            if !entry.starts_with(&home) {
                 continue;
             }
             if !Self::should_repair_user_bin_dir(&entry) {
+                continue;
+            }
+            if !entry.exists() {
+                if let Err(err) = tokio::fs::create_dir_all(&entry).await {
+                    debug!(
+                        "Skipping compatibility bin directory {:?}; failed to create: {}",
+                        entry, err
+                    );
+                    continue;
+                }
+            }
+            if !Self::is_dir_writable(&entry).await {
                 continue;
             }
 
@@ -916,7 +927,7 @@ impl CaskInstaller {
                                 tokio::fs::symlink(link_target, &candidate).await?;
                                 rollback.add(candidate.clone());
                                 created.push(candidate);
-                                break;
+                                continue;
                             }
                         }
                     }
@@ -925,7 +936,7 @@ impl CaskInstaller {
                     tokio::fs::symlink(link_target, &candidate).await?;
                     rollback.add(candidate.clone());
                     created.push(candidate);
-                    break;
+                    continue;
                 }
             }
         }

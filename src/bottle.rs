@@ -651,6 +651,28 @@ impl BottleDownloader {
         }
 
         if let Ok(output) = Command::new(&patchelf)
+            .args(["--print-interpreter", path.to_str().unwrap_or_default()])
+            .output()
+        {
+            if output.status.success() {
+                let interpreter = String::from_utf8_lossy(&output.stdout);
+                let new_interpreter = interpreter
+                    .replace("@@HOMEBREW_PREFIX@@", prefix)
+                    .replace("@@HOMEBREW_CELLAR@@", cellar);
+                if new_interpreter != interpreter.as_ref() {
+                    let _ = Command::new(&patchelf)
+                        .args([
+                            "--set-interpreter",
+                            new_interpreter.trim(),
+                            path.to_str().unwrap_or_default(),
+                        ])
+                        .output();
+                    debug!("Relocated ELF interpreter: {:?}", path);
+                }
+            }
+        }
+
+        if let Ok(output) = Command::new(&patchelf)
             .args(["--print-rpath", path.to_str().unwrap_or_default()])
             .output()
         {
@@ -933,7 +955,21 @@ fn validate_runtime_dir(dir: &Path) -> Result<()> {
             continue;
         }
 
+        if binary_has_homebrew_placeholders(&path) {
+            return Err(WaxError::InstallError(format!(
+                "Installed Linux binary still contains unresolved Homebrew placeholders: {}",
+                path.display()
+            )));
+        }
+
         if let Some(interpreter) = elf_interpreter(&path) {
+            if interpreter.contains("@@HOMEBREW_") {
+                return Err(WaxError::InstallError(format!(
+                    "Installed binary has unresolved runtime loader placeholder: {} -> {}",
+                    path.display(),
+                    interpreter
+                )));
+            }
             if interpreter.starts_with('/') && !Path::new(&interpreter).exists() {
                 return Err(WaxError::InstallError(format!(
                     "Installed binary has missing runtime loader: {} -> {}",
@@ -942,9 +978,54 @@ fn validate_runtime_dir(dir: &Path) -> Result<()> {
                 )));
             }
         }
+
+        if let Some(missing_lib) = elf_missing_dependency(&path) {
+            return Err(WaxError::InstallError(format!(
+                "Installed binary has unresolved shared library dependency: {} -> {}",
+                path.display(),
+                missing_lib
+            )));
+        }
     }
 
     Ok(())
+}
+
+fn binary_has_homebrew_placeholders(path: &Path) -> bool {
+    let Ok(output) = Command::new("readelf")
+        .args(["-d", path.to_str().unwrap_or_default()])
+        .output()
+    else {
+        return false;
+    };
+
+    if !output.status.success() {
+        return false;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.contains("@@HOMEBREW_PREFIX@@") || text.contains("@@HOMEBREW_CELLAR@@")
+}
+
+fn elf_missing_dependency(path: &Path) -> Option<String> {
+    let output = Command::new("ldd")
+        .arg(path.to_str().unwrap_or_default())
+        .output()
+        .ok()?;
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for line in combined.lines() {
+        if let Some((name, _)) = line.split_once("=> not found") {
+            return Some(name.trim().to_string());
+        }
+    }
+
+    None
 }
 
 fn elf_interpreter(path: &Path) -> Option<String> {
@@ -1135,6 +1216,10 @@ pub fn managed_homebrew_prefix() -> Option<PathBuf> {
 pub fn should_prefer_source_build() -> bool {
     if std::env::consts::OS != "linux" {
         return false;
+    }
+
+    if which_patchelf().is_none() {
+        return true;
     }
 
     let Ok(raw) = std::fs::read_to_string("/etc/os-release") else {
