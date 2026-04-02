@@ -6,6 +6,11 @@
 
 A fast, modern package manager that leverages Homebrew's ecosystem without the overhead. Built in Rust for speed and reliability, wax provides 16-20x faster search operations and parallel installation workflows while maintaining full compatibility with Homebrew formulae and bottles.
 
+## Current status
+
+- cargo test passes on the current checkout.
+- Recent work focuses on source-build and system package handling.
+
 ## Overview
 
 Wax reimagines package management by replacing Homebrew's git-based tap system with direct JSON API access and parallel async operations. It reads from the same bottle CDN and formula definitions but executes operations through a compiled binary with modern concurrency primitives. The result is a package manager that feels instant for read operations and maximizes throughput for installations.
@@ -214,6 +219,7 @@ See `docs/comparison.md` for detailed methodology and analysis.
 ## Limitations
 
 - **Linux Bottles**: Linux bottles require `patchelf` for ELF binary relocation. Install it first: `wax install patchelf`
+- **Fedora Chrome fallback**: `wax install google-chrome` uses the native `dnf`/`yum` path on Linux instead of the macOS-only cask flow.
 - **Build System Detection**: Source builds use heuristic detection of build systems. Complex or non-standard build configurations may fail.
 - **Formula DSL Subset**: Parses essential Ruby formula syntax. Advanced features (conditional deps, patches, custom install blocks) may not be fully supported.
 - **macOS Primary**: Developed for macOS. Linux support is functional but less tested.

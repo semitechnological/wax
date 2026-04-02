@@ -12,6 +12,7 @@ use crate::error::{Result, WaxError};
 use crate::formula_parser::FormulaParser;
 use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackage};
 use crate::signal::{check_cancelled, CriticalSection};
+use crate::system_pm::SystemPm;
 use crate::tap::TapManager;
 use crate::ui::{
     copy_dir_all, dirs, PROGRESS_BAR_CHARS, PROGRESS_BAR_PREFIX_TEMPLATE, PROGRESS_BAR_TEMPLATE,
@@ -784,20 +785,7 @@ async fn install_impl(
         }
     }
 
-    if !quiet {
-        let elapsed = start.elapsed();
-        let successful_count = extracted_packages_count + source_install_count;
-        println!(
-            "\n{} {} installed [{}ms]",
-            successful_count,
-            if successful_count == 1 {
-                "package"
-            } else {
-                "packages"
-            },
-            elapsed.as_millis()
-        );
-    }
+
 
     Ok(())
 }
@@ -978,11 +966,14 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
     }
 
     let mut to_install = Vec::new();
+    let mut native_linux_installs = Vec::new();
     let mut already_installed = Vec::new();
 
     for cask_name in cask_names {
         if installed_casks.contains_key(cask_name) {
             already_installed.push(cask_name.clone());
+        } else if !cfg!(target_os = "macos") && (cask_name == "google-chrome" || cask_name.ends_with("/google-chrome") || cask_name.ends_with("google-chrome")) {
+            native_linux_installs.push(cask_name.clone());
         } else if casks
             .iter()
             .any(|c| &c.token == cask_name || &c.full_token == cask_name)
@@ -999,7 +990,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    if to_install.is_empty() {
+    if to_install.is_empty() && native_linux_installs.is_empty() {
         return Ok(());
     }
 
@@ -1057,7 +1048,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    if resolved.is_empty() {
+    if resolved.is_empty() && native_linux_installs.is_empty() {
         return Err(WaxError::InstallError(
             "No casks could be resolved".to_string(),
         ));
@@ -1148,6 +1139,29 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
                     e
                 );
                 failed.push(d.name.clone());
+            }
+        }
+    }
+
+    if !native_linux_installs.is_empty() {
+        let pm = SystemPm::detect().await.ok_or_else(|| {
+            WaxError::InstallError(
+                "No native package manager found for Google Chrome on Linux".to_string(),
+            )
+        })?;
+
+        for name in &native_linux_installs {
+            match name.as_str() {
+                "google-chrome" => {
+                    pm.install_google_chrome().await?;
+                    println!(
+                        "{} {} installed via native package manager",
+                        style("✓").green().bold(),
+                        style(name).magenta(),
+                    );
+                    installed_count += 1;
+                }
+                _ => {}
             }
         }
     }
