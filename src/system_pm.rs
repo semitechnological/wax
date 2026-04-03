@@ -6,7 +6,9 @@
 //! packages (apt, dnf, pacman, apk, zypper, emerge, yum, xbps-install, nix).
 
 use crate::error::{Result, WaxError};
+use crate::formula_parser::FormulaParser;
 use console::style;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tracing::debug;
 
@@ -169,11 +171,36 @@ impl SystemPm {
         Ok(())
     }
 
-    /// Install a cask (GUI app) on Linux by trying snap → flatpak → native PM.
+    /// Install a cask (GUI app) on Linux.
     ///
-    /// On Linux, Homebrew cask artifacts are macOS-only, so we route cask
-    /// installs through the Linux app distribution layers instead.
+    /// Strategy (in order):
+    /// 0. Fetch the Homebrew cask `.rb` file and look for an `on_linux` block
+    ///    containing a native download URL (.deb / .rpm / .AppImage).
+    /// 1. Try snap (with and without `--classic`).
+    /// 2. Try flatpak via Flathub.
+    /// 3. Fall back to the native system package manager.
     pub async fn install_cask(&self, cask_name: &str) -> Result<()> {
+        // 0. Try Homebrew cask .rb — uses the same metadata Homebrew itself uses.
+        if let Ok(rb) = FormulaParser::fetch_cask_rb(cask_name).await {
+            if let Some(artifact) = FormulaParser::parse_cask_linux_artifact(&rb) {
+                debug!(
+                    "Found on_linux artifact for {}: {}",
+                    cask_name, artifact.url
+                );
+                if self
+                    .install_linux_artifact(cask_name, &artifact.url, artifact.sha256.as_deref())
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                debug!(
+                    "Homebrew cask artifact install failed for {}, falling back",
+                    cask_name
+                );
+            }
+        }
+
         // 1. Try snap — no extra repo setup needed on Ubuntu/Debian/derivatives.
         if which("snap").await {
             // Some snaps need --classic confinement; try both.
@@ -219,6 +246,98 @@ impl SystemPm {
 
         // 3. Fall back to native package manager (apt, dnf, pacman, etc.).
         self.install(&[cask_name.to_string()]).await
+    }
+
+    /// Download a Linux artifact from `url` and install it based on its extension.
+    async fn install_linux_artifact(
+        &self,
+        name: &str,
+        url: &str,
+        sha256: Option<&str>,
+    ) -> Result<()> {
+        // Determine the artifact type from the URL extension (ignore query string).
+        let ext = url
+            .split('?')
+            .next()
+            .unwrap_or(url)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+
+        println!(
+            "  {} downloading {} ({})…",
+            style("→").cyan(),
+            style(name).magenta(),
+            ext
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .map_err(|e| WaxError::InstallError(format!("HTTP client: {}", e)))?;
+
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| WaxError::InstallError(format!("Download failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(WaxError::InstallError(format!(
+                "HTTP {} downloading {}",
+                response.status(),
+                name
+            )));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| WaxError::InstallError(format!("Read response: {}", e)))?;
+
+        // Verify checksum if provided.
+        if let Some(expected) = sha256 {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let computed = format!("{:x}", hasher.finalize());
+            if computed != expected {
+                return Err(WaxError::InstallError(format!(
+                    "{} checksum mismatch: expected {}, got {}",
+                    name, expected, computed
+                )));
+            }
+        }
+
+        // Write to a temp file.
+        let temp_path = std::env::temp_dir().join(format!("wax-cask-{}.{}", name, ext));
+        tokio::fs::write(&temp_path, &bytes)
+            .await
+            .map_err(|e| WaxError::InstallError(format!("Write temp file: {}", e)))?;
+
+        let temp_str = temp_path.to_string_lossy().into_owned();
+
+        let result = match ext.as_str() {
+            "deb" => run_visible("sudo", &["dpkg", "-i", &temp_str]).await,
+            "rpm" => run_visible("sudo", &["rpm", "-i", "--force", &temp_str]).await,
+            "appimage" => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                let bin_dir = format!("{home}/.local/bin");
+                tokio::fs::create_dir_all(&bin_dir).await.ok();
+                let dest = format!("{bin_dir}/{name}.AppImage");
+                tokio::fs::copy(&temp_path, std::path::Path::new(&dest))
+                    .await
+                    .map_err(|e| WaxError::InstallError(format!("Copy AppImage: {}", e)))?;
+                run_visible("chmod", &["+x", &dest]).await
+            }
+            _ => Err(WaxError::InstallError(format!(
+                "Unsupported artifact extension '.{}' from Homebrew cask .rb",
+                ext
+            ))),
+        };
+
+        tokio::fs::remove_file(&temp_path).await.ok();
+        result
     }
 }
 
