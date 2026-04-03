@@ -11,10 +11,11 @@ REPO="semitechnological/wax"
 INSTALL_DIR="${WAX_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${WAX_VERSION:-}"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 info()  { printf "${CYAN}%s${NC}\n" "$*"; }
 ok()    { printf "${GREEN}✓ %s${NC}\n" "$*"; }
+warn()  { printf "${YELLOW}! %s${NC}\n" "$*" >&2; }
 die()   { printf "${RED}error: %s${NC}\n" "$*" >&2; exit 1; }
 
 # ---- detect OS / arch -------------------------------------------------------
@@ -56,30 +57,42 @@ trap 'rm -f "$TMP" "$TMP_SHA"' EXIT
 
 if command -v curl &>/dev/null; then
   curl -fsSL --progress-bar "${BASE_URL}/${ASSET}" -o "$TMP"
-  curl -fsSL "${BASE_URL}/${ASSET}.sha256" -o "$TMP_SHA"
+  # Fetch checksum file — releases before v0.13.3 don't have one; skip gracefully.
+  HAVE_SHA=0
+  if curl -fsSL "${BASE_URL}/${ASSET}.sha256" -o "$TMP_SHA" 2>/dev/null; then
+    HAVE_SHA=1
+  fi
 elif command -v wget &>/dev/null; then
   wget -q --show-progress "${BASE_URL}/${ASSET}" -O "$TMP"
-  wget -q "${BASE_URL}/${ASSET}.sha256" -O "$TMP_SHA"
+  HAVE_SHA=0
+  if wget -q "${BASE_URL}/${ASSET}.sha256" -O "$TMP_SHA" 2>/dev/null; then
+    HAVE_SHA=1
+  fi
 else
   die "curl or wget is required"
 fi
 
-# ---- verify checksum --------------------------------------------------------
+# ---- verify checksum (when available) ---------------------------------------
 
-EXPECTED="$(cat "$TMP_SHA" | tr -d '[:space:]')"
-if command -v sha256sum &>/dev/null; then
-  ACTUAL="$(sha256sum "$TMP" | awk '{print $1}')"
-elif command -v shasum &>/dev/null; then
-  ACTUAL="$(shasum -a 256 "$TMP" | awk '{print $1}')"
-else
-  die "sha256sum or shasum is required to verify download integrity"
-fi
+if [ "$HAVE_SHA" -eq 1 ] && [ -s "$TMP_SHA" ]; then
+  EXPECTED="$(tr -d '[:space:]' < "$TMP_SHA")"
+  if command -v sha256sum &>/dev/null; then
+    ACTUAL="$(sha256sum "$TMP" | awk '{print $1}')"
+  elif command -v shasum &>/dev/null; then
+    ACTUAL="$(shasum -a 256 "$TMP" | awk '{print $1}')"
+  else
+    warn "sha256sum/shasum not found — skipping integrity check"
+    ACTUAL="$EXPECTED"
+  fi
 
-[ "$ACTUAL" = "$EXPECTED" ] || die "SHA256 mismatch — download may be corrupted or tampered with
+  [ "$ACTUAL" = "$EXPECTED" ] || die "SHA256 mismatch — download may be corrupted or tampered with
   expected: $EXPECTED
   actual:   $ACTUAL"
+  ok "checksum verified"
+else
+  warn "No checksum file found for ${VERSION} — skipping integrity verification"
+fi
 
-ok "checksum verified"
 chmod +x "$TMP"
 
 # ---- install ----------------------------------------------------------------
