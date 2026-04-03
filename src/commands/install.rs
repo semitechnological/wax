@@ -671,7 +671,6 @@ async fn install_impl(
 
     let semaphore = Arc::new(Semaphore::new(concurrent_limit));
     let mut tasks = Vec::new();
-    let inline_extracted: Vec<(String, String, std::path::PathBuf, String, u32)> = Vec::new();
 
     let temp_dir = Arc::new(TempDir::new()?);
 
@@ -842,8 +841,6 @@ async fn install_impl(
             }
         }
     }
-
-    extracted_packages.extend(inline_extracted);
 
     if cancelled {
         return Err(WaxError::Interrupted);

@@ -10,7 +10,7 @@ use crate::formula_parser::FormulaParser;
 use console::style;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// A detected system package manager.
 #[derive(Debug, Clone, PartialEq)]
@@ -187,17 +187,25 @@ impl SystemPm {
                     "Found on_linux artifact for {}: {}",
                     cask_name, artifact.url
                 );
-                if self
+                match self
                     .install_linux_artifact(cask_name, &artifact.url, artifact.sha256.as_deref())
                     .await
-                    .is_ok()
                 {
-                    return Ok(());
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        warn!(
+                            "Homebrew cask artifact install failed for {}: {}. \
+                             Falling back to snap/flatpak/native PM — the package \
+                             installed may differ from the macOS version.",
+                            cask_name, e
+                        );
+                        eprintln!(
+                            "  {} Homebrew .rb download failed ({}); trying snap/flatpak/native PM…",
+                            style("!").yellow(),
+                            e
+                        );
+                    }
                 }
-                debug!(
-                    "Homebrew cask artifact install failed for {}, falling back",
-                    cask_name
-                );
             }
         }
 
@@ -309,15 +317,19 @@ impl SystemPm {
             }
         }
 
-        // Write to a temp file.
-        let temp_path = std::env::temp_dir().join(format!("wax-cask-{}.{}", name, ext));
-        tokio::fs::write(&temp_path, &bytes)
-            .await
+        // Write to a secure temp file (unpredictable name, not world-accessible via /tmp race).
+        let mut temp_file = tempfile::Builder::new()
+            .suffix(&format!(".{}", ext))
+            .tempfile()
+            .map_err(|e| WaxError::InstallError(format!("Create temp file: {}", e)))?;
+        use std::io::Write as _;
+        temp_file
+            .write_all(&bytes)
             .map_err(|e| WaxError::InstallError(format!("Write temp file: {}", e)))?;
-
+        let temp_path = temp_file.path().to_path_buf();
         let temp_str = temp_path.to_string_lossy().into_owned();
 
-        let result = match ext.as_str() {
+        match ext.as_str() {
             "deb" => run_visible("sudo", &["dpkg", "-i", &temp_str]).await,
             "rpm" => run_visible("sudo", &["rpm", "-i", "--force", &temp_str]).await,
             "appimage" => {
@@ -334,10 +346,8 @@ impl SystemPm {
                 "Unsupported artifact extension '.{}' from Homebrew cask .rb",
                 ext
             ))),
-        };
-
-        tokio::fs::remove_file(&temp_path).await.ok();
-        result
+        }
+        // temp_file drops here, deleting the temp file automatically
     }
 }
 

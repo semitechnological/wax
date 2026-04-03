@@ -3,7 +3,7 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/semitechnological/wax/master/install.sh | bash
 #   # or with a specific version:
-#   WAX_VERSION=v0.13.1 bash install.sh
+#   WAX_VERSION=v0.13.3 bash install.sh
 
 set -euo pipefail
 
@@ -49,18 +49,37 @@ info "Installing wax ${VERSION} (${os}/${arch})…"
 
 # ---- download ---------------------------------------------------------------
 
-URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
 TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+TMP_SHA="$(mktemp)"
+trap 'rm -f "$TMP" "$TMP_SHA"' EXIT
 
 if command -v curl &>/dev/null; then
-  curl -fsSL --progress-bar "$URL" -o "$TMP"
+  curl -fsSL --progress-bar "${BASE_URL}/${ASSET}" -o "$TMP"
+  curl -fsSL "${BASE_URL}/${ASSET}.sha256" -o "$TMP_SHA"
 elif command -v wget &>/dev/null; then
-  wget -q --show-progress "$URL" -O "$TMP"
+  wget -q --show-progress "${BASE_URL}/${ASSET}" -O "$TMP"
+  wget -q "${BASE_URL}/${ASSET}.sha256" -O "$TMP_SHA"
 else
   die "curl or wget is required"
 fi
 
+# ---- verify checksum --------------------------------------------------------
+
+EXPECTED="$(cat "$TMP_SHA" | tr -d '[:space:]')"
+if command -v sha256sum &>/dev/null; then
+  ACTUAL="$(sha256sum "$TMP" | awk '{print $1}')"
+elif command -v shasum &>/dev/null; then
+  ACTUAL="$(shasum -a 256 "$TMP" | awk '{print $1}')"
+else
+  die "sha256sum or shasum is required to verify download integrity"
+fi
+
+[ "$ACTUAL" = "$EXPECTED" ] || die "SHA256 mismatch — download may be corrupted or tampered with
+  expected: $EXPECTED
+  actual:   $ACTUAL"
+
+ok "checksum verified"
 chmod +x "$TMP"
 
 # ---- install ----------------------------------------------------------------
