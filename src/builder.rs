@@ -89,6 +89,45 @@ impl Builder {
         Ok(())
     }
 
+    /// Build directly from an already-present source directory (e.g. a git clone).
+    #[instrument(skip(self, progress))]
+    pub async fn build_from_directory(
+        &self,
+        formula: &ParsedFormula,
+        source_dir: &Path,
+        install_prefix: &Path,
+        progress: Option<&ProgressBar>,
+    ) -> Result<()> {
+        info!("Building {} from directory {:?}", formula.name, source_dir);
+
+        match formula.build_system {
+            BuildSystem::Autotools => {
+                self.build_autotools(source_dir, install_prefix, &formula.configure_args)
+                    .await?
+            }
+            BuildSystem::CMake => {
+                self.build_cmake(source_dir, install_prefix, &formula.configure_args)
+                    .await?
+            }
+            BuildSystem::Meson => {
+                self.build_meson(source_dir, install_prefix, &formula.configure_args)
+                    .await?
+            }
+            BuildSystem::Make => self.build_make(source_dir, install_prefix).await?,
+            BuildSystem::Unknown => {
+                return Err(WaxError::BuildError(
+                    "Unknown build system - cannot build from source".to_string(),
+                ))
+            }
+        }
+
+        if let Some(pb) = progress {
+            pb.set_message("Build complete");
+        }
+
+        Ok(())
+    }
+
     async fn extract_source(&self, tarball: &Path, dest: &Path) -> Result<()> {
         debug!("Extracting {:?} to {:?}", tarball, dest);
 

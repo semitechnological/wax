@@ -28,6 +28,8 @@ pub struct ParsedFormula {
     pub homepage: Option<String>,
     pub license: Option<String>,
     pub source: FormulaSource,
+    /// HEAD git URL, if the formula defines one.
+    pub head_url: Option<String>,
     pub runtime_dependencies: Vec<String>,
     pub build_dependencies: Vec<String>,
     pub build_system: BuildSystem,
@@ -41,6 +43,7 @@ static RE_FIELD: OnceLock<Regex> = OnceLock::new();
 static RE_DEPENDS: OnceLock<Regex> = OnceLock::new();
 static RE_SYSTEM: OnceLock<Regex> = OnceLock::new();
 static RE_VERSION: OnceLock<Regex> = OnceLock::new();
+static RE_HEAD: OnceLock<Regex> = OnceLock::new();
 
 impl FormulaParser {
     #[instrument(skip(ruby_content))]
@@ -52,6 +55,7 @@ impl FormulaParser {
         let desc = Self::extract_field(ruby_content, "desc").ok();
         let homepage = Self::extract_field(ruby_content, "homepage").ok();
         let license = Self::extract_field(ruby_content, "license").ok();
+        let head_url = Self::extract_head_url(ruby_content);
 
         let version = Self::extract_version_from_url(&url);
 
@@ -73,12 +77,20 @@ impl FormulaParser {
                 sha256,
                 version,
             },
+            head_url,
             runtime_dependencies,
             build_dependencies,
             build_system,
             install_commands,
             configure_args,
         })
+    }
+
+    fn extract_head_url(content: &str) -> Option<String> {
+        let re = RE_HEAD.get_or_init(|| {
+            Regex::new(r#"(?m)^\s*head\s+"([^"]+)""#).unwrap()
+        });
+        re.captures(content).map(|c| c[1].to_string())
     }
 
     fn extract_field(content: &str, field: &str) -> Result<String> {

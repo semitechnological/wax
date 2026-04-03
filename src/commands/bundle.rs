@@ -149,7 +149,7 @@ pub async fn bundle(cache: &Cache, waxfile_path: Option<&str>, dry_run: bool) ->
             style("→").cyan(),
             names.len()
         );
-        match crate::commands::install::install(cache, &names, false, false, false, false, false)
+        match crate::commands::install::install(cache, &names, false, false, false, false, false, false)
             .await
         {
             Ok(()) => success += names.len(),
@@ -164,7 +164,7 @@ pub async fn bundle(cache: &Cache, waxfile_path: Option<&str>, dry_run: bool) ->
         let names: Vec<String> = waxfile.cask.iter().map(|e| e.name().to_string()).collect();
         println!();
         println!("  {} installing {} casks", style("→").cyan(), names.len());
-        match crate::commands::install::install(cache, &names, false, true, false, false, false)
+        match crate::commands::install::install(cache, &names, false, true, false, false, false, false)
             .await
         {
             Ok(()) => success += names.len(),
