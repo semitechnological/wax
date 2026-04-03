@@ -737,6 +737,7 @@ impl CaskInstaller {
         source_rel: &str,
         target_name: Option<&str>,
         cask_name: Option<&str>,
+
     ) -> Result<Vec<PathBuf>> {
         let source = self.resolve_source_path(staging, source_rel);
         let name = target_name.unwrap_or_else(|| {
