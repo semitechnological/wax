@@ -584,11 +584,11 @@ impl CaskInstaller {
         Ok(())
     }
 
-    #[instrument(skip(self, staging, rollback))]
+    #[instrument(skip(self, _staging, _rollback))]
     pub async fn install_app(
         &self,
-        staging: &StagingContext,
-        rollback: &mut RollbackContext,
+        _staging: &StagingContext,
+        _rollback: &mut RollbackContext,
         source_rel: &str,
     ) -> Result<()> {
         #[cfg(not(target_os = "macos"))]
@@ -596,51 +596,56 @@ impl CaskInstaller {
             debug!("Skipping .app bundle install on non-macOS: {}", source_rel);
             return Ok(());
         }
-        let source = self.resolve_source_path(staging, source_rel);
-        let app_name = Path::new(source_rel)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| WaxError::InstallError(format!("Invalid app source: {}", source_rel)))?;
+        #[cfg(target_os = "macos")]
+        {
+            let source = self.resolve_source_path(_staging, source_rel);
+            let app_name = Path::new(source_rel)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    WaxError::InstallError(format!("Invalid app source: {}", source_rel))
+                })?;
 
-        info!("Installing app: {}", app_name);
+            info!("Installing app: {}", app_name);
 
-        if !source.exists() {
-            return Err(WaxError::InstallError(format!(
-                "App source does not exist: {:?}",
-                source
-            )));
+            if !source.exists() {
+                return Err(WaxError::InstallError(format!(
+                    "App source does not exist: {:?}",
+                    source
+                )));
+            }
+
+            let app_dest = Self::applications_dir()?.join(app_name);
+
+            // Remove existing app bundle before copying (upgrade path)
+            if app_dest.exists() {
+                tokio::fs::remove_dir_all(&app_dest).await?;
+            }
+
+            _rollback.add(app_dest.clone());
+
+            let cp_output = tokio::process::Command::new("cp")
+                .arg("-R")
+                .arg(&source)
+                .arg(&app_dest)
+                .output()
+                .await?;
+
+            if !cp_output.status.success() {
+                return Err(WaxError::InstallError(format!(
+                    "Failed to copy app: {}",
+                    String::from_utf8_lossy(&cp_output.stderr)
+                )));
+            }
+
+            Ok(())
         }
-
-        let app_dest = Self::applications_dir()?.join(app_name);
-
-        // Remove existing app bundle before copying (upgrade path)
-        if app_dest.exists() {
-            tokio::fs::remove_dir_all(&app_dest).await?;
-        }
-
-        rollback.add(app_dest.clone());
-
-        let cp_output = tokio::process::Command::new("cp")
-            .arg("-R")
-            .arg(&source)
-            .arg(&app_dest)
-            .output()
-            .await?;
-
-        if !cp_output.status.success() {
-            return Err(WaxError::InstallError(format!(
-                "Failed to copy app: {}",
-                String::from_utf8_lossy(&cp_output.stderr)
-            )));
-        }
-
-        Ok(())
     }
 
-    #[instrument(skip(self, staging, _rollback))]
+    #[instrument(skip(self, _staging, _rollback))]
     pub async fn install_pkg(
         &self,
-        staging: &StagingContext,
+        _staging: &StagingContext,
         _rollback: &mut RollbackContext,
         source_rel: &str,
     ) -> Result<()> {
@@ -648,47 +653,50 @@ impl CaskInstaller {
         return Err(WaxError::PlatformNotSupported(
             "PKG installers are macOS-only".to_string(),
         ));
-        let source = self.resolve_source_path(staging, source_rel);
-        info!("Installing PKG: {:?}", source);
+        #[cfg(target_os = "macos")]
+        {
+            let source = self.resolve_source_path(_staging, source_rel);
+            info!("Installing PKG: {:?}", source);
 
-        if !source.exists() {
-            return Err(WaxError::InstallError(format!(
-                "PKG source does not exist: {:?}",
-                source
-            )));
+            if !source.exists() {
+                return Err(WaxError::InstallError(format!(
+                    "PKG source does not exist: {:?}",
+                    source
+                )));
+            }
+
+            // Warn before prompting so the user knows why credentials are needed.
+            if let Some(m) = crate::signal::clone_active_multi() {
+                let _ = m.println("\n⚠️  PKG installer requires administrator privileges");
+            } else {
+                println!("\n⚠️  PKG installer requires administrator privileges");
+            }
+
+            // Acquire sudo credentials interactively before spawning the installer.
+            // acquire_sudo() prompts with Touch ID / password and caches the ticket.
+            tokio::task::spawn_blocking(crate::sudo::acquire_sudo)
+                .await
+                .map_err(|e| WaxError::InstallError(e.to_string()))??;
+
+            let install_output = tokio::process::Command::new("sudo")
+                .arg("installer")
+                .arg("-pkg")
+                .arg(&source)
+                .arg("-target")
+                .arg("/")
+                .output()
+                .await?;
+
+            if !install_output.status.success() {
+                return Err(WaxError::InstallError(format!(
+                    "Failed to install PKG: {}",
+                    String::from_utf8_lossy(&install_output.stderr)
+                )));
+            }
+
+            info!("Successfully installed PKG");
+            Ok(())
         }
-
-        // Warn before prompting so the user knows why credentials are needed.
-        if let Some(m) = crate::signal::clone_active_multi() {
-            let _ = m.println("\n⚠️  PKG installer requires administrator privileges");
-        } else {
-            println!("\n⚠️  PKG installer requires administrator privileges");
-        }
-
-        // Acquire sudo credentials interactively before spawning the installer.
-        // acquire_sudo() prompts with Touch ID / password and caches the ticket.
-        tokio::task::spawn_blocking(crate::sudo::acquire_sudo)
-            .await
-            .map_err(|e| WaxError::InstallError(e.to_string()))??;
-
-        let install_output = tokio::process::Command::new("sudo")
-            .arg("installer")
-            .arg("-pkg")
-            .arg(&source)
-            .arg("-target")
-            .arg("/")
-            .output()
-            .await?;
-
-        if !install_output.status.success() {
-            return Err(WaxError::InstallError(format!(
-                "Failed to install PKG: {}",
-                String::from_utf8_lossy(&install_output.stderr)
-            )));
-        }
-
-        info!("Successfully installed PKG");
-        Ok(())
     }
 
     #[instrument(skip(self, staging, rollback))]
