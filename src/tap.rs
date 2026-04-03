@@ -364,6 +364,44 @@ impl TapManager {
         self.taps.values().collect()
     }
 
+    /// Re-clone any GitHub/Git tap whose directory is missing or not a valid git repo.
+    pub async fn repair_all(&mut self) -> Result<Vec<String>> {
+        let tap_names: Vec<String> = self.taps.keys().cloned().collect();
+        let mut repaired = Vec::new();
+
+        for name in tap_names {
+            let tap = self.taps[&name].clone();
+            match &tap.kind {
+                TapKind::GitHub { .. } | TapKind::Git { .. } => {
+                    let needs_repair = if !tap.path.exists() {
+                        true
+                    } else {
+                        let check = tokio::process::Command::new("git")
+                            .args(["rev-parse", "--git-dir"])
+                            .current_dir(&tap.path)
+                            .output()
+                            .await;
+                        check.map(|o| !o.status.success()).unwrap_or(true)
+                    };
+
+                    if needs_repair {
+                        if tap.path.exists() {
+                            fs::remove_dir_all(&tap.path).await.ok();
+                        }
+                        if let Some(parent) = tap.path.parent() {
+                            fs::create_dir_all(parent).await?;
+                        }
+                        self.clone_tap(&tap).await?;
+                        repaired.push(name);
+                    }
+                }
+                TapKind::LocalDir { .. } | TapKind::LocalFile { .. } => {}
+            }
+        }
+
+        Ok(repaired)
+    }
+
     pub async fn has_tap(&self, tap_name: &str) -> bool {
         self.taps.contains_key(tap_name)
     }
@@ -466,6 +504,7 @@ impl TapManager {
                             keg_only: None,
                             keg_only_reason: None,
                             post_install_defined: false,
+                            rb_path: Some(path.clone()),
                         };
                         Ok(vec![formula])
                     }
@@ -518,6 +557,7 @@ impl TapManager {
                                     keg_only: None,
                                     keg_only_reason: None,
                                     post_install_defined: false,
+                                    rb_path: Some(path.clone()),
                                 };
                                 formulae.push(formula);
                             }
