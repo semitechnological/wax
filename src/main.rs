@@ -95,6 +95,8 @@ enum Commands {
         global: bool,
         #[arg(long, help = "Build from source even if bottle available")]
         build_from_source: bool,
+        #[arg(long, help = "Install the HEAD version (clones git repo, builds from source)")]
+        head: bool,
     },
 
     #[command(about = "Install casks  [alias: c]")]
@@ -227,8 +229,10 @@ enum Commands {
     #[command(about = "Install packages from lockfile")]
     Sync,
 
-    #[command(about = "Manage custom taps")]
+    #[command(about = "Manage custom taps  [alias: untap]")]
     Tap {
+        #[arg(long, help = "Re-clone missing or broken taps")]
+        repair: bool,
         #[command(subcommand)]
         action: Option<TapAction>,
     },
@@ -359,18 +363,21 @@ enum TapAction {
         #[arg(help = "Tap specification: user/repo, Git URL, local directory, or .rb file path")]
         tap: String,
     },
-    #[command(about = "Remove a custom tap")]
+    #[command(about = "Remove a custom tap", visible_alias = "rm", alias = "uninstall", alias = "delete")]
     Remove {
         #[arg(help = "Tap specification: user/repo, Git URL, local directory, or .rb file path")]
         tap: String,
     },
-    #[command(about = "List installed taps")]
+    #[command(about = "List installed taps", visible_alias = "ls")]
     List,
-    #[command(about = "Update a tap")]
+    #[command(about = "Update a tap", visible_alias = "up")]
     Update {
         #[arg(help = "Tap specification: user/repo, Git URL, local directory, or .rb file path")]
         tap: String,
     },
+    /// Bare `wax tap user/repo` — treated as an add.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 fn init_logging(verbose: bool) -> Result<()> {
@@ -454,6 +461,7 @@ async fn main() -> Result<()> {
             user,
             global,
             build_from_source,
+            head,
         } => {
             if packages.is_empty() && !cask {
                 // No packages specified — sync from lockfile like `npm install`
@@ -467,6 +475,7 @@ async fn main() -> Result<()> {
                     user,
                     global,
                     build_from_source,
+                    head,
                 )
                 .await
             }
@@ -477,7 +486,8 @@ async fn main() -> Result<()> {
             user,
             global,
         } => {
-            commands::install::install(&cache, &packages, dry_run, true, user, global, false).await
+            commands::install::install(&cache, &packages, dry_run, true, user, global, false, false)
+                .await
         }
         Commands::Uninstall {
             formulae,
@@ -597,7 +607,7 @@ async fn main() -> Result<()> {
         Commands::Unpin { packages } => commands::pin::unpin(&packages).await,
         Commands::Lock => commands::lock::lock(&cache).await,
         Commands::Sync => commands::sync::sync(&cache).await,
-        Commands::Tap { action } => commands::tap::tap(action, Some(&cache)).await,
+        Commands::Tap { action, repair } => commands::tap::tap(action, repair, Some(&cache)).await,
         Commands::Doctor { fix } => commands::doctor::doctor(&cache, fix).await,
         Commands::Bundle {
             file,

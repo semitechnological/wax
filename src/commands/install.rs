@@ -12,6 +12,7 @@ use crate::error::{Result, WaxError};
 use crate::formula_parser::FormulaParser;
 use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackage};
 use crate::signal::{check_cancelled, CriticalSection};
+use crate::system_pm::SystemPm;
 use crate::tap::TapManager;
 use crate::ui::{
     copy_dir_all, dirs, PROGRESS_BAR_CHARS, PROGRESS_BAR_PREFIX_TEMPLATE, PROGRESS_BAR_TEMPLATE,
@@ -45,7 +46,18 @@ async fn install_from_source_task(
     spinner.set_message(format!("Fetching formula for {}...", formula.name));
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let ruby_content = FormulaParser::fetch_formula_rb(&formula.name).await?;
+    // Use the local tap .rb file if available; otherwise fetch from homebrew-core.
+    let ruby_content = if let Some(rb_path) = &formula.rb_path {
+        tokio::fs::read_to_string(rb_path).await.map_err(|e| {
+            crate::error::WaxError::BuildError(format!(
+                "Failed to read formula file {}: {}",
+                rb_path.display(),
+                e
+            ))
+        })?
+    } else {
+        FormulaParser::fetch_formula_rb(&formula.name).await?
+    };
 
     spinner.set_message("Parsing formula...");
     let parsed_formula = FormulaParser::parse_ruby_formula(&formula.name, &ruby_content)?;
@@ -137,12 +149,142 @@ async fn install_from_source_task(
     Ok(())
 }
 
+/// Clone and build from a formula's HEAD git URL.
+async fn install_from_head_task(
+    formula: Formula,
+    cellar: &Path,
+    install_mode: InstallMode,
+    state: &InstallState,
+    platform: &str,
+) -> Result<()> {
+    info!("Installing {} from HEAD", formula.name);
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {prefix:.bold} {msg}")
+            .unwrap(),
+    );
+    spinner.set_prefix("[>]".to_string());
+    spinner.set_message(format!("Fetching formula for {}...", formula.name));
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let ruby_content = if let Some(rb_path) = &formula.rb_path {
+        tokio::fs::read_to_string(rb_path).await.map_err(|e| {
+            crate::error::WaxError::BuildError(format!(
+                "Failed to read formula file {}: {}",
+                rb_path.display(),
+                e
+            ))
+        })?
+    } else {
+        FormulaParser::fetch_formula_rb(&formula.name).await?
+    };
+
+    spinner.set_message("Parsing formula...");
+    let parsed_formula = FormulaParser::parse_ruby_formula(&formula.name, &ruby_content)?;
+
+    let head_url = parsed_formula.head_url.as_deref().ok_or_else(|| {
+        crate::error::WaxError::BuildError(format!(
+            "Formula '{}' does not define a head URL",
+            formula.name
+        ))
+    })?;
+
+    let temp_dir = TempDir::new()?;
+    let clone_dir = temp_dir.path().join("head-src");
+
+    spinner.set_message(format!("Cloning HEAD from {}...", head_url));
+
+    let clone_output = tokio::process::Command::new("git")
+        .args(["clone", "--depth=1", head_url])
+        .arg(&clone_dir)
+        .output()
+        .await?;
+
+    if !clone_output.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_output.stderr);
+        return Err(crate::error::WaxError::BuildError(format!(
+            "Failed to clone HEAD: {}",
+            stderr
+        )));
+    }
+
+    // Determine a version string from the commit SHA.
+    let sha_output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(&clone_dir)
+        .output()
+        .await?;
+
+    let sha = if sha_output.status.success() {
+        String::from_utf8_lossy(&sha_output.stdout).trim().to_string()
+    } else {
+        "HEAD".to_string()
+    };
+
+    let version = format!("HEAD-{}", sha);
+
+    spinner.set_message("Building from HEAD (this may take several minutes)...");
+
+    let install_prefix = temp_dir.path().join("install");
+    tokio::fs::create_dir_all(&install_prefix).await?;
+
+    let builder = crate::builder::Builder::new();
+    builder
+        .build_from_directory(&parsed_formula, &clone_dir, &install_prefix, Some(&spinner))
+        .await?;
+
+    spinner.set_message("Installing to Cellar...");
+
+    let formula_cellar = cellar.join(&formula.name).join(&version);
+    tokio::fs::create_dir_all(&formula_cellar).await?;
+
+    copy_dir_all(&install_prefix, &formula_cellar)?;
+
+    create_symlinks(
+        &formula.name,
+        &version,
+        cellar,
+        false, /* dry_run */
+        install_mode,
+    )
+    .await?;
+
+    let package = InstalledPackage {
+        name: formula.name.clone(),
+        version: version.clone(),
+        platform: platform.to_string(),
+        install_date: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+        install_mode,
+        from_source: true,
+        bottle_rebuild: 0,
+        bottle_sha256: None,
+        pinned: false,
+    };
+    state.add(package).await?;
+
+    spinner.finish_and_clear();
+    println!(
+        "+ {}@{} {}",
+        style(&formula.name).magenta(),
+        style(&version).dim(),
+        style("(HEAD)").yellow()
+    );
+
+    Ok(())
+}
+
 struct InstallArgs<'a> {
     dry_run: bool,
     cask: bool,
     user: bool,
     global: bool,
     build_from_source: bool,
+    head: bool,
     quiet: bool,
     external_pb: Option<&'a ProgressBar>,
 }
@@ -156,6 +298,7 @@ pub async fn install(
     user: bool,
     global: bool,
     build_from_source: bool,
+    head: bool,
 ) -> Result<()> {
     install_impl(
         cache,
@@ -166,6 +309,7 @@ pub async fn install(
             user,
             global,
             build_from_source,
+            head,
             quiet: false,
             external_pb: None,
         },
@@ -193,6 +337,7 @@ pub async fn install_quiet(
             user,
             global,
             build_from_source: false,
+            head: false,
             quiet: true,
             external_pb: None,
         },
@@ -221,6 +366,7 @@ pub async fn install_quiet_with_progress(
             user,
             global,
             build_from_source: false,
+            head: false,
             quiet: true,
             external_pb: Some(pb),
         },
@@ -239,6 +385,7 @@ async fn install_impl(
         user,
         global,
         build_from_source,
+        head,
         quiet,
         external_pb,
     } = args;
@@ -545,6 +692,17 @@ async fn install_impl(
             .and_then(|s| s.files.get(&platform).or_else(|| s.files.get("all")))
             .is_some();
 
+        if head {
+            check_cancelled()?;
+            if !quiet {
+                println!();
+                println!("installing {} from HEAD", pkg.name);
+            }
+            install_from_head_task(pkg.clone(), &cellar, install_mode, &state, &platform).await?;
+            source_install_count += 1;
+            continue;
+        }
+
         if !has_bottle || build_from_source {
             check_cancelled()?;
 
@@ -787,20 +945,7 @@ async fn install_impl(
         }
     }
 
-    if !quiet {
-        let elapsed = start.elapsed();
-        let successful_count = extracted_packages_count + source_install_count;
-        println!(
-            "\n{} {} installed [{}ms]",
-            successful_count,
-            if successful_count == 1 {
-                "package"
-            } else {
-                "packages"
-            },
-            elapsed.as_millis()
-        );
-    }
+
 
     Ok(())
 }
@@ -985,11 +1130,14 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
     }
 
     let mut to_install = Vec::new();
+    let mut native_linux_installs = Vec::new();
     let mut already_installed = Vec::new();
 
     for cask_name in cask_names {
         if installed_casks.contains_key(cask_name) {
             already_installed.push(cask_name.clone());
+        } else if !cfg!(target_os = "macos") && (cask_name == "google-chrome" || cask_name.ends_with("/google-chrome") || cask_name.ends_with("google-chrome")) {
+            native_linux_installs.push(cask_name.clone());
         } else if casks
             .iter()
             .any(|c| &c.token == cask_name || &c.full_token == cask_name)
@@ -1006,7 +1154,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    if to_install.is_empty() {
+    if to_install.is_empty() && native_linux_installs.is_empty() {
         return Ok(());
     }
 
@@ -1078,7 +1226,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    if resolved.is_empty() {
+    if resolved.is_empty() && native_linux_installs.is_empty() {
         return Err(WaxError::InstallError(
             "No casks could be resolved".to_string(),
         ));
@@ -1168,6 +1316,29 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
                     e
                 );
                 failed.push(d.name.clone());
+            }
+        }
+    }
+
+    if !native_linux_installs.is_empty() {
+        let pm = SystemPm::detect().await.ok_or_else(|| {
+            WaxError::InstallError(
+                "No native package manager found for Google Chrome on Linux".to_string(),
+            )
+        })?;
+
+        for name in &native_linux_installs {
+            match name.as_str() {
+                "google-chrome" => {
+                    pm.install_google_chrome().await?;
+                    println!(
+                        "{} {} installed via native package manager",
+                        style("✓").green().bold(),
+                        style(name).magenta(),
+                    );
+                    installed_count += 1;
+                }
+                _ => {}
             }
         }
     }

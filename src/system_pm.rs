@@ -264,6 +264,32 @@ impl SystemPm {
         }
         Ok(())
     }
+
+    /// Install Google Chrome on Fedora-like Linux systems using Google's RPM.
+    /// This is used as a native-package fallback when users request google-chrome
+    /// on Linux instead of the macOS-only Homebrew cask path.
+    pub async fn install_google_chrome(&self) -> Result<()> {
+        let rpm_url = "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm";
+
+        match self {
+            Self::Dnf | Self::Yum => {
+                let pkg_bin = if which("dnf").await {
+                    "dnf"
+                } else if which("yum").await {
+                    "yum"
+                } else {
+                    return Err(WaxError::PlatformNotSupported(
+                        "Google Chrome native install requires dnf or yum".to_string(),
+                    ));
+                };
+                run_visible("sudo", &[pkg_bin, "install", "-y", rpm_url]).await?;
+                Ok(())
+            }
+            _ => Err(WaxError::PlatformNotSupported(
+                "Google Chrome native install is only wired for Fedora-like systems".to_string(),
+            )),
+        }
+    }
 }
 
 /// Check if a binary exists on PATH.
