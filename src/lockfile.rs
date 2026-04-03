@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockfilePackage {
@@ -108,9 +108,13 @@ impl Lockfile {
     }
 
     pub fn default_path() -> PathBuf {
-        crate::ui::dirs::wax_dir()
-            .unwrap_or_else(|_| PathBuf::from(".wax"))
-            .join("wax.lock")
+        match crate::ui::dirs::wax_dir() {
+            Ok(dir) => dir.join("wax.lock"),
+            Err(e) => {
+                warn!("Could not determine wax config directory: {}; using .wax/ fallback", e);
+                PathBuf::from(".wax").join("wax.lock")
+            }
+        }
     }
 }
 

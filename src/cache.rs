@@ -71,7 +71,7 @@ impl Cache {
             Some(m) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs() as i64;
                 (now - m.last_updated) > Self::STALE_THRESHOLD_SECS
             }
@@ -122,7 +122,7 @@ impl Cache {
             let new_metadata = CacheMetadata {
                 last_updated: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs() as i64,
                 formula_count,
                 cask_count,
@@ -298,5 +298,45 @@ impl Cache {
 impl Default for Cache {
     fn default() -> Self {
         Self::new().expect("Failed to initialize cache")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_metadata_serializes_roundtrip() {
+        let meta = CacheMetadata {
+            last_updated: 1_700_000_000,
+            formula_count: 8100,
+            cask_count: 7500,
+            formulae_etag: Some("\"abc123\"".to_string()),
+            formulae_last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
+            casks_etag: None,
+            casks_last_modified: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let decoded: CacheMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.last_updated, meta.last_updated);
+        assert_eq!(decoded.formula_count, meta.formula_count);
+        assert_eq!(decoded.formulae_etag, meta.formulae_etag);
+        assert_eq!(decoded.casks_etag, None);
+    }
+
+    #[test]
+    fn unix_timestamp_is_positive() {
+        // Sanity check: our timestamp helper produces a sane positive value.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // Must be > 2020-01-01 (Unix time 1577836800)
+        assert!(ts > 1_577_836_800, "timestamp looks wrong: {ts}");
+    }
+
+    #[test]
+    fn stale_threshold_constant_is_one_hour() {
+        assert_eq!(Cache::STALE_THRESHOLD_SECS, 3600);
     }
 }

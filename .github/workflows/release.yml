@@ -65,10 +65,13 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/wax ${{ matrix.asset_name }}
           chmod +x ${{ matrix.asset_name }}
+          sha256sum ${{ matrix.asset_name }} | awk '{print $1}' > ${{ matrix.asset_name }}.sha256
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset_name }}
+          files: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
