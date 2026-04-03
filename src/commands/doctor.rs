@@ -1,5 +1,7 @@
 use crate::api::ApiClient;
 use crate::bottle::{detect_platform, homebrew_prefix, run_command_with_timeout};
+#[cfg(target_os = "macos")]
+use crate::bottle::BottleDownloader;
 use crate::cache::Cache;
 use crate::cask::CaskState;
 use crate::error::Result;

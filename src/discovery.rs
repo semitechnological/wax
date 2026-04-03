@@ -20,6 +20,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
+#[cfg(target_os = "macos")]
+use tracing::debug;
 use tracing::info;
 
 #[allow(dead_code)]
