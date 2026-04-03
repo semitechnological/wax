@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/semitechnological/wax/master/instal
 ```
 
 Installs to `~/.local/bin/wax`. Override the destination with `WAX_INSTALL_DIR=/usr/local/bin`.
-Pin a specific release with `WAX_VERSION=v0.13.2`.
+Pin a specific release with `WAX_VERSION=v0.13.3`.
 
 **Homebrew tap** — builds from source via cargo:
 
