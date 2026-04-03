@@ -12,12 +12,15 @@ use crate::cask::InstalledCask;
 use crate::error::Result;
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 use crate::install::{InstallMode, InstalledPackage};
+#[cfg(target_os = "macos")]
 use crate::ui::dirs;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::info;
 
 #[allow(dead_code)]
 pub async fn discover_manually_installed_casks(
@@ -244,6 +247,7 @@ fn normalize_package_token(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+#[cfg(target_os = "macos")]
 fn macos_application_roots() -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/Applications")];
     if let Ok(home) = dirs::home_dir() {

@@ -410,8 +410,6 @@ async fn install_impl(
 
     install_mode.validate()?;
 
-    let start = std::time::Instant::now();
-
     let mut tap_manager = TapManager::new()?;
     tap_manager.load().await?;
 
@@ -674,7 +672,6 @@ async fn install_impl(
     let semaphore = Arc::new(Semaphore::new(concurrent_limit));
     let mut tasks = Vec::new();
     let inline_extracted: Vec<(String, String, std::path::PathBuf, String, u32)> = Vec::new();
-    let mut source_install_count = 0usize;
 
     let temp_dir = Arc::new(TempDir::new()?);
 
@@ -693,7 +690,6 @@ async fn install_impl(
                 println!("installing {} from HEAD", pkg.name);
             }
             install_from_head_task(pkg.clone(), &cellar, install_mode, &state, &platform).await?;
-            source_install_count += 1;
             continue;
         }
 
@@ -706,7 +702,6 @@ async fn install_impl(
             }
 
             install_from_source_task(pkg.clone(), &cellar, install_mode, &state, &platform).await?;
-            source_install_count += 1;
             continue;
         }
 
@@ -865,7 +860,7 @@ async fn install_impl(
         }
     }
 
-    let extracted_packages_count = extracted_packages.len();
+    let _extracted_packages_count = extracted_packages.len();
     check_cancelled()?;
 
     // Drop MultiProgress before the install phase so its draw layer releases
