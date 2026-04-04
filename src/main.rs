@@ -78,6 +78,8 @@ enum Commands {
     #[command(about = "List installed packages  [alias: ls]")]
     #[command(visible_alias = "ls")]
     List {
+        #[arg(help = "Filter: pre-fills the interactive search (TTY), or limits printed output")]
+        query: Option<String>,
         #[arg(long, help = "Only show packages with available updates")]
         upgradable: bool,
     },
@@ -464,7 +466,10 @@ async fn main() -> Result<()> {
         Commands::Info { formula, cask } => {
             commands::info::info(&api_client, &cache, &formula, cask).await
         }
-        Commands::List { upgradable } => commands::list::list(Some(&cache), upgradable).await,
+        Commands::List {
+            query,
+            upgradable,
+        } => commands::list::list(&cache, query, upgradable).await,
         Commands::Install {
             packages,
             dry_run,
