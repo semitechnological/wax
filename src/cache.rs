@@ -276,7 +276,16 @@ impl Cache {
                     tap_cache_path.display()
                 );
                 let json = fs::read_to_string(&tap_cache_path).await?;
-                serde_json::from_str(&json)?
+                let mut formulae: Vec<Formula> = serde_json::from_str(&json)?;
+                // rb_path is skipped during serialisation — restore it from the filesystem.
+                let formula_dir = tap.formula_dir();
+                for f in &mut formulae {
+                    let rb_file = formula_dir.join(format!("{}.rb", f.name));
+                    if rb_file.exists() {
+                        f.rb_path = Some(rb_file);
+                    }
+                }
+                formulae
             } else {
                 debug!("Loading tap formulae from filesystem: {}", tap.full_name);
                 let formulae = tap_manager.load_formulae_from_tap(tap).await?;
