@@ -6,9 +6,11 @@
 //! packages (apt, dnf, pacman, apk, zypper, emerge, yum, xbps-install, nix).
 
 use crate::error::{Result, WaxError};
+use crate::formula_parser::FormulaParser;
 use console::style;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// A detected system package manager.
 #[derive(Debug, Clone, PartialEq)]
@@ -265,30 +267,183 @@ impl SystemPm {
         Ok(())
     }
 
-    /// Install Google Chrome on Fedora-like Linux systems using Google's RPM.
-    /// This is used as a native-package fallback when users request google-chrome
-    /// on Linux instead of the macOS-only Homebrew cask path.
-    pub async fn install_google_chrome(&self) -> Result<()> {
-        let rpm_url = "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm";
-
-        match self {
-            Self::Dnf | Self::Yum => {
-                let pkg_bin = if which("dnf").await {
-                    "dnf"
-                } else if which("yum").await {
-                    "yum"
-                } else {
-                    return Err(WaxError::PlatformNotSupported(
-                        "Google Chrome native install requires dnf or yum".to_string(),
-                    ));
-                };
-                run_visible("sudo", &[pkg_bin, "install", "-y", rpm_url]).await?;
-                Ok(())
+    /// Install a cask (GUI app) on Linux.
+    ///
+    /// Strategy (in order):
+    /// 0. Fetch the Homebrew cask `.rb` file and look for an `on_linux` block
+    ///    containing a native download URL (.deb / .rpm / .AppImage).
+    /// 1. Try snap (with and without `--classic`).
+    /// 2. Try flatpak via Flathub.
+    /// 3. Fall back to the native system package manager.
+    pub async fn install_cask(&self, cask_name: &str) -> Result<()> {
+        // 0. Try Homebrew cask .rb — uses the same metadata Homebrew itself uses.
+        if let Ok(rb) = FormulaParser::fetch_cask_rb(cask_name).await {
+            if let Some(artifact) = FormulaParser::parse_cask_linux_artifact(&rb) {
+                debug!(
+                    "Found on_linux artifact for {}: {}",
+                    cask_name, artifact.url
+                );
+                match self
+                    .install_linux_artifact(cask_name, &artifact.url, artifact.sha256.as_deref())
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        warn!(
+                            "Homebrew cask artifact install failed for {}: {}. \
+                             Falling back to snap/flatpak/native PM — the package \
+                             installed may differ from the macOS version.",
+                            cask_name, e
+                        );
+                        eprintln!(
+                            "  {} Homebrew .rb download failed ({}); trying snap/flatpak/native PM…",
+                            style("!").yellow(),
+                            e
+                        );
+                    }
+                }
             }
-            _ => Err(WaxError::PlatformNotSupported(
-                "Google Chrome native install is only wired for Fedora-like systems".to_string(),
-            )),
         }
+
+        // 1. Try snap — no extra repo setup needed on Ubuntu/Debian/derivatives.
+        if which("snap").await {
+            // Some snaps need --classic confinement; try both.
+            for args in &[
+                vec!["install", cask_name],
+                vec!["install", "--classic", cask_name],
+            ] {
+                let ok = tokio::process::Command::new("snap")
+                    .args(args.as_slice())
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if ok {
+                    return Ok(());
+                }
+            }
+        }
+
+        // 2. Try flatpak via Flathub — good GUI app coverage on Fedora/etc.
+        if which("flatpak").await {
+            // Ensure Flathub remote exists (harmless if already present).
+            let _ = tokio::process::Command::new("flatpak")
+                .args([
+                    "remote-add",
+                    "--if-not-exists",
+                    "flathub",
+                    "https://dl.flathub.org/repo/flathub.flatpakrepo",
+                ])
+                .output()
+                .await;
+
+            let ok = tokio::process::Command::new("flatpak")
+                .args(["install", "-y", "flathub", cask_name])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                return Ok(());
+            }
+        }
+
+        // 3. Fall back to native package manager (apt, dnf, pacman, etc.).
+        self.install(&[cask_name.to_string()]).await
+    }
+
+    /// Download a Linux artifact from `url` and install it based on its extension.
+    async fn install_linux_artifact(
+        &self,
+        name: &str,
+        url: &str,
+        sha256: Option<&str>,
+    ) -> Result<()> {
+        // Determine the artifact type from the URL extension (ignore query string).
+        let ext = url
+            .split('?')
+            .next()
+            .unwrap_or(url)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+
+        println!(
+            "  {} downloading {} ({})…",
+            style("→").cyan(),
+            style(name).magenta(),
+            ext
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .map_err(|e| WaxError::InstallError(format!("HTTP client: {}", e)))?;
+
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| WaxError::InstallError(format!("Download failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(WaxError::InstallError(format!(
+                "HTTP {} downloading {}",
+                response.status(),
+                name
+            )));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| WaxError::InstallError(format!("Read response: {}", e)))?;
+
+        // Verify checksum if provided.
+        if let Some(expected) = sha256 {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let computed = format!("{:x}", hasher.finalize());
+            if computed != expected {
+                return Err(WaxError::InstallError(format!(
+                    "{} checksum mismatch: expected {}, got {}",
+                    name, expected, computed
+                )));
+            }
+        }
+
+        // Write to a secure temp file (unpredictable name, not world-accessible via /tmp race).
+        let mut temp_file = tempfile::Builder::new()
+            .suffix(&format!(".{}", ext))
+            .tempfile()
+            .map_err(|e| WaxError::InstallError(format!("Create temp file: {}", e)))?;
+        use std::io::Write as _;
+        temp_file
+            .write_all(&bytes)
+            .map_err(|e| WaxError::InstallError(format!("Write temp file: {}", e)))?;
+        let temp_path = temp_file.path().to_path_buf();
+        let temp_str = temp_path.to_string_lossy().into_owned();
+
+        match ext.as_str() {
+            "deb" => run_visible("sudo", &["dpkg", "-i", &temp_str]).await,
+            "rpm" => run_visible("sudo", &["rpm", "-i", "--force", &temp_str]).await,
+            "appimage" => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                let bin_dir = format!("{home}/.local/bin");
+                tokio::fs::create_dir_all(&bin_dir).await.ok();
+                let dest = format!("{bin_dir}/{name}.AppImage");
+                tokio::fs::copy(&temp_path, std::path::Path::new(&dest))
+                    .await
+                    .map_err(|e| WaxError::InstallError(format!("Copy AppImage: {}", e)))?;
+                run_visible("chmod", &["+x", &dest]).await
+            }
+            _ => Err(WaxError::InstallError(format!(
+                "Unsupported artifact extension '.{}' from Homebrew cask .rb",
+                ext
+            ))),
+        }
+        // temp_file drops here, deleting the temp file automatically
     }
 }
 

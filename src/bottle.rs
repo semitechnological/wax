@@ -1231,3 +1231,75 @@ pub fn should_prefer_source_build() -> bool {
         value == "ID=nixos" || value == "ID=\"nixos\"" || value.contains("ID_LIKE=nixos")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // ── num_connections ──────────────────────────────────────────────────────
+
+    #[test]
+    fn num_connections_tiny_file() {
+        // <10 MB → ideally 4, but capped by max_connections
+        assert_eq!(BottleDownloader::num_connections(1024, 8), 4);
+    }
+
+    #[test]
+    fn num_connections_medium_file() {
+        // 20 MB → ideally 6
+        assert_eq!(BottleDownloader::num_connections(20 * 1024 * 1024, 8), 6);
+    }
+
+    #[test]
+    fn num_connections_large_file() {
+        // 60 MB → ideally 8
+        assert_eq!(BottleDownloader::num_connections(60 * 1024 * 1024, 8), 8);
+    }
+
+    #[test]
+    fn num_connections_caps_at_max() {
+        // max_connections=2 caps even if ideal is higher
+        assert_eq!(BottleDownloader::num_connections(60 * 1024 * 1024, 2), 2);
+    }
+
+    #[test]
+    fn num_connections_minimum_one() {
+        // max_connections=0 still returns at least 1
+        assert_eq!(BottleDownloader::num_connections(1024, 0), 1);
+    }
+
+    // ── verify_checksum ──────────────────────────────────────────────────────
+
+    #[test]
+    fn verify_checksum_correct() {
+        use sha2::{Digest, Sha256};
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"hello world").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"hello world"));
+        let result = BottleDownloader::verify_checksum(f.path(), &hash);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn verify_checksum_mismatch_returns_error() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"hello world").unwrap();
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let result = BottleDownloader::verify_checksum(f.path(), wrong);
+        assert!(result.is_err(), "expected checksum mismatch error");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("mismatch") || msg.contains("Checksum"),
+            "error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_checksum_missing_file_returns_error() {
+        let path = std::path::Path::new("/tmp/wax-test-nonexistent-file-xyz-123.tar.gz");
+        let result = BottleDownloader::verify_checksum(path, "abc123");
+        assert!(result.is_err());
+    }
+}
