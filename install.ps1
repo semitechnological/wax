@@ -43,7 +43,7 @@ function Hint-Path {
     $dirs = ($env:PATH -split ';' | ForEach-Object { $_.TrimEnd('\') })
     if ($installDir -notin $dirs) {
         Write-Host ''
-        Write-Host 'Add this folder to your user PATH if `wax` is not found:'
+        Write-Host 'Add this folder to your user PATH if wax.exe is not found:'
         Write-Host "  $installDir"
     }
 }
@@ -110,7 +110,7 @@ function Install-FromRelease {
 $repoRoot = $PSScriptRoot
 $invokedAsThisScript = $PSCommandPath -and ((Split-Path -Leaf $PSCommandPath) -eq 'install.ps1')
 
-# Build `name = "waxpkg"` without embedding `"` in source (avoids tokenizer/parser issues on some hosts).
+# If Cargo.toml declares the waxpkg package, treat this directory as the project root.
 $cargoTomlPath = Join-Path $repoRoot 'Cargo.toml'
 $cargoTomlIsWaxpkg = $false
 if (Test-Path -LiteralPath $cargoTomlPath) {
