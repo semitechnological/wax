@@ -2,8 +2,8 @@
 # wax installer — downloads the latest pre-built binary from GitHub Releases.
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/semitechnological/wax/master/install.sh | bash
-#   # or with a specific version:
-#   WAX_VERSION=v0.13.3 bash install.sh
+#   # or with a specific tagged release:
+#   WAX_VERSION=v0.14.3 bash install.sh
 
 set -euo pipefail
 

@@ -76,7 +76,10 @@ enum Commands {
 
     #[command(about = "List installed packages  [alias: ls]")]
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        #[arg(help = "Filter: pre-fills the interactive search (TTY), or limits printed output")]
+        query: Option<String>,
+    },
 
     #[command(about = "Install one or more formulae or casks  [alias: i, add]")]
     #[command(visible_alias = "i")]
@@ -428,7 +431,7 @@ async fn main() -> Result<()> {
         Commands::Info { formula, cask } => {
             commands::info::info(&api_client, &cache, &formula, cask).await
         }
-        Commands::List => commands::list::list().await,
+        Commands::List { query } => commands::list::list(&cache, query).await,
         Commands::Install {
             packages,
             dry_run,
