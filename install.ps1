@@ -1,9 +1,12 @@
-#Requires -Version 5.1
-# Wax installer — from a clone: builds with cargo. Otherwise: GitHub Releases.
+﻿#Requires -Version 5.1
+# Wax installer - from a clone: builds with cargo. Otherwise: GitHub Releases.
 # Usage:
 #   irm https://raw.githubusercontent.com/semitechnological/wax/winget-integration/install.ps1 | iex
 #   .\install.ps1
-#   $env:WAX_USE_RELEASE = '1'; .\install.ps1   # force release download from a clone
+#   $env:WAX_USE_RELEASE = '1'; .\install.ps1
+#
+# Style: single-quoted strings where possible; expand with -f. ASCII punctuation only.
+# Save as UTF-8 with BOM for Windows PowerShell 5.1.
 #
 param()
 
@@ -19,9 +22,9 @@ $installDir = if ($env:WAX_INSTALL_DIR) {
 function Install-FromRepo {
     param([string]$Root)
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-        throw 'cargo not in PATH — install Rust from https://rustup.rs/ or set WAX_USE_RELEASE=1 to download a release binary.'
+        throw 'cargo not in PATH - install Rust from https://rustup.rs/ or set WAX_USE_RELEASE=1 to download a release binary.'
     }
-    Write-Host "Building wax from local checkout ($Root)…"
+    Write-Host ('Building wax from local checkout ({0})...' -f $Root)
     Push-Location $Root
     try {
         cargo build --release
@@ -30,12 +33,12 @@ function Install-FromRepo {
     }
     $built = Join-Path $Root 'target\release\wax.exe'
     if (-not (Test-Path -LiteralPath $built)) {
-        throw "Build finished but $built not found."
+        throw ('Build finished but {0} not found.' -f $built)
     }
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     $dest = Join-Path $installDir 'wax.exe'
     Copy-Item -LiteralPath $built -Destination $dest -Force
-    Write-Host "Installed to $dest"
+    Write-Host ('Installed to {0}' -f $dest)
     Hint-Path
 }
 
@@ -44,7 +47,7 @@ function Hint-Path {
     if ($installDir -notin $dirs) {
         Write-Host ''
         Write-Host 'Add this folder to your user PATH if wax.exe is not found:'
-        Write-Host "  $installDir"
+        Write-Host ('  {0}' -f $installDir)
     }
 }
 
@@ -57,39 +60,44 @@ function Install-FromRelease {
     $asset = switch ($osArch) {
         ([System.Runtime.InteropServices.Architecture]::X64) { 'wax-windows-x64.exe' }
         ([System.Runtime.InteropServices.Architecture]::Arm64) { 'wax-windows-arm64.exe' }
-        default { throw "Unsupported Windows CPU architecture for pre-built wax: $osArch (clone the repo and run .\install.ps1 to build)." }
+        default {
+            throw ('Unsupported Windows CPU architecture for pre-built wax: {0} (clone the repo and run install.ps1 to build).' -f $osArch)
+        }
     }
 
     $archLabel = if ($asset -match 'arm64') { 'windows/arm64' } else { 'windows/x64' }
 
     $version = $env:WAX_VERSION
     if (-not $version) {
-        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'wax-install-ps1' }
+        $releaseUri = ('https://api.github.com/repos/{0}/releases/latest' -f $Repo)
+        $rel = Invoke-RestMethod -Uri $releaseUri -Headers @{ 'User-Agent' = 'wax-install-ps1' }
         $version = $rel.tag_name
     }
     if ($version -notmatch '^v') {
-        $version = "v$version"
+        $version = 'v' + $version
     }
 
-    $base = "https://github.com/$Repo/releases/download/$version"
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("wax-install-" + [System.IO.Path]::GetRandomFileName())
+    $base = ('https://github.com/{0}/releases/download/{1}' -f $Repo, $version)
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('wax-install-' + [System.IO.Path]::GetRandomFileName())
 
     try {
-        Write-Host "Installing wax $version ($archLabel) from GitHub Releases…"
-        Invoke-WebRequest -Uri "$base/$asset" -OutFile $tmp -UseBasicParsing
+        Write-Host ('Installing wax {0} ({1}) from GitHub Releases...' -f $version, $archLabel)
+        $exeUri = ('{0}/{1}' -f $base, $asset)
+        Invoke-WebRequest -Uri $exeUri -OutFile $tmp -UseBasicParsing
 
         $expected = $null
         try {
-            $raw = (Invoke-WebRequest -Uri "$base/$asset.sha256" -UseBasicParsing).Content.Trim()
+            $shaUri = ('{0}/{1}.sha256' -f $base, $asset)
+            $raw = (Invoke-WebRequest -Uri $shaUri -UseBasicParsing).Content.Trim()
             $expected = ($raw -split '\s+')[0]
         } catch {
-            Write-Warning "No .sha256 file for $version — skipping integrity check"
+            Write-Warning ('No .sha256 file for {0} - skipping integrity check' -f $version)
         }
 
         if ($expected) {
             $hash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
             if ($hash.ToLowerInvariant() -ne $expected.ToLowerInvariant()) {
-                throw "SHA256 mismatch (expected $expected, got $hash)"
+                throw ('SHA256 mismatch (expected {0}, got {1})' -f $expected, $hash)
             }
             Write-Host 'Checksum verified.'
         }
@@ -97,7 +105,7 @@ function Install-FromRelease {
         New-Item -ItemType Directory -Force -Path $installDir | Out-Null
         $dest = Join-Path $installDir 'wax.exe'
         Move-Item -LiteralPath $tmp -Destination $dest -Force
-        Write-Host "Installed to $dest"
+        Write-Host ('Installed to {0}' -f $dest)
 
         Hint-Path
     } finally {
@@ -110,7 +118,6 @@ function Install-FromRelease {
 $repoRoot = $PSScriptRoot
 $invokedAsThisScript = $PSCommandPath -and ((Split-Path -Leaf $PSCommandPath) -eq 'install.ps1')
 
-# If Cargo.toml declares the waxpkg package, treat this directory as the project root.
 $cargoTomlPath = Join-Path $repoRoot 'Cargo.toml'
 $cargoTomlIsWaxpkg = $false
 if (Test-Path -LiteralPath $cargoTomlPath) {
