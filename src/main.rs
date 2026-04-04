@@ -523,10 +523,15 @@ async fn main() -> Result<()> {
         } => {
             commands::upgrade::upgrade(&cache, &packages, dry_run).await?;
             if system {
-                handle_system_upgrade().await
-            } else {
-                Ok(())
+                handle_system_upgrade().await?;
             }
+            // Always check for a wax update at the end of upgrade.
+            commands::self_update::self_update(
+                commands::self_update::Channel::Stable,
+                false,
+            )
+            .await?;
+            Ok(())
         }
         Commands::System { action } => match action {
             SystemAction::Upgrade => match system::SystemManager::detect().await? {

@@ -34,19 +34,35 @@ Wax reimagines package management by replacing Homebrew's git-based tap system w
 
 ## Installation
 
+**One-liner (recommended)** — downloads the pre-built binary for your platform:
+
 ```bash
-# Homebrew tap (recommended)
+curl -fsSL https://raw.githubusercontent.com/semitechnological/wax/master/install.sh | bash
+```
+
+Installs to `~/.local/bin/wax`. Override the destination with `WAX_INSTALL_DIR=/usr/local/bin`.
+Pin a specific release with `WAX_VERSION=v0.13.3`.
+
+**Homebrew tap** — builds from source via cargo:
+
+```bash
 brew tap semitechnological/tap
 brew install --HEAD wax
+```
 
-# Using Cargo
+**Cargo:**
+
+```bash
 cargo install waxpkg
+```
 
-# From source
+**From source:**
+
+```bash
 git clone https://github.com/semitechnological/wax.git
 cd wax
 cargo build --release
-sudo cp target/release/wax /usr/local/bin/
+cp target/release/wax ~/.local/bin/
 ```
 
 ## Usage
@@ -219,7 +235,7 @@ See `docs/comparison.md` for detailed methodology and analysis.
 ## Limitations
 
 - **Linux Bottles**: Linux bottles require `patchelf` for ELF binary relocation. Install it first: `wax install patchelf`
-- **Fedora Chrome fallback**: `wax install google-chrome` uses the native `dnf`/`yum` path on Linux instead of the macOS-only cask flow.
+- **Linux GUI / cask flow**: On Linux, GUI-style installs use cask Ruby metadata when an `on_linux` block is present; otherwise Wax may try snap, flatpak, or the native system package manager—not the macOS DMG install path.
 - **Build System Detection**: Source builds use heuristic detection of build systems. Complex or non-standard build configurations may fail.
 - **Formula DSL Subset**: Parses essential Ruby formula syntax. Advanced features (conditional deps, patches, custom install blocks) may not be fully supported.
 - **macOS Primary**: Developed for macOS. Linux support is functional but less tested.
