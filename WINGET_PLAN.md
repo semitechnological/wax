@@ -1,5 +1,10 @@
 # winget-cli Feature Parity Roadmap
 
+**Windows investigation (winget + Scoop as stand-ins):** see
+[docs/WINDOWS_PACKAGE_MANAGER_INVESTIGATION.md](docs/WINDOWS_PACKAGE_MANAGER_INVESTIGATION.md)
+for a phased research plan (manifests, shims, sources, spikes) before locking
+implementation on Windows.
+
 ## Overview
 
 This document maps winget-cli's command surface onto wax, identifies gaps, and
@@ -185,14 +190,22 @@ external dependencies.
 
 ## Notes on Platform Scope
 
-winget is Windows-only.  wax targets macOS and Linux.  The commands above are
-designed to be cross-platform at the UX level; no Windows-specific installer
-types (`.msix`, `.appx`, MSI silent flags) need to be replicated.  The value
-of this parity work is:
+winget is Windows-only; wax also targets macOS and Linux.  Command-level parity
+in this document helps users moving between platforms.  **If wax on Windows is
+positioned to replace winget and Scoop**, the assumptions below need to be
+revisited after the investigation in
+[docs/WINDOWS_PACKAGE_MANAGER_INVESTIGATION.md](docs/WINDOWS_PACKAGE_MANAGER_INVESTIGATION.md)
+(installer types, shims, store/MSIX, bucket JSON vs winget YAML).
+
+Previously this section stated that Windows-specific installer types need not be
+replicated; that only holds for a **Unix-first** wax.  A Windows **stand-in**
+build should explicitly define which installer families (MSI, EXE, ZIP, MSIX,
+etc.) are in scope for v1 versus delegated or out-of-scope.
+
+Cross-platform value *regardless* of Windows depth:
 
 1. Familiar muscle memory for users who switch between Windows and
    macOS/Linux.
-2. Shared tooling conventions (manifest format, REST source protocol) that
-   lower the barrier for hosting private cross-platform package repositories.
-3. A consistent `export`/`import` cycle that works regardless of the
-   underlying package manager.
+2. Shared conventions (REST source protocol, export/import lists) for private
+   registries.
+3. A consistent `export`/`import` cycle where formats align.
