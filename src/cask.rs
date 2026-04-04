@@ -1,4 +1,4 @@
-use crate::bottle::{homebrew_prefix, BottleDownloader};
+use crate::bottle::{BottleDownloader, homebrew_prefix};
 use crate::error::{Result, WaxError};
 use crate::ui::dirs;
 use indicatif::ProgressBar;
@@ -191,6 +191,137 @@ impl CaskState {
         self.save(&casks).await?;
         Ok(())
     }
+}
+
+async fn installed_cask_version_dir(cask: &InstalledCask) -> Result<Option<PathBuf>> {
+    let mut candidates = vec![
+        CaskState::caskroom_dir()
+            .join(&cask.name)
+            .join(&cask.version),
+    ];
+    if let Ok(user_dir) = CaskState::user_caskroom_dir() {
+        candidates.push(user_dir.join(&cask.name).join(&cask.version));
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn replace_path_with_link(source: &Path, dest: &Path) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(dest).await {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() || file_type.is_file() {
+            fs::remove_file(dest).await.ok();
+        } else if file_type.is_dir() {
+            fs::remove_dir_all(dest).await.ok();
+        }
+    }
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::fs::symlink(source, dest).await?;
+    }
+    #[cfg(not(unix))]
+    {
+        if source.is_dir() {
+            crate::ui::copy_dir_all(source, dest)?;
+        } else {
+            fs::copy(source, dest).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn remove_path_if_present(path: &Path) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path).await {
+        let file_type = metadata.file_type();
+        if file_type.is_dir() && !file_type.is_symlink() {
+            fs::remove_dir_all(path).await.ok();
+        } else {
+            fs::remove_file(path).await.ok();
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn relink_installed_cask(cask: &InstalledCask) -> Result<Vec<PathBuf>> {
+    let mut links = Vec::new();
+    let Some(version_dir) = installed_cask_version_dir(cask).await? else {
+        return Ok(links);
+    };
+
+    if let Some(app_name) = &cask.app_name {
+        #[cfg(target_os = "macos")]
+        {
+            let app_path = PathBuf::from("/Applications").join(app_name);
+            let link_path = version_dir.join(app_name);
+            if app_path.exists() {
+                replace_path_with_link(&app_path, &link_path).await?;
+                links.push(link_path);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let link_path = version_dir.join(app_name);
+            if link_path.exists() {
+                links.push(link_path);
+            }
+        }
+    }
+
+    if let Some(binary_paths) = &cask.binary_paths {
+        for binary_path in binary_paths {
+            let dest = PathBuf::from(binary_path);
+            let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let source = version_dir.join(name);
+            if source.exists() {
+                replace_path_with_link(&source, &dest).await?;
+                links.push(dest);
+            }
+        }
+    }
+
+    Ok(links)
+}
+
+pub async fn unlink_installed_cask(cask: &InstalledCask) -> Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    let version_dir = installed_cask_version_dir(cask).await?;
+
+    if let Some(app_name) = &cask.app_name {
+        if let Some(version_dir) = &version_dir {
+            let link_path = version_dir.join(app_name);
+            if link_path.exists() {
+                remove_path_if_present(&link_path).await?;
+                removed.push(link_path);
+            }
+        }
+    }
+
+    if let Some(binary_paths) = &cask.binary_paths {
+        for binary_path in binary_paths {
+            let dest = PathBuf::from(binary_path);
+            if dest.exists() {
+                remove_path_if_present(&dest).await?;
+                removed.push(dest);
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 impl Default for CaskState {
@@ -983,7 +1114,7 @@ impl CaskInstaller {
                 return Err(WaxError::InstallError(format!(
                     "Unsupported shell: {}",
                     shell
-                )))
+                )));
             }
         };
 
