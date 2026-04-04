@@ -6,8 +6,14 @@ use crate::error::{Result, WaxError};
 use crate::install::InstallState;
 use console::style;
 use inquire::{Confirm, Select};
+use std::collections::HashMap;
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use tracing::instrument;
+
+/// When set (tests only), treat this path as the Cellar root (`<Cellar>/<formula>/<version>/`)
+/// and do not merge in casks from the system, so `wax list` output is deterministic.
+const WAX_TEST_CELLAR_ENV: &str = "WAX_TEST_CELLAR";
 
 #[derive(Clone)]
 struct InstalledRow {
@@ -23,21 +29,31 @@ impl std::fmt::Display for InstalledRow {
 }
 
 async fn collect_installed_rows() -> Result<Vec<InstalledRow>> {
-    let candidates = [
-        homebrew_prefix().join("Cellar"),
-        crate::ui::dirs::home_dir()
-            .unwrap_or_else(|_| homebrew_prefix())
-            .join(".local/wax/Cellar"),
-    ];
+    let test_cellar = std::env::var_os(WAX_TEST_CELLAR_ENV);
 
-    let cellar_path = candidates
-        .iter()
-        .find(|p| p.exists())
-        .cloned()
-        .unwrap_or_else(|| homebrew_prefix().join("Cellar"));
+    let (cellar_path, skip_casks) = if let Some(ref raw) = test_cellar {
+        (PathBuf::from(raw), true)
+    } else {
+        let candidates = [
+            homebrew_prefix().join("Cellar"),
+            crate::ui::dirs::home_dir()
+                .unwrap_or_else(|_| homebrew_prefix())
+                .join(".local/wax/Cellar"),
+        ];
+        let cellar_path = candidates
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+            .unwrap_or_else(|| homebrew_prefix().join("Cellar"));
+        (cellar_path, false)
+    };
 
     let cask_state = CaskState::new()?;
-    let installed_casks = cask_state.load().await?;
+    let installed_casks: HashMap<_, _> = if skip_casks {
+        HashMap::new()
+    } else {
+        cask_state.load().await?
+    };
 
     let install_state = InstallState::new()?;
     let installed_packages = install_state.load().await?;
@@ -316,4 +332,44 @@ pub async fn list(cache: &Cache, query: Option<String>) -> Result<()> {
     print_summary(filtered.len(), fc, cc);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InstalledRow;
+    use super::matches_query;
+
+    fn row(name: &str, line: &str) -> InstalledRow {
+        InstalledRow {
+            name: name.to_string(),
+            line: line.to_string(),
+            is_cask: false,
+        }
+    }
+
+    #[test]
+    fn matches_query_empty_string_matches_all() {
+        let r = row("tree", "tree 2.0");
+        assert!(matches_query(&r, ""));
+    }
+
+    #[test]
+    fn matches_query_name_substring() {
+        let r = row("ripgrep", "ripgrep 14");
+        assert!(matches_query(&r, "rip"));
+        assert!(!matches_query(&r, "zzz"));
+    }
+
+    #[test]
+    fn matches_query_is_case_insensitive() {
+        let r = row("Foo-Bar", "foo-bar 1");
+        assert!(matches_query(&r, "FOO"));
+        assert!(matches_query(&r, "bar"));
+    }
+
+    #[test]
+    fn matches_query_matches_line_text() {
+        let r = row("x", "x 1 (source) something");
+        assert!(matches_query(&r, "source"));
+    }
 }

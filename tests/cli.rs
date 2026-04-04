@@ -96,6 +96,100 @@ fn list_with_query_exits_zero() {
     );
 }
 
+/// Hermetic Cellar layout via `WAX_TEST_CELLAR` (see `commands/list.rs`).
+#[test]
+fn list_plain_shows_test_cellar_formulae() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cellar = tmp.path().join("Cellar");
+    std::fs::create_dir_all(cellar.join("wax-a-listtest/1.0.0")).unwrap();
+    std::fs::create_dir_all(cellar.join("wax-b-listtest/2.0.0")).unwrap();
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let out = wax()
+        .env("WAX_CACHE_DIR", &cache)
+        .env("WAX_TEST_CELLAR", &cellar)
+        .env("CI", "1")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("wax-a-listtest"),
+        "expected formula a in output: {stdout}"
+    );
+    assert!(
+        stdout.contains("wax-b-listtest"),
+        "expected formula b in output: {stdout}"
+    );
+}
+
+#[test]
+fn list_plain_filter_excludes_non_matching() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cellar = tmp.path().join("Cellar");
+    std::fs::create_dir_all(cellar.join("wax-a-listtest/1.0.0")).unwrap();
+    std::fs::create_dir_all(cellar.join("wax-b-listtest/2.0.0")).unwrap();
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let out = wax()
+        .env("WAX_CACHE_DIR", &cache)
+        .env("WAX_TEST_CELLAR", &cellar)
+        .env("CI", "1")
+        .args(["list", "wax-b"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("wax-b-listtest"),
+        "expected filtered formula: {stdout}"
+    );
+    assert!(
+        !stdout.contains("wax-a-listtest"),
+        "did not expect excluded formula: {stdout}"
+    );
+}
+
+#[test]
+fn list_plain_no_match_reports_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cellar = tmp.path().join("Cellar");
+    std::fs::create_dir_all(cellar.join("only-wax-pkg/1.0")).unwrap();
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let needle = "zzz-nope-match";
+    let out = wax()
+        .env("WAX_CACHE_DIR", &cache)
+        .env("WAX_TEST_CELLAR", &cellar)
+        .env("CI", "1")
+        .args(["list", needle])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no installed packages match"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(needle), "{stdout}");
+}
+
 #[test]
 fn tap_list_exits_zero() {
     let out = wax()
