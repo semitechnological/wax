@@ -53,14 +53,16 @@ cd wax
 
 To **force** a pre-built release while standing in a clone, set `WAX_USE_RELEASE=1` before `./install.sh`.
 
-**Windows (this branch)** — one-liner downloads `wax-windows-x64.exe` or `wax-windows-arm64.exe` from GitHub Releases (same repo; pin with `WAX_VERSION`):
+**Windows (this branch)** — one-liner downloads `wax-windows-x64.exe` or `wax-windows-arm64.exe` from GitHub Releases (same repo; pin with `WAX_VERSION`).
+
+Because `iex` runs script content from the web, **lower the execution policy for this PowerShell session first** (`-Scope Process` only affects the current window; it does not change machine or user defaults), then run the installer:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 irm https://raw.githubusercontent.com/semitechnological/wax/winget-integration/install.ps1 | iex
 ```
 
-Installs to `%USERPROFILE%\.local\bin\wax.exe` unless you set `WAX_INSTALL_DIR`. If `irm | iex` is blocked by policy, run `install.ps1` from a clone or open an elevated/process-scoped policy as above.
+Installs to `%USERPROFILE%\.local\bin\wax.exe` unless you set `WAX_INSTALL_DIR`. To avoid changing policy, clone the repo and run `.\install.ps1` from that folder instead (you may still need process-scoped `RemoteSigned` or `Bypass` if running scripts is restricted).
 
 **From a git clone on Windows:**
 
