@@ -1014,6 +1014,7 @@ impl CaskInstaller {
         }
     }
 
+    #[cfg(unix)]
     async fn install_compatibility_links(
         name: &str,
         primary_path: &Path,
