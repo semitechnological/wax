@@ -161,11 +161,6 @@ enum Commands {
             help = "Also upgrade OS packages via the native package manager (apt/dnf/pacman/apk/…)"
         )]
         system: bool,
-        #[arg(
-            long = "self",
-            help = "Also upgrade wax itself from GitHub Releases"
-        )]
-        upgrade_self: bool,
     },
 
     #[command(about = "Manage OS-level packages via the native package manager")]
@@ -489,19 +484,17 @@ async fn main() -> Result<()> {
             packages,
             dry_run,
             system,
-            upgrade_self,
         } => {
             commands::upgrade::upgrade(&cache, &packages, dry_run).await?;
             if system {
                 handle_system_upgrade().await?;
             }
-            if upgrade_self {
-                commands::self_update::self_update(
-                    commands::self_update::Channel::Stable,
-                    false,
-                )
-                .await?;
-            }
+            // Always check for a wax update at the end of upgrade.
+            commands::self_update::self_update(
+                commands::self_update::Channel::Stable,
+                false,
+            )
+            .await?;
             Ok(())
         }
         Commands::System { action } => match action {
