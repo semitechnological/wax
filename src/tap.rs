@@ -386,7 +386,7 @@ impl TapManager {
 
                     if needs_repair {
                         if tap.path.exists() {
-                            fs::remove_dir_all(&tap.path).await.ok();
+                            fs::remove_dir_all(&tap.path).await?;
                         }
                         if let Some(parent) = tap.path.parent() {
                             fs::create_dir_all(parent).await?;
@@ -577,5 +577,68 @@ impl TapManager {
 impl Default for TapManager {
     fn default() -> Self {
         Self::new().expect("Failed to initialize TapManager")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Tap::from_spec ────────────────────────────────────────────────────────
+
+    #[test]
+    fn from_spec_github_user_repo() {
+        let tap = Tap::from_spec("homebrew/core").unwrap();
+        assert_eq!(tap.full_name, "homebrew/core");
+        assert!(matches!(tap.kind, TapKind::GitHub { ref user, ref repo }
+            if user == "homebrew" && repo == "core"));
+    }
+
+    #[test]
+    fn from_spec_github_url() {
+        let tap = Tap::from_spec("https://github.com/homebrew/homebrew-core.git").unwrap();
+        assert!(matches!(tap.kind, TapKind::Git { .. }));
+    }
+
+    #[test]
+    fn from_spec_git_at_url() {
+        let tap = Tap::from_spec("git@github.com:homebrew/homebrew-core.git").unwrap();
+        assert!(matches!(tap.kind, TapKind::Git { .. }));
+    }
+
+    #[test]
+    fn from_spec_invalid_returns_error() {
+        let result = Tap::from_spec("not/a/valid/tap/spec");
+        assert!(result.is_err(), "expected error for invalid spec");
+    }
+
+    #[test]
+    fn from_spec_bare_word_returns_error() {
+        let result = Tap::from_spec("justaword");
+        assert!(result.is_err());
+    }
+
+    // ── Tap::url ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn github_tap_url_format() {
+        let tap = Tap::from_spec("myuser/mytap").unwrap();
+        let url = tap.url().unwrap();
+        assert_eq!(url, "https://github.com/myuser/homebrew-mytap.git");
+    }
+
+    #[test]
+    fn git_tap_url_passthrough() {
+        let url = "https://example.com/my-tap.git";
+        let tap = Tap::from_spec(url).unwrap();
+        assert_eq!(tap.url().unwrap(), url);
+    }
+
+    // ── TapManager ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_tap_manager_starts_empty() {
+        let mgr = TapManager::new().unwrap();
+        assert!(mgr.list_taps().is_empty());
     }
 }

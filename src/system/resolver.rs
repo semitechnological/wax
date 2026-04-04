@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::system::registry::{parse_dep_name, PackageIndex, PackageMetadata};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use tracing::warn;
 
 pub struct Resolver<'a> {

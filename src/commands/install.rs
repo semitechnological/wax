@@ -9,7 +9,7 @@ use crate::commands::version_install;
 use crate::deps::resolve_dependencies;
 use crate::discovery::discover_manually_installed_casks;
 use crate::error::{Result, WaxError};
-use crate::formula_parser::FormulaParser;
+use crate::formula_parser::{BuildSystem, FormulaParser};
 use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackage};
 use crate::signal::{check_cancelled, CriticalSection};
 use crate::system_pm::SystemPm;
@@ -61,6 +61,132 @@ async fn install_from_source_task(
 
     spinner.set_message("Parsing formula...");
     let parsed_formula = FormulaParser::parse_ruby_formula(&formula.name, &ruby_content)?;
+
+    // Binary-release formula: `bin.install` entries with no build system.
+    // Download the platform-appropriate pre-built tarball and copy the named files.
+    if !parsed_formula.bin_installs.is_empty()
+        && parsed_formula.build_system == BuildSystem::Unknown
+    {
+        let (dl_url, dl_sha) =
+            FormulaParser::extract_platform_source(&ruby_content).ok_or_else(|| {
+                WaxError::BuildError(format!(
+                    "Formula '{}' has no pre-built binary for this platform (os={}, arch={})",
+                    formula.name,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                ))
+            })?;
+
+        spinner.set_message(format!("Downloading {}…", formula.name));
+        let client = reqwest::Client::new();
+        let response = client.get(&dl_url).send().await?;
+        if !response.status().is_success() {
+            return Err(WaxError::BuildError(format!(
+                "Failed to download binary: HTTP {}",
+                response.status()
+            )));
+        }
+        let bytes = response.bytes().await?;
+        let actual_sha = format!("{:x}", sha2::Sha256::digest(&bytes));
+        if actual_sha != dl_sha {
+            return Err(WaxError::ChecksumMismatch {
+                expected: dl_sha,
+                actual: actual_sha,
+            });
+        }
+
+        // Extract tarball.
+        let temp_dir = TempDir::new()?;
+        let archive_ext = if dl_url.ends_with(".tar.gz") || dl_url.ends_with(".tgz") {
+            "tar.gz"
+        } else {
+            "tar.bz2"
+        };
+        let archive_path = temp_dir
+            .path()
+            .join(format!("{}.{}", formula.name, archive_ext));
+        let extract_dir = temp_dir.path().join("extracted");
+        tokio::fs::write(&archive_path, &bytes).await?;
+        tokio::fs::create_dir_all(&extract_dir).await?;
+
+        let tar_output = tokio::process::Command::new("tar")
+            .args(["xf", &archive_path.to_string_lossy(), "-C"])
+            .arg(&extract_dir)
+            .output()
+            .await?;
+        if !tar_output.status.success() {
+            return Err(WaxError::BuildError(format!(
+                "Failed to extract tarball: {}",
+                String::from_utf8_lossy(&tar_output.stderr)
+            )));
+        }
+
+        // Find the single extracted subdirectory, or use extract_dir itself.
+        let src_dir = std::fs::read_dir(&extract_dir)
+            .ok()
+            .and_then(|mut rd| {
+                let entries: Vec<_> = rd.by_ref().filter_map(|e| e.ok()).collect();
+                if entries.len() == 1 {
+                    let e = &entries[0];
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        return Some(e.path());
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| extract_dir.clone());
+
+        // Copy bin_install targets into install_prefix/bin/.
+        let install_prefix = temp_dir.path().join("install");
+        let bin_dir = install_prefix.join("bin");
+        tokio::fs::create_dir_all(&bin_dir).await?;
+        for file in &parsed_formula.bin_installs {
+            let src = src_dir.join(file);
+            if src.exists() {
+                let dst = bin_dir.join(file);
+                tokio::fs::copy(&src, &dst).await?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = tokio::fs::metadata(&dst).await?.permissions();
+                    perms.set_mode(perms.mode() | 0o111);
+                    tokio::fs::set_permissions(&dst, perms).await?;
+                }
+            }
+        }
+
+        spinner.set_message("Installing to Cellar...");
+        let version = &parsed_formula.source.version;
+        let formula_cellar = cellar.join(&formula.name).join(version);
+        tokio::fs::create_dir_all(&formula_cellar).await?;
+        copy_dir_all(&install_prefix, &formula_cellar)?;
+        create_symlinks(&formula.name, version, cellar, false, install_mode).await?;
+
+        let package = InstalledPackage {
+            name: formula.name.clone(),
+            version: version.clone(),
+            platform: platform.to_string(),
+            install_date: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            install_mode,
+            from_source: false,
+            bottle_rebuild: 0,
+            bottle_sha256: None,
+            pinned: false,
+        };
+        state.add(package).await?;
+
+        spinner.finish_and_clear();
+        println!(
+            "+ {}@{} {}",
+            style(&formula.name).magenta(),
+            style(version).dim(),
+            style("(binary)").yellow()
+        );
+        return Ok(());
+    }
 
     spinner.set_message("Building from source (this may take several minutes)...".to_string());
 
@@ -184,12 +310,16 @@ async fn install_from_head_task(
     spinner.set_message("Parsing formula...");
     let parsed_formula = FormulaParser::parse_ruby_formula(&formula.name, &ruby_content)?;
 
-    let head_url = parsed_formula.head_url.as_deref().ok_or_else(|| {
-        crate::error::WaxError::BuildError(format!(
-            "Formula '{}' does not define a head URL",
+    if parsed_formula.head_url.is_none() {
+        spinner.finish_and_clear();
+        eprintln!(
+            "  {} '{}' has no HEAD URL — installing stable release instead",
+            console::style("note:").yellow(),
             formula.name
-        ))
-    })?;
+        );
+        return install_from_source_task(formula, cellar, install_mode, state, platform).await;
+    }
+    let head_url = parsed_formula.head_url.as_deref().unwrap();
 
     let temp_dir = TempDir::new()?;
     let clone_dir = temp_dir.path().join("head-src");
@@ -400,7 +530,7 @@ async fn install_impl(
     cache.ensure_fresh().await?;
 
     if cask {
-        return install_casks(cache, package_names, dry_run).await;
+        return install_casks(cache, package_names, dry_run, quiet).await;
     }
 
     let install_mode = match InstallMode::from_flags(user, global)? {
@@ -409,8 +539,6 @@ async fn install_impl(
     };
 
     install_mode.validate()?;
-
-    let start = std::time::Instant::now();
 
     let mut tap_manager = TapManager::new()?;
     tap_manager.load().await?;
@@ -548,7 +676,7 @@ async fn install_impl(
 
     // Install all auto-detected casks concurrently (batch download + serial install)
     if !detected_casks.is_empty() {
-        install_casks(cache, &detected_casks, dry_run).await?;
+        install_casks(cache, &detected_casks, dry_run, quiet).await?;
     }
 
     if all_to_install.is_empty() {
@@ -679,8 +807,6 @@ async fn install_impl(
 
     let semaphore = Arc::new(Semaphore::new(concurrent_limit));
     let mut tasks = Vec::new();
-    let inline_extracted: Vec<(String, String, std::path::PathBuf, String, u32)> = Vec::new();
-    let mut source_install_count = 0usize;
 
     let temp_dir = Arc::new(TempDir::new()?);
 
@@ -699,7 +825,6 @@ async fn install_impl(
                 println!("installing {} from HEAD", pkg.name);
             }
             install_from_head_task(pkg.clone(), &cellar, install_mode, &state, &platform).await?;
-            source_install_count += 1;
             continue;
         }
 
@@ -712,7 +837,6 @@ async fn install_impl(
             }
 
             install_from_source_task(pkg.clone(), &cellar, install_mode, &state, &platform).await?;
-            source_install_count += 1;
             continue;
         }
 
@@ -854,8 +978,6 @@ async fn install_impl(
         }
     }
 
-    extracted_packages.extend(inline_extracted);
-
     if cancelled {
         return Err(WaxError::Interrupted);
     }
@@ -871,7 +993,7 @@ async fn install_impl(
         }
     }
 
-    let extracted_packages_count = extracted_packages.len();
+    let _extracted_packages_count = extracted_packages.len();
     check_cancelled()?;
 
     drop(multi);
@@ -1109,7 +1231,7 @@ struct DownloadedCask {
 }
 
 #[instrument(skip(cache))]
-async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> Result<()> {
+async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quiet: bool) -> Result<()> {
     let start = std::time::Instant::now();
     let cask_platform = detect_platform();
 
@@ -1129,22 +1251,26 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    let mut to_install = Vec::new();
-    let mut native_linux_installs = Vec::new();
+    let mut to_install = Vec::new();          // macOS: full CaskInstaller path
+    let mut linux_cask_installs = Vec::new(); // Linux: snap → flatpak → native PM
     let mut already_installed = Vec::new();
 
     for cask_name in cask_names {
         if installed_casks.contains_key(cask_name) {
             already_installed.push(cask_name.clone());
-        } else if !cfg!(target_os = "macos") && (cask_name == "google-chrome" || cask_name.ends_with("/google-chrome") || cask_name.ends_with("google-chrome")) {
-            native_linux_installs.push(cask_name.clone());
-        } else if casks
-            .iter()
-            .any(|c| &c.token == cask_name || &c.full_token == cask_name)
-        {
-            to_install.push(cask_name.clone());
+        } else if cfg!(target_os = "macos") {
+            if casks
+                .iter()
+                .any(|c| &c.token == cask_name || &c.full_token == cask_name)
+            {
+                to_install.push(cask_name.clone());
+            } else {
+                eprintln!("{}: cask not found", style(cask_name).magenta());
+            }
         } else {
-            eprintln!("{}: cask not found", style(cask_name).magenta());
+            // On Linux, Homebrew cask artifacts are macOS-only.
+            // Route all cask requests through snap/flatpak/native PM instead.
+            linux_cask_installs.push(cask_name.clone());
         }
     }
 
@@ -1154,7 +1280,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    if to_install.is_empty() && native_linux_installs.is_empty() {
+    if to_install.is_empty() && linux_cask_installs.is_empty() {
         return Ok(());
     }
 
@@ -1226,7 +1352,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    if resolved.is_empty() && native_linux_installs.is_empty() {
+    if resolved.is_empty() && linux_cask_installs.is_empty() {
         return Err(WaxError::InstallError(
             "No casks could be resolved".to_string(),
         ));
@@ -1300,12 +1426,14 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
             Ok(installed_cask) => {
                 let state = CaskState::new()?;
                 state.add(installed_cask).await?;
-                println!(
-                    "{} {} (cask) {}",
-                    style("✓").green().bold(),
-                    style(&d.name).magenta(),
-                    style(&d.details.version).dim()
-                );
+                if !quiet {
+                    println!(
+                        "{} {} (cask) {}",
+                        style("✓").green().bold(),
+                        style(&d.name).magenta(),
+                        style(&d.details.version).dim()
+                    );
+                }
                 installed_count += 1;
             }
             Err(e) => {
@@ -1320,50 +1448,58 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool) -> R
         }
     }
 
-    if !native_linux_installs.is_empty() {
+    if !linux_cask_installs.is_empty() {
         let pm = SystemPm::detect().await.ok_or_else(|| {
             WaxError::InstallError(
-                "No native package manager found for Google Chrome on Linux".to_string(),
+                "No supported package manager found for Linux cask install".to_string(),
             )
         })?;
 
-        for name in &native_linux_installs {
-            match name.as_str() {
-                "google-chrome" => {
-                    pm.install_google_chrome().await?;
-                    println!(
-                        "{} {} installed via native package manager",
-                        style("✓").green().bold(),
-                        style(name).magenta(),
-                    );
+        for name in &linux_cask_installs {
+            match pm.install_cask(name).await {
+                Ok(()) => {
+                    if !quiet {
+                        println!(
+                            "{} {} installed",
+                            style("✓").green().bold(),
+                            style(name).magenta(),
+                        );
+                    }
                     installed_count += 1;
                 }
-                _ => {}
+                Err(e) => {
+                    eprintln!("{} {} failed: {}", style("✗").red(), style(name).magenta(), e);
+                    failed.push(name.clone());
+                }
             }
         }
     }
 
     let elapsed = start.elapsed();
     if failed.is_empty() {
-        println!(
-            "\n{} {} installed [{}ms]",
-            installed_count,
-            if installed_count == 1 {
-                "cask"
-            } else {
-                "casks"
-            },
-            elapsed.as_millis()
-        );
+        if !quiet {
+            println!(
+                "\n{} {} installed [{}ms]",
+                installed_count,
+                if installed_count == 1 {
+                    "cask"
+                } else {
+                    "casks"
+                },
+                elapsed.as_millis()
+            );
+        }
         Ok(())
     } else {
-        println!(
-            "\n{}/{} casks installed ({} failed) [{}ms]",
-            installed_count,
-            downloaded.len(),
-            failed.len(),
-            elapsed.as_millis()
-        );
+        if !quiet {
+            println!(
+                "\n{}/{} casks installed ({} failed) [{}ms]",
+                installed_count,
+                downloaded.len(),
+                failed.len(),
+                elapsed.as_millis()
+            );
+        }
         Err(WaxError::InstallError(format!(
             "Some casks failed: {}",
             failed.join(", ")

@@ -1,5 +1,7 @@
 use crate::api::ApiClient;
-use crate::bottle::{detect_platform, homebrew_prefix, run_command_with_timeout, BottleDownloader};
+use crate::bottle::{
+    detect_platform, homebrew_prefix, run_command_with_timeout, BottleDownloader,
+};
 use crate::cache::Cache;
 use crate::cask::CaskState;
 use crate::error::Result;
@@ -1009,6 +1011,7 @@ async fn check_unrelocated_bottles(d: &mut DiagResult) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn has_unrelocated_macho(dir: &Path) -> bool {
     for subdir in &["bin", "lib"] {
         let path = dir.join(subdir);
@@ -1019,6 +1022,7 @@ fn has_unrelocated_macho(dir: &Path) -> bool {
     false
 }
 
+#[cfg(target_os = "macos")]
 fn scan_dir_for_placeholders(dir: &Path) -> bool {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -1033,6 +1037,7 @@ fn scan_dir_for_placeholders(dir: &Path) -> bool {
     false
 }
 
+#[cfg(target_os = "macos")]
 fn is_mach_o_with_placeholders(path: &Path) -> bool {
     use std::io::Read;
 
