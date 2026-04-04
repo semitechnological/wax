@@ -43,6 +43,18 @@ curl -fsSL https://raw.githubusercontent.com/semitechnological/wax/master/instal
 Installs to `~/.local/bin/wax`. Override the destination with `WAX_INSTALL_DIR=/usr/local/bin`.
 Pin a specific release with `WAX_VERSION=v0.13.3`.
 
+**From a git clone** (builds with your Rust toolchain; no GitHub download):
+
+```bash
+git clone https://github.com/semitechnological/wax.git
+cd wax
+./install.sh
+```
+
+To **force** a pre-built release while standing in a clone, set `WAX_USE_RELEASE=1` before `./install.sh`.
+
+GitHub Releases ship **Linux** and **macOS** binaries (`wax-linux-*`, `wax-macos-*`) with `.sha256` sidecars when published by CI.
+
 **Homebrew tap** — builds from source via cargo:
 
 ```bash
@@ -56,7 +68,7 @@ brew install --HEAD wax
 cargo install waxpkg
 ```
 
-**From source:**
+**From source (manual)** — equivalent to `./install.sh` from a clone:
 
 ```bash
 git clone https://github.com/semitechnological/wax.git
