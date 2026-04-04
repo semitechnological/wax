@@ -109,12 +109,22 @@ function Install-FromRelease {
 
 $repoRoot = $PSScriptRoot
 $invokedAsThisScript = $PSCommandPath -and ((Split-Path -Leaf $PSCommandPath) -eq 'install.ps1')
+
+# Build `name = "waxpkg"` without embedding `"` in source (avoids tokenizer/parser issues on some hosts).
+$cargoTomlPath = Join-Path $repoRoot 'Cargo.toml'
+$cargoTomlIsWaxpkg = $false
+if (Test-Path -LiteralPath $cargoTomlPath) {
+    $tomlRaw = Get-Content -LiteralPath $cargoTomlPath -Raw
+    $q = [char]34
+    $needle = [string]::Concat('name = ', $q, 'waxpkg', $q)
+    $cargoTomlIsWaxpkg = $tomlRaw.IndexOf($needle, [System.StringComparison]::Ordinal) -ge 0
+}
+
 if (
     $invokedAsThisScript -and
     $repoRoot -and
     ($env:WAX_USE_RELEASE -ne '1') -and
-    (Test-Path -LiteralPath (Join-Path $repoRoot 'Cargo.toml')) -and
-    (Select-String -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -SimpleMatch 'name = "waxpkg"' -Quiet)
+    $cargoTomlIsWaxpkg
 ) {
     Install-FromRepo -Root $repoRoot
 } else {
