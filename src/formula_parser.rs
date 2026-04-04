@@ -35,6 +35,8 @@ pub struct ParsedFormula {
     pub build_system: BuildSystem,
     pub install_commands: Vec<String>,
     pub configure_args: Vec<String>,
+    /// Files to copy to `bin/` via `bin.install "..."` (binary-release formulas).
+    pub bin_installs: Vec<String>,
 }
 
 pub struct FormulaParser;
@@ -68,7 +70,11 @@ impl FormulaParser {
         let license = Self::extract_field(ruby_content, "license").ok();
         let head_url = Self::extract_head_url(ruby_content);
 
-        let version = Self::extract_version_from_url(&url);
+        // Prefer an explicit `version "x.y.z"` field; fall back to parsing from URL.
+        let version = Self::extract_field(ruby_content, "version")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| Self::extract_version_from_url(&url));
 
         let runtime_dependencies = Self::extract_dependencies(ruby_content, false);
         let build_dependencies = Self::extract_dependencies(ruby_content, true);
@@ -77,6 +83,7 @@ impl FormulaParser {
         let build_system = Self::detect_build_system(&install_block);
         let configure_args = Self::extract_configure_args(&install_block);
         let install_commands = Self::extract_install_commands(&install_block);
+        let bin_installs = Self::extract_bin_installs(&install_block);
 
         Ok(ParsedFormula {
             name: name.to_string(),
@@ -94,6 +101,7 @@ impl FormulaParser {
             build_system,
             install_commands,
             configure_args,
+            bin_installs,
         })
     }
 
@@ -106,7 +114,7 @@ impl FormulaParser {
 
     fn extract_field(content: &str, field: &str) -> Result<String> {
         let re = RE_FIELD.get_or_init(|| {
-            Regex::new(r#"(?m)^\s*(?P<field>url|sha256|desc|homepage|license)\s+"(?P<value>[^"]+)"#)
+            Regex::new(r#"(?m)^\s*(?P<field>url|sha256|desc|homepage|license|version)\s+"(?P<value>[^"]+)"#)
                 .unwrap()
         });
 
@@ -280,6 +288,60 @@ impl FormulaParser {
             commands.push(cap["cmd"].to_string());
         }
         commands
+    }
+
+    /// Parse `bin.install "filename"` entries from a formula install block.
+    pub(crate) fn extract_bin_installs(install_block: &str) -> Vec<String> {
+        let re = Regex::new(r#"bin\.install\s+"([^"]+)""#).unwrap();
+        re.captures_iter(install_block)
+            .map(|c| c[1].to_string())
+            .collect()
+    }
+
+    /// For formulas with `on_linux`/`on_macos`/`on_arm`/`on_intel` conditional blocks,
+    /// extract the (url, sha256) pair appropriate for the current platform.
+    /// Returns `None` if no matching block is found.
+    pub fn extract_platform_source(content: &str) -> Option<(String, String)> {
+        let is_arm = std::env::consts::ARCH == "aarch64";
+        let os_block_key = if std::env::consts::OS == "macos" {
+            "on_macos do"
+        } else {
+            "on_linux do"
+        };
+        let arch_preferred = if is_arm { "on_arm do" } else { "on_intel do" };
+        let arch_fallback = if is_arm { "on_intel do" } else { "on_arm do" };
+
+        let try_extract = |block: &str| -> Option<(String, String)> {
+            let art = Self::extract_url_sha(block)?;
+            Some((art.url, art.sha256?))
+        };
+
+        // 1. OS block → preferred arch → whole OS block → fallback arch
+        if let Some(os_block) = Self::extract_named_block(content, os_block_key) {
+            if let Some(arch_block) = Self::extract_named_block(&os_block, arch_preferred) {
+                if let Some(pair) = try_extract(&arch_block) {
+                    return Some(pair);
+                }
+            }
+            // No arch sub-block — use the whole OS block directly.
+            if let Some(pair) = try_extract(&os_block) {
+                return Some(pair);
+            }
+            if let Some(arch_block) = Self::extract_named_block(&os_block, arch_fallback) {
+                if let Some(pair) = try_extract(&arch_block) {
+                    return Some(pair);
+                }
+            }
+        }
+
+        // 2. Direct arch blocks at top level (no OS wrapper).
+        if let Some(arch_block) = Self::extract_named_block(content, arch_preferred) {
+            if let Some(pair) = try_extract(&arch_block) {
+                return Some(pair);
+            }
+        }
+
+        None
     }
 
     /// Parse the Linux-specific artifact from a Homebrew cask `.rb` file.
@@ -663,5 +725,71 @@ cask "macos-only-app" do
 end
 "#;
         assert!(FormulaParser::parse_cask_linux_artifact(cask).is_none());
+    }
+
+    #[test]
+    fn extract_bin_installs_finds_quoted_filenames() {
+        let install_block = r#"
+    bin.install "poke-around"
+    bin.install "poke-around-bridge.js"
+    bin.install "menubar_linux.py" if File.exist?("menubar_linux.py")
+"#;
+        let bins = FormulaParser::extract_bin_installs(install_block);
+        assert_eq!(bins, vec!["poke-around", "poke-around-bridge.js", "menubar_linux.py"]);
+    }
+
+    #[test]
+    fn extract_bin_installs_empty_for_build_formulas() {
+        let install_block = r#"
+    system "./configure", "--prefix=#{prefix}"
+    system "make", "install"
+"#;
+        assert!(FormulaParser::extract_bin_installs(install_block).is_empty());
+    }
+
+    #[test]
+    fn extract_platform_source_linux_intel() {
+        let formula = r#"
+class MyTool < Formula
+  on_macos do
+    on_arm do
+      url "https://example.com/mytool-macos-arm64.tar.gz"
+      sha256 "aaaa"
+    end
+    on_intel do
+      url "https://example.com/mytool-macos-x86_64.tar.gz"
+      sha256 "bbbb"
+    end
+  end
+  on_linux do
+    on_intel do
+      url "https://example.com/mytool-linux-x86_64.tar.gz"
+      sha256 "cccc"
+    end
+  end
+end
+"#;
+        let result = FormulaParser::extract_platform_source(formula);
+        // On Linux x86_64 we expect the linux-intel URL.
+        if std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64" {
+            let (url, sha) = result.unwrap();
+            assert_eq!(url, "https://example.com/mytool-linux-x86_64.tar.gz");
+            assert_eq!(sha, "cccc");
+        }
+    }
+
+    #[test]
+    fn extract_platform_source_returns_none_without_matching_block() {
+        let formula = r#"
+class MacOnly < Formula
+  on_macos do
+    url "https://example.com/maconly.dmg"
+    sha256 "aaaa"
+  end
+end
+"#;
+        if std::env::consts::OS == "linux" {
+            assert!(FormulaParser::extract_platform_source(formula).is_none());
+        }
     }
 }

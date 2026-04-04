@@ -9,7 +9,7 @@ use crate::commands::version_install;
 use crate::deps::resolve_dependencies;
 use crate::discovery::discover_manually_installed_casks;
 use crate::error::{Result, WaxError};
-use crate::formula_parser::FormulaParser;
+use crate::formula_parser::{BuildSystem, FormulaParser};
 use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackage};
 use crate::signal::{check_cancelled, CriticalSection};
 use crate::system_pm::SystemPm;
@@ -61,6 +61,132 @@ async fn install_from_source_task(
 
     spinner.set_message("Parsing formula...");
     let parsed_formula = FormulaParser::parse_ruby_formula(&formula.name, &ruby_content)?;
+
+    // Binary-release formula: `bin.install` entries with no build system.
+    // Download the platform-appropriate pre-built tarball and copy the named files.
+    if !parsed_formula.bin_installs.is_empty()
+        && parsed_formula.build_system == BuildSystem::Unknown
+    {
+        let (dl_url, dl_sha) =
+            FormulaParser::extract_platform_source(&ruby_content).ok_or_else(|| {
+                WaxError::BuildError(format!(
+                    "Formula '{}' has no pre-built binary for this platform (os={}, arch={})",
+                    formula.name,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                ))
+            })?;
+
+        spinner.set_message(format!("Downloading {}…", formula.name));
+        let client = reqwest::Client::new();
+        let response = client.get(&dl_url).send().await?;
+        if !response.status().is_success() {
+            return Err(WaxError::BuildError(format!(
+                "Failed to download binary: HTTP {}",
+                response.status()
+            )));
+        }
+        let bytes = response.bytes().await?;
+        let actual_sha = format!("{:x}", sha2::Sha256::digest(&bytes));
+        if actual_sha != dl_sha {
+            return Err(WaxError::ChecksumMismatch {
+                expected: dl_sha,
+                actual: actual_sha,
+            });
+        }
+
+        // Extract tarball.
+        let temp_dir = TempDir::new()?;
+        let archive_ext = if dl_url.ends_with(".tar.gz") || dl_url.ends_with(".tgz") {
+            "tar.gz"
+        } else {
+            "tar.bz2"
+        };
+        let archive_path = temp_dir
+            .path()
+            .join(format!("{}.{}", formula.name, archive_ext));
+        let extract_dir = temp_dir.path().join("extracted");
+        tokio::fs::write(&archive_path, &bytes).await?;
+        tokio::fs::create_dir_all(&extract_dir).await?;
+
+        let tar_output = tokio::process::Command::new("tar")
+            .args(["xf", &archive_path.to_string_lossy(), "-C"])
+            .arg(&extract_dir)
+            .output()
+            .await?;
+        if !tar_output.status.success() {
+            return Err(WaxError::BuildError(format!(
+                "Failed to extract tarball: {}",
+                String::from_utf8_lossy(&tar_output.stderr)
+            )));
+        }
+
+        // Find the single extracted subdirectory, or use extract_dir itself.
+        let src_dir = std::fs::read_dir(&extract_dir)
+            .ok()
+            .and_then(|mut rd| {
+                let entries: Vec<_> = rd.by_ref().filter_map(|e| e.ok()).collect();
+                if entries.len() == 1 {
+                    let e = &entries[0];
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        return Some(e.path());
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| extract_dir.clone());
+
+        // Copy bin_install targets into install_prefix/bin/.
+        let install_prefix = temp_dir.path().join("install");
+        let bin_dir = install_prefix.join("bin");
+        tokio::fs::create_dir_all(&bin_dir).await?;
+        for file in &parsed_formula.bin_installs {
+            let src = src_dir.join(file);
+            if src.exists() {
+                let dst = bin_dir.join(file);
+                tokio::fs::copy(&src, &dst).await?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = tokio::fs::metadata(&dst).await?.permissions();
+                    perms.set_mode(perms.mode() | 0o111);
+                    tokio::fs::set_permissions(&dst, perms).await?;
+                }
+            }
+        }
+
+        spinner.set_message("Installing to Cellar...");
+        let version = &parsed_formula.source.version;
+        let formula_cellar = cellar.join(&formula.name).join(version);
+        tokio::fs::create_dir_all(&formula_cellar).await?;
+        copy_dir_all(&install_prefix, &formula_cellar)?;
+        create_symlinks(&formula.name, version, cellar, false, install_mode).await?;
+
+        let package = InstalledPackage {
+            name: formula.name.clone(),
+            version: version.clone(),
+            platform: platform.to_string(),
+            install_date: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            install_mode,
+            from_source: false,
+            bottle_rebuild: 0,
+            bottle_sha256: None,
+            pinned: false,
+        };
+        state.add(package).await?;
+
+        spinner.finish_and_clear();
+        println!(
+            "+ {}@{} {}",
+            style(&formula.name).magenta(),
+            style(version).dim(),
+            style("(binary)").yellow()
+        );
+        return Ok(());
+    }
 
     spinner.set_message("Building from source (this may take several minutes)...".to_string());
 
@@ -184,12 +310,16 @@ async fn install_from_head_task(
     spinner.set_message("Parsing formula...");
     let parsed_formula = FormulaParser::parse_ruby_formula(&formula.name, &ruby_content)?;
 
-    let head_url = parsed_formula.head_url.as_deref().ok_or_else(|| {
-        crate::error::WaxError::BuildError(format!(
-            "Formula '{}' does not define a head URL",
+    if parsed_formula.head_url.is_none() {
+        spinner.finish_and_clear();
+        eprintln!(
+            "  {} '{}' has no HEAD URL — installing stable release instead",
+            console::style("note:").yellow(),
             formula.name
-        ))
-    })?;
+        );
+        return install_from_source_task(formula, cellar, install_mode, state, platform).await;
+    }
+    let head_url = parsed_formula.head_url.as_deref().unwrap();
 
     let temp_dir = TempDir::new()?;
     let clone_dir = temp_dir.path().join("head-src");
