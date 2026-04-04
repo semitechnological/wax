@@ -69,6 +69,7 @@ fn list_exits_zero() {
     // `wax list` works without a populated cache (just shows an empty list).
     let out = wax()
         .env("WAX_CACHE_DIR", std::env::temp_dir().join("wax-test-cache-list"))
+        .env("CI", "1")
         .arg("list")
         .output()
         .unwrap();
@@ -76,6 +77,21 @@ fn list_exits_zero() {
     assert!(
         out.status.success(),
         "wax list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn list_with_query_exits_zero() {
+    let out = wax()
+        .env("WAX_CACHE_DIR", std::env::temp_dir().join("wax-test-cache-list-q"))
+        .env("CI", "1")
+        .args(["list", "rust"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "wax list rust failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
