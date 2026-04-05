@@ -33,6 +33,21 @@ fn version_output_contains_version_string() {
 }
 
 #[test]
+fn info_flag_exits_zero() {
+    let out = wax().arg("--info").output().unwrap();
+    assert!(
+        out.status.success(),
+        "wax --info failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Version:") && stdout.contains("Prefix:"),
+        "expected paths in --info output: {stdout}"
+    );
+}
+
+#[test]
 fn help_flag_exits_zero() {
     let out = wax().arg("--help").output().unwrap();
     assert!(out.status.success());

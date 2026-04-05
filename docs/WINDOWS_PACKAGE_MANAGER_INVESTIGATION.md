@@ -5,7 +5,7 @@ outlines how to study **Windows Package Manager (winget)** and **Scoop** so
 Windows builds of wax can credibly replace them: same user workflows, comparable
 coverage assumptions, and clear boundaries where behaviour must differ.
 
-The existing [WINGET_PLAN.md](../WINGET_PLAN.md) maps winget *CLI verbs* to wax
+[UNIFIED_SOURCES.md](windows-notes/UNIFIED_SOURCES.md) documents how wax maps winget/Scoop/Chocolatey-style sources
 today; this plan adds **platform reality** (installers, sources, shims) and
 **Scoop**, which winget-only parity work does not cover.
 
@@ -152,7 +152,7 @@ These are *candidates* to validate or reject after Phases 1–3.
 | 1 | Phase 0–1 (winget docs + experiments + execution model note) |
 | 2 | Phase 2 (Scoop) + start comparative matrix |
 | 3 | Complete matrix + two integration spikes (Phase 4) |
-| 4 | Risks, non-goals, prioritized backlog tied to [WINGET_PLAN.md](../WINGET_PLAN.md) phases |
+| 4 | Risks, non-goals, prioritized backlog tied to [UNIFIED_SOURCES.md](windows-notes/UNIFIED_SOURCES.md) |
 
 Adjust based on maintainer bandwidth.
 
@@ -168,15 +168,24 @@ Adjust based on maintainer bandwidth.
 
 ---
 
-## 10. Relation to WINGET_PLAN.md
+## 10. Relation to unified source support
 
-- [WINGET_PLAN.md](../WINGET_PLAN.md): **command-level parity** and phased **wax
-  features** (settings, hash, REST sources, export/import).
+- [UNIFIED_SOURCES.md](windows-notes/UNIFIED_SOURCES.md): **bang prefixes**, **auto
+  source pick** (fastest wins), and **installer scope** for brew / Scoop / winget-pkgs /
+  Chocolatey.
 - **This document**: **investigation methodology** for Windows, **Scoop**, and
   **installer/source reality** so “stand-in” is grounded in behaviour, not only
   CLI name matching.
 
-After investigation, update WINGET_PLAN “Notes on Platform Scope” to reflect
-decisions for **Windows-native** install paths (the current note assumes
-cross-platform UX without replicating Windows installers; that should be revised
-if wax Windows is a first-class winget/scoop replacement).
+After investigation, extend **UNIFIED_SOURCES.md** with measured Windows-native
+install paths and any policy that changes which installer families wax handles in-process.
+
+---
+
+## 11. Desk research (Linux / CI)
+
+When a Windows host is not available, use [windows-notes/DESK_RESEARCH.md](windows-notes/DESK_RESEARCH.md)
+for documentation-derived notes: winget execution outline, REST source pointer,
+Scoop JSON minimal fields, and a **partial** comparative matrix. **Phase 0–2
+checkboxes in §§2–4 remain open** until commands are run on Windows and outputs
+are captured (see §2 P0.4 for where to store them).

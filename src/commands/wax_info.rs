@@ -9,7 +9,10 @@ pub fn wax_info() -> Result<()> {
     let cellar = prefix.join("Cellar");
     let taps_dir = prefix.join("Library/Taps");
     let cache_dir = dirs::wax_cache_dir().unwrap_or_else(|_| prefix.join("var/cache/wax"));
-    let config_dir = dirs::wax_dir().unwrap_or_else(|_| prefix.join("etc/wax"));
+    let data_dir = dirs::wax_dir().unwrap_or_else(|_| prefix.join("etc/wax"));
+    let log_file = dirs::wax_logs_dir()
+        .map(|d| d.join("wax.log"))
+        .unwrap_or_else(|_| data_dir.join("logs/wax.log"));
 
     println!();
     println!(
@@ -28,7 +31,8 @@ pub fn wax_info() -> Result<()> {
     row("Cellar:", &cellar.display().to_string());
     row("Taps:", &taps_dir.display().to_string());
     row("Cache:", &cache_dir.display().to_string());
-    row("Config:", &config_dir.display().to_string());
+    row("Data:", &data_dir.display().to_string());
+    row("Log file:", &log_file.display().to_string());
     row("OS:", std::env::consts::OS);
     row("Arch:", std::env::consts::ARCH);
 
