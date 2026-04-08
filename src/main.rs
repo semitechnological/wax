@@ -157,6 +157,8 @@ enum Commands {
     Upgrade {
         #[arg(help = "Package name(s) to upgrade (upgrades all if omitted)")]
         packages: Vec<String>,
+        #[arg(long = "self", help = "Upgrade wax itself")]
+        upgrade_self: bool,
         #[arg(long)]
         dry_run: bool,
         #[arg(
@@ -485,9 +487,18 @@ async fn main() -> Result<()> {
         } => commands::install::postinstall(&cache, &formulae, user, global).await,
         Commands::Upgrade {
             packages,
+            upgrade_self,
             dry_run,
             system,
         } => {
+            if upgrade_self {
+                commands::self_update::self_update(
+                    commands::self_update::Channel::Stable,
+                    false,
+                )
+                .await?;
+                return Ok(());
+            }
             commands::upgrade::upgrade(&cache, &packages, dry_run).await?;
             if system {
                 handle_system_upgrade().await?;
