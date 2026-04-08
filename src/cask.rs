@@ -430,13 +430,28 @@ impl StagingContext {
                     .output()
                     .await?;
 
-                if !attach_output.status.success() {
-                    return Err(WaxError::InstallError(format!(
-                        "Failed to mount DMG: {}",
-                        String::from_utf8_lossy(&attach_output.stderr)
-                    )));
+                if attach_output.status.success() {
+                    mount_point = Some(mp);
+                } else {
+                    // Some casks use extensionless endpoints that are actually ZIP files.
+                    // If DMG mounting fails, try ZIP extraction as a fallback.
+                    let unzip_output = tokio::process::Command::new("unzip")
+                        .arg("-q")
+                        .arg("-o")
+                        .arg(download_path)
+                        .arg("-d")
+                        .arg(&staging_root)
+                        .output()
+                        .await?;
+
+                    if !unzip_output.status.success() {
+                        return Err(WaxError::InstallError(format!(
+                            "Failed to mount DMG and fallback unzip failed: {} | {}",
+                            String::from_utf8_lossy(&attach_output.stderr),
+                            String::from_utf8_lossy(&unzip_output.stderr)
+                        )));
+                    }
                 }
-                mount_point = Some(mp);
             }
             "zip" => {
                 let unzip_output = tokio::process::Command::new("unzip")
