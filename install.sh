@@ -4,7 +4,6 @@
 #   ./install.sh                         # in a clone → cargo build --release
 #   WAX_USE_RELEASE=1 ./install.sh       # in a clone → still use releases
 #   curl -fsSL …/install.sh | bash       # download latest release
-#   WAX_VERSION=v0.14.3 …               # pin release (piped or non-repo)
 #
 set -euo pipefail
 
