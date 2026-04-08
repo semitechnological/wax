@@ -17,6 +17,8 @@ pub struct BottleDownloader {
 }
 
 impl BottleDownloader {
+    const TRANSIENT_RETRY_ATTEMPTS: usize = 3;
+
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
@@ -122,7 +124,7 @@ impl BottleDownloader {
             head_req = head_req.header("Authorization", format!("Bearer {}", tok));
         }
 
-        let resp = match head_req.send().await {
+        let resp = match Self::send_with_retry(head_req, "HEAD probe").await {
             Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
             _ => {
                 // HEAD rejected or failed — fall back to a tiny range GET.
@@ -130,7 +132,7 @@ impl BottleDownloader {
                 if let Some(ref tok) = auth_token {
                     get_req = get_req.header("Authorization", format!("Bearer {}", tok));
                 }
-                let r = get_req.send().await?;
+                let r = Self::send_with_retry(get_req, "range probe").await?;
                 // If the server ignored the Range header and returned the full
                 // body (200 instead of 206), abort early to avoid downloading
                 // the entire file during a probe.
@@ -320,7 +322,7 @@ impl BottleDownloader {
             request = request.header("Authorization", format!("Bearer {}", tok));
         }
 
-        let response = request.send().await?;
+        let response = Self::send_with_retry(request, "download").await?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -358,6 +360,58 @@ impl BottleDownloader {
         file.flush().await?;
         debug!("Single-connection download: {} bytes", downloaded);
         Ok(())
+    }
+
+    async fn send_with_retry(
+        request: reqwest::RequestBuilder,
+        op_name: &str,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        for attempt in 1..=Self::TRANSIENT_RETRY_ATTEMPTS {
+            let Some(cloned) = request.try_clone() else {
+                return request.send().await;
+            };
+
+            match cloned.send().await {
+                Ok(resp) => {
+                    if !Self::is_retryable_status(resp.status()) || attempt == Self::TRANSIENT_RETRY_ATTEMPTS {
+                        return Ok(resp);
+                    }
+                    let backoff_ms = 300 * attempt as u64;
+                    tracing::debug!(
+                        "{} got HTTP {}, retrying attempt {}/{} in {}ms",
+                        op_name,
+                        resp.status(),
+                        attempt + 1,
+                        Self::TRANSIENT_RETRY_ATTEMPTS,
+                        backoff_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(e) => {
+                    if attempt == Self::TRANSIENT_RETRY_ATTEMPTS {
+                        return Err(e);
+                    }
+                    let backoff_ms = 300 * attempt as u64;
+                    tracing::debug!(
+                        "{} network error ({}), retrying attempt {}/{} in {}ms",
+                        op_name,
+                        e,
+                        attempt + 1,
+                        Self::TRANSIENT_RETRY_ATTEMPTS,
+                        backoff_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+
+        request.send().await
+    }
+
+    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+        status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
     }
 
     async fn get_ghcr_token(&self, url: &str) -> Result<String> {

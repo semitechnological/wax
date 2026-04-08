@@ -1079,6 +1079,43 @@ async fn install_impl(
     Ok(())
 }
 
+fn infer_artifact_type_from_cask_artifacts(details: &crate::api::CaskDetails) -> Option<&'static str> {
+    let artifacts = details.artifacts.as_ref()?;
+
+    if artifacts
+        .iter()
+        .any(|a| matches!(a, crate::api::CaskArtifact::Pkg { .. }))
+    {
+        return Some("pkg");
+    }
+
+    if artifacts
+        .iter()
+        .any(|a| matches!(a, crate::api::CaskArtifact::Binary { .. }))
+    {
+        return Some("binary");
+    }
+
+    // Many app-distributing casks use extensionless endpoints; default to DMG
+    // on macOS so we can proceed and let staging logic handle extraction.
+    if cfg!(target_os = "macos")
+        && artifacts.iter().any(|a| {
+            matches!(
+                a,
+                crate::api::CaskArtifact::App { .. }
+                    | crate::api::CaskArtifact::Suite { .. }
+                    | crate::api::CaskArtifact::Font { .. }
+                    | crate::api::CaskArtifact::Manpage { .. }
+                    | crate::api::CaskArtifact::Artifact { .. }
+            )
+        })
+    {
+        return Some("dmg");
+    }
+
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn install_extracted_bottle(
     name: &str,
@@ -1312,6 +1349,8 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
                     .unwrap_or(false)
                 {
                     "binary"
+                } else if let Some(t) = infer_artifact_type_from_cask_artifacts(&details) {
+                    t
                 } else {
                     return Err(WaxError::InstallError(format!(
                         "Unsupported artifact type for URL: {}",
