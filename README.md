@@ -6,11 +6,6 @@
 
 A fast, modern package manager that leverages Homebrew's ecosystem without the overhead. Built in Rust for speed and reliability, wax provides 16-20x faster search operations and parallel installation workflows while maintaining full compatibility with Homebrew formulae and bottles.
 
-## Current status
-
-- cargo test passes on the current checkout.
-- Recent work focuses on source-build and system package handling.
-
 ## Overview
 
 Wax reimagines package management by replacing Homebrew's git-based tap system with direct JSON API access and parallel async operations. It reads from the same bottle CDN and formula definitions but executes operations through a compiled binary with modern concurrency primitives. The result is a package manager that feels instant for read operations and maximizes throughput for installations.
@@ -41,7 +36,6 @@ curl -fsSL https://raw.githubusercontent.com/semitechnological/wax/master/instal
 ```
 
 Installs to `~/.local/bin/wax`. Override the destination with `WAX_INSTALL_DIR=/usr/local/bin`.
-Pin a specific release with `WAX_VERSION=v0.13.3`.
 
 **From a git clone** (builds with your Rust toolchain; no GitHub download):
 
@@ -132,6 +126,7 @@ wax outdated
 wax upgrade              # upgrade all outdated packages
 wax upgrade nginx        # upgrade specific package
 wax upgrade nginx tree   # upgrade multiple packages
+wax upgrade --self       # upgrade wax itself
 wax up nginx             # shorthand
 
 # Generate lockfile
