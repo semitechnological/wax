@@ -3,6 +3,7 @@ use crate::bottle::{detect_platform, BottleDownloader};
 use crate::cache::Cache;
 use crate::cask::CaskState;
 use crate::commands::{install, uninstall};
+use crate::commands::self_update::{self_update, Channel};
 use crate::deps::find_installed_reverse_dependencies;
 use crate::error::{Result, WaxError};
 use crate::install::{InstallMode, InstallState};
@@ -11,7 +12,7 @@ use crate::signal::{
     CriticalSection,
 };
 use crate::ui::{PROGRESS_BAR_CHARS, PROGRESS_BAR_TEMPLATE, SPINNER_TICK_CHARS};
-use crate::version::is_same_or_newer;
+use crate::version::{is_same_or_newer, WAX_VERSION};
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet};
@@ -575,10 +576,22 @@ async fn upgrade_single(cache: &Cache, formula_name: &str, dry_run: bool) -> Res
         state.sync_from_cellar().await?;
         let updated_packages = state.load().await?;
 
-        updated_packages
-            .get(formula_name)
-            .cloned()
-            .ok_or_else(|| WaxError::NotInstalled(formula_name.to_string()))?
+        if let Some(pkg) = updated_packages.get(formula_name).cloned() {
+            pkg
+        } else if formula_name == "wax" {
+            if dry_run {
+                println!(
+                    "{}: {} → latest (self-update)",
+                    style("wax").magenta(),
+                    style(WAX_VERSION).dim()
+                );
+                println!("\ndry run - no changes made");
+                return Ok(());
+            }
+            return self_update(Channel::Stable, false).await;
+        } else {
+            return Err(WaxError::NotInstalled(formula_name.to_string()));
+        }
     };
 
     if installed.pinned {
