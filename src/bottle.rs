@@ -5,12 +5,20 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 use tar::Archive;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
+
+/// Tracks aggregate downloaded / expected bytes across concurrent downloads (e.g. multiple casks).
+#[derive(Clone, Default)]
+pub struct DownloadTotals {
+    pub downloaded: Arc<AtomicU64>,
+    pub expected: Arc<AtomicU64>,
+}
 
 pub struct BottleDownloader {
     client: reqwest::Client,
@@ -64,13 +72,14 @@ impl BottleDownloader {
         ideal.min(max_connections).max(1)
     }
 
-    #[instrument(skip(self, progress))]
+    #[instrument(skip(self, progress, totals))]
     pub async fn download(
         &self,
         url: &str,
         dest_path: &Path,
         progress: Option<&ProgressBar>,
         max_connections: usize,
+        totals: Option<&DownloadTotals>,
     ) -> Result<()> {
         debug!("Downloading from {}", url);
 
@@ -89,13 +98,27 @@ impl BottleDownloader {
             .await
             .unwrap_or_else(|_| (url.to_string(), 0, false));
 
+        if let Some(t) = totals {
+            if total_size > 0 {
+                t.expected.fetch_add(total_size, Ordering::Relaxed);
+            }
+        }
+
         debug!(
             "Download probe: size={} bytes, accepts_ranges={}, max_connections={}",
             total_size, accepts_ranges, max_connections
         );
+        let totals_for_multipart = totals.cloned();
         if accepts_ranges && total_size >= Self::MULTIPART_THRESHOLD && max_connections > 1 {
             match self
-                .download_multipart(&cdn_url, dest_path, total_size, progress, max_connections)
+                .download_multipart(
+                    &cdn_url,
+                    dest_path,
+                    total_size,
+                    progress,
+                    max_connections,
+                    totals_for_multipart,
+                )
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -106,7 +129,14 @@ impl BottleDownloader {
             }
         }
 
-        self.download_single(url, dest_path, &auth_token, total_size, progress)
+        self.download_single(
+            url,
+            dest_path,
+            &auth_token,
+            total_size,
+            progress,
+            totals,
+        )
             .await
     }
 
@@ -176,6 +206,7 @@ impl BottleDownloader {
         total_size: u64,
         progress: Option<&ProgressBar>,
         max_connections: usize,
+        totals: Option<DownloadTotals>,
     ) -> Result<()> {
         let n = Self::num_connections(total_size, max_connections);
         let chunk_size = total_size.div_ceil(n as u64);
@@ -217,6 +248,7 @@ impl BottleDownloader {
             let url = url.clone();
             let counter = Arc::clone(&downloaded_so_far);
             let dest = dest_path_buf.clone();
+            let totals_chunk = totals.clone();
 
             tasks.push(tokio::spawn(async move {
                 let response = client
@@ -244,7 +276,11 @@ impl BottleDownloader {
                         return Err(WaxError::Interrupted);
                     }
                     let piece = piece.map_err(WaxError::from)?;
-                    counter.fetch_add(piece.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let n = piece.len() as u64;
+                    counter.fetch_add(n, Ordering::Relaxed);
+                    if let Some(ref t) = totals_chunk {
+                        t.downloaded.fetch_add(n, Ordering::Relaxed);
+                    }
                     data.extend_from_slice(&piece);
                 }
 
@@ -270,7 +306,7 @@ impl BottleDownloader {
             loop {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 if let Some(ref pb) = pb_poll {
-                    pb.set_position(counter_poll.load(std::sync::atomic::Ordering::Relaxed));
+                    pb.set_position(counter_poll.load(Ordering::Relaxed));
                 }
             }
         });
@@ -290,6 +326,15 @@ impl BottleDownloader {
             }
         }
         poll_handle.abort();
+
+        if err.is_some() {
+            if let Some(ref t) = totals {
+                let partial = downloaded_so_far.load(Ordering::Relaxed);
+                if partial > 0 {
+                    t.downloaded.fetch_sub(partial, Ordering::Relaxed);
+                }
+            }
+        }
 
         if let Some(e) = err {
             return Err(WaxError::InstallError(format!(
@@ -316,6 +361,7 @@ impl BottleDownloader {
         auth_token: &Option<String>,
         content_length: u64,
         progress: Option<&ProgressBar>,
+        totals: Option<&DownloadTotals>,
     ) -> Result<()> {
         let mut request = self.client.get(url);
         if let Some(ref tok) = auth_token {
@@ -337,6 +383,11 @@ impl BottleDownloader {
         if let Some(pb) = progress {
             pb.set_length(total_size);
         }
+        if let Some(t) = totals {
+            if content_length == 0 && total_size > 0 {
+                t.expected.fetch_add(total_size, Ordering::Relaxed);
+            }
+        }
 
         let mut file = tokio::fs::File::create(dest_path).await?;
         let mut downloaded = 0u64;
@@ -351,9 +402,13 @@ impl BottleDownloader {
             }
             let chunk = chunk?;
             file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
+            let n = chunk.len() as u64;
+            downloaded += n;
             if let Some(pb) = progress {
                 pb.set_position(downloaded);
+            }
+            if let Some(t) = totals {
+                t.downloaded.fetch_add(n, Ordering::Relaxed);
             }
         }
 

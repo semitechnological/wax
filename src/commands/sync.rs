@@ -267,7 +267,7 @@ pub async fn sync(cache: &Cache) -> Result<()> {
                     .join(format!("{}-{}.tar.gz", entry.name, entry.version));
 
                 downloader
-                    .download(&entry.url, &tarball_path, Some(&pb), conns)
+                    .download(&entry.url, &tarball_path, Some(&pb), conns, None)
                     .await?;
                 pb.finish_and_clear();
 

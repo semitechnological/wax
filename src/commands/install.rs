@@ -24,7 +24,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, info, instrument};
 
 async fn install_from_source_task(
@@ -872,7 +873,7 @@ async fn install_impl(
             let tarball_path = temp_dir.path().join(format!("{}-{}.tar.gz", name, version));
 
             downloader
-                .download(&url, &tarball_path, Some(ext_pb), pkg_connections)
+                .download(&url, &tarball_path, Some(ext_pb), pkg_connections, None)
                 .await?;
 
             BottleDownloader::verify_checksum(&tarball_path, &sha256)?;
@@ -935,7 +936,7 @@ async fn install_impl(
             let tarball_path = temp_dir.path().join(format!("{}-{}.tar.gz", name, version));
 
             downloader
-                .download(&url, &tarball_path, Some(&pb), conns)
+                .download(&url, &tarball_path, Some(&pb), conns, None)
                 .await?;
             pb.finish_and_clear();
 
@@ -1262,6 +1263,36 @@ pub async fn install_extracted_bottle(
     Ok(())
 }
 
+/// Per-cask install pipeline failure (download, verify, disk, or install).
+enum CaskPipelineFail {
+    Download { name: String, err: WaxError },
+    Checksum { name: String, err: WaxError },
+    Install { name: String, err: WaxError },
+}
+
+fn reuse_download_bar_as_install_spinner(pb: &ProgressBar, prefix: &str) {
+    pb.disable_steady_tick();
+    pb.reset();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {prefix:.bold} {wide_msg}")
+            .unwrap()
+            .tick_chars(crate::ui::SPINNER_TICK_CHARS),
+    );
+    pb.set_prefix(prefix.to_string());
+    pb.set_message(String::new());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+}
+
+/// Clears one `MultiProgress` row when dropped (after verify + install for that cask).
+struct FinishProgressLine<'a>(&'a ProgressBar);
+
+impl Drop for FinishProgressLine<'_> {
+    fn drop(&mut self) {
+        self.0.finish_and_clear();
+    }
+}
+
 #[instrument(skip(cache))]
 async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quiet: bool) -> Result<()> {
     let start = std::time::Instant::now();
@@ -1357,7 +1388,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
                         details.url
                     )));
                 };
-                Ok::<_, WaxError>((name, details, artifact_type))
+                Ok::<_, WaxError>((name, details, artifact_type.to_string()))
             })
         })
         .collect();
@@ -1377,71 +1408,144 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
         ));
     }
 
-    // --- Phase 2: download + install serially (pipeline per cask) ---
+    // --- Phase 2: per-cask pipelines (download → verify → install) with bounded overlap ---
+    // While some casks are still downloading, others may already be installing. State persistence
+    // is serialized so concurrent installs do not corrupt the cask JSON.
+    const CASK_PIPELINE_CONCURRENCY: usize = 8;
+
+    let state_lock = Arc::new(Mutex::new(()));
+
+    // One JoinSet task per cask so work runs on the runtime thread pool (true overlap of
+    // I/O and CPU-heavy install steps). A semaphore caps how many pipelines run at once.
+    let pipeline_sem = Arc::new(Semaphore::new(CASK_PIPELINE_CONCURRENCY));
+    let mut pipeline_tasks = JoinSet::new();
+
+    for (name, details, artifact_type) in resolved {
+        let multi = Arc::clone(&multi);
+        let installer = Arc::clone(&installer);
+        let state_lock = Arc::clone(&state_lock);
+        let pipeline_sem = Arc::clone(&pipeline_sem);
+        pipeline_tasks.spawn(async move {
+            let _permit = pipeline_sem.acquire().await.map_err(|_| {
+                CaskPipelineFail::Download {
+                    name: name.clone(),
+                    err: WaxError::InstallError("download worker cancelled".into()),
+                }
+            })?;
+
+            if let Err(e) = check_cancelled() {
+                return Err(CaskPipelineFail::Download { name, err: e });
+            }
+
+            let temp_dir = TempDir::new().map_err(|e| CaskPipelineFail::Download {
+                name: name.clone(),
+                err: e.into(),
+            })?;
+            let download_path =
+                temp_dir.path().join(format!("{}.{}", name, artifact_type.as_str()));
+            let pb = multi.insert_from_back(1, ProgressBar::new(0));
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(PROGRESS_BAR_PREFIX_TEMPLATE)
+                    .unwrap()
+                    .progress_chars(PROGRESS_BAR_CHARS),
+            );
+            pb.set_prefix(name.clone());
+            if let Err(e) = installer
+                .download_cask(&details.url, &download_path, Some(&pb), None)
+                .await
+            {
+                pb.finish_and_clear();
+                return Err(CaskPipelineFail::Download { name, err: e });
+            }
+
+            reuse_download_bar_as_install_spinner(&pb, details.token.as_str());
+            pb.set_message(format!("{}", style("verifying checksum…").dim()));
+
+            if let Err(e) = check_cancelled() {
+                pb.finish_and_clear();
+                return Err(CaskPipelineFail::Download { name, err: e });
+            }
+
+            let installed_cask = {
+                let _line_done = FinishProgressLine(&pb);
+                if let Err(e) = CaskInstaller::verify_checksum(&download_path, &details.sha256) {
+                    return Err(CaskPipelineFail::Checksum { name, err: e });
+                }
+                install_from_downloaded(&details, artifact_type.as_str(), &download_path, &pb).await
+            };
+
+            match installed_cask {
+                Ok(installed_cask) => {
+                    let state = CaskState::new().map_err(|e| CaskPipelineFail::Install {
+                        name: name.clone(),
+                        err: e,
+                    })?;
+                    {
+                        let _guard = state_lock.lock().await;
+                        state.add(installed_cask).await.map_err(|e| {
+                            CaskPipelineFail::Install {
+                                name: name.clone(),
+                                err: e,
+                            }
+                        })?;
+                    }
+                    if !quiet {
+                        let _ = multi.println(format!(
+                            "{} {} (cask) {}",
+                            style("✓").green().bold(),
+                            style(&name).magenta(),
+                            style(&details.version).dim()
+                        ));
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(CaskPipelineFail::Install { name, err: e }),
+            }
+        });
+    }
+
+    let mut pipeline_outcomes = Vec::new();
+    while let Some(join_res) = pipeline_tasks.join_next().await {
+        match join_res {
+            Ok(outcome) => pipeline_outcomes.push(outcome),
+            Err(e) => eprintln!("{} task error: {}", style("✗").red(), e),
+        }
+    }
+
+    check_cancelled()?;
+
     let mut installed_count = 0;
     let mut failed = Vec::new();
-    for (name, details, artifact_type) in resolved {
-        check_cancelled()?;
-        let temp_dir = TempDir::new()?;
-        let download_path = temp_dir.path().join(format!("{}.{}", name, artifact_type));
-        let pb = multi.insert_from_back(1, ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(PROGRESS_BAR_PREFIX_TEMPLATE)
-                .unwrap()
-                .progress_chars(PROGRESS_BAR_CHARS),
-        );
-        pb.set_prefix(name.clone());
-        if let Err(e) = installer
-            .download_cask(&details.url, &download_path, Some(&pb))
-            .await
-        {
-            pb.finish_and_clear();
-            eprintln!(
-                "{} {} download failed: {}",
-                style("✗").red(),
-                style(&name).magenta(),
-                e
-            );
-            failed.push(name.clone());
-            continue;
-        }
-        pb.finish_and_clear();
-
-        if let Err(e) = CaskInstaller::verify_checksum(&download_path, &details.sha256) {
-            eprintln!(
-                "{} {} checksum failed: {}",
-                style("✗").red(),
-                style(&name).magenta(),
-                e
-            );
-            failed.push(name.clone());
-            continue;
-        }
-
-        let result = install_from_downloaded(&details, artifact_type, &download_path).await;
-        match result {
-            Ok(installed_cask) => {
-                let state = CaskState::new()?;
-                state.add(installed_cask).await?;
-                if !quiet {
-                    println!(
-                        "{} {} (cask) {}",
-                        style("✓").green().bold(),
-                        style(&name).magenta(),
-                        style(&details.version).dim()
-                    );
-                }
-                installed_count += 1;
+    for outcome in pipeline_outcomes {
+        match outcome {
+            Ok(()) => installed_count += 1,
+            Err(CaskPipelineFail::Download { name, err }) => {
+                eprintln!(
+                    "{} {} download failed: {}",
+                    style("✗").red(),
+                    style(&name).magenta(),
+                    err
+                );
+                failed.push(name);
             }
-            Err(e) => {
+            Err(CaskPipelineFail::Checksum { name, err }) => {
+                eprintln!(
+                    "{} {} checksum failed: {}",
+                    style("✗").red(),
+                    style(&name).magenta(),
+                    err
+                );
+                failed.push(name);
+            }
+            Err(CaskPipelineFail::Install { name, err }) => {
                 eprintln!(
                     "{} {} failed: {}",
                     style("✗").red(),
                     style(&name).magenta(),
-                    e
+                    err
                 );
-                failed.push(name.clone());
+                failed.push(name);
             }
         }
     }
@@ -1570,29 +1674,18 @@ async fn postinstall_impl(name: &str, _install_mode: InstallMode, quiet: bool) -
 }
 
 /// Install a cask from an already-downloaded file (skips download).
+/// `line` must already be switched to an install spinner (see `reuse_download_bar_as_install_spinner`).
 async fn install_from_downloaded(
     cask: &crate::api::CaskDetails,
-    artifact_type: &'static str,
+    artifact_type: &str,
     download_path: &std::path::Path,
+    line: &ProgressBar,
 ) -> Result<InstalledCask> {
     let installer = CaskInstaller::new();
 
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_chars(crate::ui::SPINNER_TICK_CHARS),
-    );
-    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-
     macro_rules! step {
         ($msg:expr) => {
-            spinner.set_message(format!(
-                "{} {}",
-                style(&cask.token).magenta(),
-                style($msg).dim()
-            ));
+            line.set_message(format!("{}", style($msg).dim()));
         };
     }
 
@@ -1882,7 +1975,6 @@ async fn install_from_downloaded(
 
     step!("registering...");
     rollback.commit();
-    spinner.finish_and_clear();
 
     Ok(InstalledCask {
         name: cask.token.clone(),

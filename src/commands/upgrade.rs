@@ -285,7 +285,7 @@ async fn upgrade_all(cache: &Cache, dry_run: bool, start: std::time::Instant) ->
                 );
                 pb.set_message(name.clone());
 
-                dl.download(&url, &tarball, Some(&pb), conns).await?;
+                dl.download(&url, &tarball, Some(&pb), conns, None).await?;
                 pb.finish_and_clear();
 
                 // Release the download permit before extraction.

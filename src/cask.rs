@@ -1,4 +1,4 @@
-use crate::bottle::{BottleDownloader, homebrew_prefix};
+use crate::bottle::{BottleDownloader, DownloadTotals, homebrew_prefix};
 use crate::error::{Result, WaxError};
 use crate::ui::dirs;
 use indicatif::ProgressBar;
@@ -678,12 +678,13 @@ impl CaskInstaller {
         None
     }
 
-    #[instrument(skip(self, progress))]
+    #[instrument(skip(self, progress, totals))]
     pub async fn download_cask(
         &self,
         url: &str,
         dest_path: &Path,
         progress: Option<&ProgressBar>,
+        totals: Option<&DownloadTotals>,
     ) -> Result<()> {
         debug!("Downloading cask from {}", url);
         self.downloader
@@ -692,6 +693,7 @@ impl CaskInstaller {
                 dest_path,
                 progress,
                 BottleDownloader::GLOBAL_CONNECTION_POOL,
+                totals,
             )
             .await
     }
