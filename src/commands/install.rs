@@ -22,7 +22,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::Digest;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, Semaphore};
@@ -1294,6 +1294,18 @@ impl Drop for FinishProgressLine<'_> {
     }
 }
 
+/// One increment per cask when its download attempt finishes (ok or fail). When all have
+/// reached that point, `hide_overall` tells the aggregate bar poller to exit and clear.
+fn note_cask_network_phase_done(done: &AtomicUsize, total: usize, hide_overall: &AtomicBool) {
+    if total == 0 {
+        return;
+    }
+    let c = done.fetch_add(1, Ordering::SeqCst) + 1;
+    if c == total {
+        hide_overall.store(true, Ordering::SeqCst);
+    }
+}
+
 #[instrument(skip(cache))]
 async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quiet: bool) -> Result<()> {
     let start = std::time::Instant::now();
@@ -1423,6 +1435,8 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
 
     let state_lock = Arc::new(Mutex::new(()));
 
+    let cask_count = resolved.len();
+
     // Aggregate download progress on the top row; per-cask rows sit below and switch to
     // install spinners in place (avoids fighting an overall bar at the bottom).
     let pipeline_totals = if quiet {
@@ -1431,28 +1445,44 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
         Some(DownloadTotals::default())
     };
 
+    let hide_overall_downloads = Arc::new(AtomicBool::new(false));
+    let network_phase_done = Arc::new(AtomicUsize::new(0));
+
     let overall_poller = if let Some(totals) = pipeline_totals.as_ref() {
-        let overall_pb = multi.insert(0, ProgressBar::new(0));
-        overall_pb.set_style(
-            ProgressStyle::default_bar()
-                .template(PROGRESS_BAR_TEMPLATE)
-                .unwrap()
-                .progress_chars(PROGRESS_BAR_CHARS),
-        );
-        overall_pb.set_message("All downloads");
-        let totals_w = totals.clone();
-        let overall_w = overall_pb.clone();
-        let poller = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                let pos = totals_w.downloaded.load(Ordering::Relaxed);
-                let len = totals_w.expected.load(Ordering::Relaxed);
-                let cap = len.max(pos).max(1);
-                overall_w.set_length(cap);
-                overall_w.set_position(pos);
-            }
-        });
-        Some((overall_pb, poller))
+        if cask_count == 0 {
+            None
+        } else {
+            let overall_pb = multi.insert(0, ProgressBar::new(0));
+            overall_pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(PROGRESS_BAR_TEMPLATE)
+                    .unwrap()
+                    .progress_chars(PROGRESS_BAR_CHARS),
+            );
+            overall_pb.set_message("All downloads");
+            let totals_w = totals.clone();
+            let overall_w = overall_pb.clone();
+            let hide_w = Arc::clone(&hide_overall_downloads);
+            let poller = tokio::spawn(async move {
+                loop {
+                    if hide_w.load(Ordering::Relaxed) {
+                        overall_w.finish_and_clear();
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if hide_w.load(Ordering::Relaxed) {
+                        overall_w.finish_and_clear();
+                        return;
+                    }
+                    let pos = totals_w.downloaded.load(Ordering::Relaxed);
+                    let len = totals_w.expected.load(Ordering::Relaxed);
+                    let cap = len.max(pos).max(1);
+                    overall_w.set_length(cap);
+                    overall_w.set_position(pos);
+                }
+            });
+            Some(poller)
+        }
     } else {
         None
     };
@@ -1468,6 +1498,8 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
         let state_lock = Arc::clone(&state_lock);
         let dl_totals = pipeline_totals.clone();
         let pipeline_sem = Arc::clone(&pipeline_sem);
+        let hide_dl = Arc::clone(&hide_overall_downloads);
+        let net_done = Arc::clone(&network_phase_done);
         pipeline_tasks.spawn(async move {
             let _permit = pipeline_sem.acquire().await.map_err(|_| {
                 CaskPipelineFail::Download {
@@ -1504,6 +1536,7 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
                 .await
             {
                 pb.finish_and_clear();
+                note_cask_network_phase_done(&net_done, cask_count, &hide_dl);
                 return Err(CaskPipelineFail::Download { name, err: e });
             }
 
@@ -1512,14 +1545,17 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
 
             if let Err(e) = check_cancelled() {
                 pb.finish_and_clear();
+                note_cask_network_phase_done(&net_done, cask_count, &hide_dl);
                 return Err(CaskPipelineFail::Download { name, err: e });
             }
 
             let installed_cask = {
                 let _line_done = FinishProgressLine(&pb);
                 if let Err(e) = CaskInstaller::verify_checksum(&download_path, &details.sha256) {
+                    note_cask_network_phase_done(&net_done, cask_count, &hide_dl);
                     return Err(CaskPipelineFail::Checksum { name, err: e });
                 }
+                note_cask_network_phase_done(&net_done, cask_count, &hide_dl);
                 install_from_downloaded(&details, artifact_type.as_str(), &download_path, &pb).await
             };
 
@@ -1561,6 +1597,12 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
         }
     }
 
+    // Ensure the aggregate bar task always stops (e.g. join error before a pipeline counted).
+    hide_overall_downloads.store(true, Ordering::SeqCst);
+    if let Some(poller) = overall_poller {
+        let _ = poller.await;
+    }
+
     check_cancelled()?;
 
     let mut installed_count = 0;
@@ -1596,11 +1638,6 @@ async fn install_casks(cache: &Cache, cask_names: &[String], dry_run: bool, quie
                 failed.push(name);
             }
         }
-    }
-
-    if let Some((_overall_pb, poller)) = overall_poller {
-        poller.abort();
-        _overall_pb.finish_and_clear();
     }
 
     if owns_multi_globals {
