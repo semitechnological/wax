@@ -11,9 +11,7 @@ use crate::discovery::discover_manually_installed_casks;
 use crate::error::{Result, WaxError};
 use crate::formula_parser::{BuildSystem, FormulaParser};
 use crate::install::{create_symlinks, InstallMode, InstallState, InstalledPackage};
-use crate::signal::{
-    check_cancelled, clear_active_multi, set_active_multi, CriticalSection,
-};
+use crate::signal::{check_cancelled, clear_active_multi, set_active_multi, CriticalSection};
 use crate::system_pm::SystemPm;
 use crate::tap::TapManager;
 use crate::ui::{
