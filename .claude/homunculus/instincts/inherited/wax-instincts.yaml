@@ -1,0 +1,259 @@
+# Instincts generated from https://github.com/tschk/wax
+# Generated: 2026-05-28T08:32:44.783Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: wax-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/tschk/wax
+---
+
+# Wax Commit Length
+
+## Action
+
+Keep commit messages concise (~33 characters)
+
+## Evidence
+
+- Average commit message length: 33 chars
+- Based on 1 commits
+
+---
+id: wax-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/tschk/wax
+---
+
+# Wax Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: wax-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/tschk/wax
+---
+
+# Wax Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: wax-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/tschk/wax
+---
+
+# Wax Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: wax-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/tschk/wax
+---
+
+# Wax Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: wax-instinct-file-naming
+trigger: "When creating a new file"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: tschk/wax
+---
+
+# Wax Instinct File Naming
+
+## Action
+
+Name the file using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.files
+
+---
+id: wax-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: tschk/wax
+---
+
+# Wax Instinct Function Naming
+
+## Action
+
+Name the function using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.functions
+
+---
+id: wax-instinct-class-naming
+trigger: "When defining a new class or struct"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: tschk/wax
+---
+
+# Wax Instinct Class Naming
+
+## Action
+
+Name the class or struct using PascalCase
+
+## Evidence
+
+- Pattern in namingConventions.classes
+
+---
+id: wax-instinct-constant-naming
+trigger: "When defining a new constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: tschk/wax
+---
+
+# Wax Instinct Constant Naming
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE
+
+## Evidence
+
+- Pattern in namingConventions.constants
+
+---
+id: wax-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: tschk/wax
+---
+
+# Wax Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in importStyle
+
+---
+id: wax-instinct-export-style
+trigger: "When exporting modules or symbols"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: tschk/wax
+---
+
+# Wax Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle
+
+---
+id: wax-instinct-test-location
+trigger: "When adding or organizing tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: tschk/wax
+---
+
+# Wax Instinct Test Location
+
+## Action
+
+Place tests in a separate directory from source code
+
+## Evidence
+
+- Pattern in architecture.testLocation
+
+---
+id: wax-instinct-git-commit-format
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: tschk/wax
+---
+
+# Wax Instinct Git Commit Format
+
+## Action
+
+Use a short, freeform message without a prefix
+
+## Evidence
+
+- Pattern in commits.prefixes (empty)
+- Example: 'fix doctor Homebrew compatibility'
+
