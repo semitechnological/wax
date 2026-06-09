@@ -271,12 +271,42 @@ pub fn sudo_chown_recursive(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sudo_password_prompt;
+    use super::{is_file_exists_error, sudo_password_prompt};
+    use crate::error::WaxError;
 
     #[test]
     fn sudo_password_prompt_is_wax_branded() {
         let prompt = sudo_password_prompt();
         assert!(prompt.contains("wax"));
         assert!(prompt.contains("%p"));
+    }
+
+    #[test]
+    fn test_is_file_exists_error() {
+        // Test IoError with AlreadyExists
+        let io_err = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        let err = WaxError::IoError(io_err);
+        assert!(is_file_exists_error(&err));
+
+        // Test IoError with unrelated error kind
+        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let err = WaxError::IoError(io_err);
+        assert!(!is_file_exists_error(&err));
+
+        // Test InstallError with "file exists"
+        let err = WaxError::InstallError("Cannot proceed: File exists at path".to_string());
+        assert!(is_file_exists_error(&err));
+
+        // Test InstallError with "os error 17"
+        let err = WaxError::InstallError("Failed with os error 17".to_string());
+        assert!(is_file_exists_error(&err));
+
+        // Test InstallError with unrelated message
+        let err = WaxError::InstallError("Permission denied".to_string());
+        assert!(!is_file_exists_error(&err));
+
+        // Test completely different WaxError variant
+        let err = WaxError::CacheError("Corrupted cache".to_string());
+        assert!(!is_file_exists_error(&err));
     }
 }
