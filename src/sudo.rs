@@ -271,12 +271,49 @@ pub fn sudo_chown_recursive(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sudo_password_prompt;
+    use super::{is_permission_error, sudo_password_prompt};
+    use crate::error::WaxError;
+    use std::io::{Error, ErrorKind};
 
     #[test]
     fn sudo_password_prompt_is_wax_branded() {
         let prompt = sudo_password_prompt();
         assert!(prompt.contains("wax"));
         assert!(prompt.contains("%p"));
+    }
+
+    #[test]
+    fn test_is_permission_error() {
+        // Test IoError::PermissionDenied
+        let err = WaxError::IoError(Error::new(ErrorKind::PermissionDenied, "permission denied"));
+        assert!(is_permission_error(&err));
+
+        // Test IoError not permission denied
+        let err = WaxError::IoError(Error::new(ErrorKind::NotFound, "not found"));
+        assert!(!is_permission_error(&err));
+
+        // Test InstallError with "permission denied"
+        let err = WaxError::InstallError("Failed: permission denied".to_string());
+        assert!(is_permission_error(&err));
+
+        // Test InstallError with uppercase "Permission Denied"
+        let err = WaxError::InstallError("Failed: Permission Denied".to_string());
+        assert!(is_permission_error(&err));
+
+        // Test InstallError with "os error 13"
+        let err = WaxError::InstallError("Failed: os error 13".to_string());
+        assert!(is_permission_error(&err));
+
+        // Test InstallError with uppercase "OS ERROR 13"
+        let err = WaxError::InstallError("Failed: OS ERROR 13".to_string());
+        assert!(is_permission_error(&err));
+
+        // Test InstallError without permission error keywords
+        let err = WaxError::InstallError("Failed: something else".to_string());
+        assert!(!is_permission_error(&err));
+
+        // Test other WaxError variant
+        let err = WaxError::FormulaNotFound("formula".to_string());
+        assert!(!is_permission_error(&err));
     }
 }
