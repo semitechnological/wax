@@ -282,7 +282,11 @@ pub async fn services_start(formula_name: &str, nice: Option<i32>) -> Result<()>
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/systemd/user");
         std::fs::create_dir_all(&systemd_user_dir)?;
 
-        let unit_name = unit.file_name().unwrap().to_string_lossy().to_string();
+        let unit_name = unit
+            .file_name()
+            .ok_or_else(|| WaxError::ServiceError(format!("Failed to get unit file name for {}", formula_name)))?
+            .to_string_lossy()
+            .to_string();
         let target_unit = systemd_user_dir.join(&unit_name);
         std::fs::copy(&unit, &target_unit)?;
 
