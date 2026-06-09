@@ -119,3 +119,74 @@ pub mod dirs {
         Ok(wax_dir()?.join("logs"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::fs;
+
+    #[test]
+    fn test_copy_dir_all_basic() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("file1.txt"), "hello").unwrap();
+
+        let src_sub = src.join("subdir");
+        fs::create_dir(&src_sub).unwrap();
+        fs::write(src_sub.join("file2.txt"), "world").unwrap();
+
+        copy_dir_all(&src, &dst).unwrap();
+
+        assert!(dst.exists());
+        assert!(dst.join("file1.txt").exists());
+        assert_eq!(fs::read_to_string(dst.join("file1.txt")).unwrap(), "hello");
+
+        let dst_sub = dst.join("subdir");
+        assert!(dst_sub.exists());
+        assert!(dst_sub.join("file2.txt").exists());
+        assert_eq!(fs::read_to_string(dst_sub.join("file2.txt")).unwrap(), "world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_dir_all_with_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("target.txt"), "target").unwrap();
+        symlink("target.txt", src.join("link.txt")).unwrap();
+
+        copy_dir_all(&src, &dst).unwrap();
+
+        assert!(dst.join("link.txt").exists());
+        let meta = dst.join("link.txt").symlink_metadata().unwrap();
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(fs::read_link(dst.join("link.txt")).unwrap().to_str().unwrap(), "target.txt");
+        assert_eq!(fs::read_to_string(dst.join("link.txt")).unwrap(), "target");
+    }
+
+    #[test]
+    fn test_copy_dir_all_overwrite() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("file1.txt"), "new content").unwrap();
+
+        fs::create_dir(&dst).unwrap();
+        fs::write(dst.join("file1.txt"), "old content").unwrap();
+
+        copy_dir_all(&src, &dst).unwrap();
+
+        assert_eq!(fs::read_to_string(dst.join("file1.txt")).unwrap(), "new content");
+    }
+}
