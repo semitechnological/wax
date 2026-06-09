@@ -168,3 +168,54 @@ pub fn install_handler() {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Use a single mutex to serialize tests that touch global state
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn reset_state() {
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        // We do not reset CRITICAL_SECTION to avoid touching other scope
+    }
+
+    #[test]
+    fn test_shutdown_request() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        reset_state();
+
+        assert!(!is_shutdown_requested());
+        request_shutdown();
+        assert!(is_shutdown_requested());
+
+        // Cleanup
+        reset_state();
+    }
+
+    #[test]
+    fn test_check_cancelled_normal() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        reset_state();
+
+        assert!(check_cancelled().is_ok());
+
+        // Cleanup
+        reset_state();
+    }
+
+    #[test]
+    fn test_check_cancelled_interrupted() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        reset_state();
+
+        request_shutdown();
+        let err = check_cancelled().unwrap_err();
+        assert!(matches!(err, WaxError::Interrupted));
+
+        // Cleanup
+        reset_state();
+    }
+}
