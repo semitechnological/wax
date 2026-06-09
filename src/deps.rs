@@ -126,3 +126,36 @@ pub fn resolve_dependencies(
     debug!("Packages to install: {:?}", to_install);
     Ok(to_install)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_topological_sort_no_cycle() {
+        let mut graph = DependencyGraph::new();
+        graph.add_node("A".to_string(), vec!["B".to_string()]);
+        graph.add_node("B".to_string(), vec!["C".to_string()]);
+        graph.add_node("C".to_string(), vec![]);
+
+        let result = graph.topological_sort().unwrap();
+        // A depends on B, B depends on C
+        // So topological sort result could be C, B, A
+        // Let's just check it doesn't error and has right length
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_dependency_cycle() {
+        let mut graph = DependencyGraph::new();
+        // A depends on B
+        graph.add_node("A".to_string(), vec!["B".to_string()]);
+        // B depends on C
+        graph.add_node("B".to_string(), vec!["C".to_string()]);
+        // C depends on A (cycle)
+        graph.add_node("C".to_string(), vec!["A".to_string()]);
+
+        let result = graph.topological_sort();
+        assert!(matches!(result, Err(WaxError::DependencyCycle(_))));
+    }
+}
