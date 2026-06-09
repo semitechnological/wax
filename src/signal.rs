@@ -168,3 +168,30 @@ pub fn install_handler() {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_critical_section_behavior() {
+        // Ensure initial state is clean
+        leave_critical_section();
+        assert!(!is_in_critical_section());
+
+        // Test direct function calls
+        enter_critical_section();
+        assert!(is_in_critical_section());
+
+        leave_critical_section();
+        assert!(!is_in_critical_section());
+
+        // Test RAII guard (CriticalSection)
+        {
+            let _guard = CriticalSection::new();
+            assert!(is_in_critical_section());
+        } // guard is dropped here
+
+        assert!(!is_in_critical_section());
+    }
+}
