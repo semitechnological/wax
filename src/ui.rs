@@ -119,3 +119,43 @@ pub mod dirs {
         Ok(wax_dir()?.join("logs"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::dirs::*;
+    use std::env;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_dirs_resolution() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let original_home = env::var_os("HOME");
+
+        let dummy_home = "/tmp/wax_test_home";
+        env::set_var("HOME", dummy_home);
+
+        assert_eq!(home_dir().unwrap(), PathBuf::from(dummy_home));
+        assert_eq!(wax_dir().unwrap(), PathBuf::from(dummy_home).join(".wax"));
+        assert_eq!(
+            wax_cache_dir().unwrap(),
+            PathBuf::from(dummy_home).join(".wax/cache")
+        );
+        assert_eq!(
+            wax_logs_dir().unwrap(),
+            PathBuf::from(dummy_home).join(".wax/logs")
+        );
+
+        env::remove_var("HOME");
+        assert!(home_dir().is_err());
+
+        if let Some(h) = original_home {
+            env::set_var("HOME", h);
+        } else {
+            env::remove_var("HOME");
+        }
+    }
+}
