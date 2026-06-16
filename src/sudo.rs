@@ -104,21 +104,35 @@ pub fn acquire_sudo_for(reason: Option<&str>) -> Result<()> {
         eprintln!();
         eprintln!("Administrator privileges are required. Enter your password when prompted.");
 
-        let mut cmd = Command::new("sudo");
-        cmd.args(["-v", "-p", &sudo_password_prompt()]);
+        let password = inquire::Password::new(&sudo_password_prompt())
+            .with_display_mode(inquire::PasswordDisplayMode::Hidden)
+            .without_confirmation()
+            .prompt()
+            .map_err(|e| {
+                WaxError::InstallError(format!("Failed to read password securely: {}", e))
+            })?;
 
-        if let Ok(tty) = std::fs::File::open("/dev/tty") {
-            cmd.stdin(Stdio::from(tty.try_clone().map_err(WaxError::IoError)?))
-                .stderr(Stdio::from(tty));
-        } else {
-            cmd.stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
+        let mut cmd = Command::new("sudo");
+        cmd.args(["-v", "-S", "-p", ""]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| WaxError::InstallError(format!("failed to spawn sudo: {}", e)))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(password.as_bytes())
+                .map_err(|e| WaxError::InstallError(format!("failed to write password to sudo: {}", e)))?;
+            stdin.write_all(b"\n")
+                .map_err(|e| WaxError::InstallError(format!("failed to write newline to sudo: {}", e)))?;
         }
 
-        let status = cmd
-            .status()
-            .map_err(|e| WaxError::InstallError(format!("failed to run sudo: {}", e)))?;
+        let status = child
+            .wait()
+            .map_err(|e| WaxError::InstallError(format!("failed to wait on sudo: {}", e)))?;
 
         if !status.success() {
             return Err(WaxError::InstallError(
