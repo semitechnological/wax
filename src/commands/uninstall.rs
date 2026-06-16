@@ -293,7 +293,7 @@ async fn resolve_cask_app_name(
         };
     }
 
-    if let Some(app_name) = find_app_in_caskroom(cask_name, version) {
+    if let Some(app_name) = find_app_in_caskroom(cask_name, version).await {
         return app_name;
     }
 
@@ -485,15 +485,15 @@ async fn uninstall_cask(
     Ok(())
 }
 
-fn find_app_in_caskroom(cask_name: &str, version: &str) -> Option<String> {
+async fn find_app_in_caskroom(cask_name: &str, version: &str) -> Option<String> {
     let caskroom = CaskState::caskroom_dir();
     let version_dir = caskroom.join(cask_name).join(version);
-    if !version_dir.exists() {
+    if !tokio::fs::try_exists(&version_dir).await.unwrap_or(false) {
         return None;
     }
 
-    if let Ok(entries) = std::fs::read_dir(&version_dir) {
-        for entry in entries.flatten() {
+    if let Ok(mut entries) = tokio::fs::read_dir(&version_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("app") {
                 return path.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -587,9 +587,9 @@ async fn uninstall_windows_package(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_find_app_in_caskroom_nonexistent() {
-        let result = find_app_in_caskroom("nonexistent", "1.0.0");
+    #[tokio::test]
+    async fn test_find_app_in_caskroom_nonexistent() {
+        let result = find_app_in_caskroom("nonexistent", "1.0.0").await;
         assert_eq!(result, None);
     }
 }
