@@ -1,5 +1,5 @@
 use crate::api::{CaskArtifact, Formula};
-use crate::bottle::{detect_platform, BottleDownloader, DownloadTotals};
+use crate::bottle::{detect_platform, homebrew_prefix, BottleDownloader, DownloadTotals};
 use crate::builder::Builder;
 use crate::cache::Cache;
 use crate::cask::{
@@ -2212,8 +2212,9 @@ async fn postinstall_impl(name: &str, _install_mode: InstallMode, quiet: bool) -
         let mut cmd = tokio::process::Command::new(&brew_path);
         cmd.arg("postinstall").arg(name);
 
-        // We might need to set HOMEBREW_PREFIX or similar if wax's prefix is different
-        // but for now let's assume standard prefix
+        let prefix = homebrew_prefix();
+        cmd.env("HOMEBREW_PREFIX", &prefix);
+
         match cmd.status().await {
             Ok(status) if status.success() => return Ok(()),
             _ => {
