@@ -937,20 +937,35 @@ impl StagingContext {
                 }
             }
             "tar.gz" | "tar" | "tgz" | "tar.bz2" | "tbz" | "tar.xz" | "txz" => {
-                let tar_output = tokio::process::Command::new("tar")
-                    .arg("-xf")
-                    .arg(download_path)
-                    .arg("-C")
-                    .arg(&staging_root)
-                    .output()
-                    .await?;
+                let staging_root_clone = staging_root.clone();
+                let download_path_clone = download_path.to_path_buf();
+                let extension = artifact_type.to_string();
 
-                if !tar_output.status.success() {
-                    return Err(WaxError::InstallError(format!(
-                        "Failed to extract tarball: {}",
-                        String::from_utf8_lossy(&tar_output.stderr)
-                    )));
-                }
+                tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+                    let file = std::fs::File::open(&download_path_clone)
+                        .map_err(|e| crate::error::WaxError::InstallError(format!("Failed to open tarball: {}", e)))?;
+
+                    let mut archive = tar::Archive::new(match extension.as_str() {
+                        "tar.gz" | "tgz" => {
+                            Box::new(flate2::read::GzDecoder::new(file)) as Box<dyn std::io::Read>
+                        }
+                        "tar.bz2" | "tbz" => {
+                            Box::new(bzip2::read::BzDecoder::new(file)) as Box<dyn std::io::Read>
+                        }
+                        "tar.xz" | "txz" => {
+                            Box::new(xz2::read::XzDecoder::new(file)) as Box<dyn std::io::Read>
+                        }
+                        "tar" => {
+                            Box::new(file) as Box<dyn std::io::Read>
+                        }
+                        _ => return Err(crate::error::WaxError::InstallError("Unsupported tarball extension".to_string())),
+                    });
+
+                    archive.unpack(&staging_root_clone)
+                        .map_err(|e| crate::error::WaxError::InstallError(format!("Failed to extract tarball: {}", e)))?;
+
+                    Ok(())
+                }).await.map_err(|e| crate::error::WaxError::InstallError(format!("Failed to spawn task: {}", e)))??;
             }
             _ => {
                 // For "pkg" or "binary", copy the file to the staging root, attempting to use its original name
