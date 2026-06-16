@@ -408,11 +408,6 @@ impl CaskState {
         Ok(casks)
     }
 
-    #[allow(dead_code)]
-    async fn scan_cask_version_dir(&self, cask_path: &Path) -> Result<(String, i64)> {
-        Ok(latest_caskroom_version(cask_path).unwrap_or_else(|| ("unknown".to_string(), 0)))
-    }
-
     pub async fn sync_from_caskrooms(&self) -> Result<HashSet<String>> {
         let mut casks = self.load().await?;
         let mut synced_names = HashSet::new();
@@ -566,7 +561,7 @@ impl CaskState {
                 Some(cask) => cask.clone(),
                 None => {
                     let cask_dir = Self::caskroom_dir().join(&name);
-                    let (version, install_date) = self.scan_cask_version_dir(&cask_dir).await?;
+                    let (version, install_date) = latest_caskroom_version(&cask_dir).unwrap_or_else(|| ("unknown".to_string(), 0));
                     InstalledCask {
                         name: name.clone(),
                         version,
