@@ -351,23 +351,7 @@ async fn apply_one_formula_package_upgrade(
     result
 }
 
-async fn upgrade_all(
-    cache: &Cache,
-    dry_run: bool,
-    ask: bool,
-    start: std::time::Instant,
-    scope: Option<InstallMode>,
-) -> Result<()> {
-    let outdated = get_outdated_packages_scoped(cache, scope).await?;
-
-    if outdated.is_empty() {
-        println!("all packages are up to date");
-        if crate::timing::enabled() {
-            println!("\n{} done", crate::timing::elapsed_text(start.elapsed()));
-        }
-        return Ok(());
-    }
-
+fn check_global_install_permissions(dry_run: bool, outdated: &[OutdatedPackage]) -> Result<()> {
     let global_count = outdated
         .iter()
         .filter(|pkg| pkg.install_mode == Some(InstallMode::Global) || pkg.is_cask)
@@ -386,11 +370,18 @@ async fn upgrade_all(
             )));
         }
     }
+    Ok(())
+}
 
+fn print_upgrade_plan_and_confirm(
+    dry_run: bool,
+    ask: bool,
+    outdated: &[OutdatedPackage],
+) -> Result<bool> {
     if dry_run || ask {
         println!();
         println!("{} upgrade plan", style("→").cyan().bold());
-        for pkg in &outdated {
+        for pkg in outdated {
             let cask_indicator = if pkg.is_cask {
                 format!(" {}", style("(cask)").yellow())
             } else {
@@ -407,191 +398,262 @@ async fn upgrade_all(
         }
         if dry_run {
             println!("\n{}", style("dry run - no changes made").dim());
-            return Ok(());
+            return Ok(false);
         }
         let proceed = confirm_prompt("Proceed with upgrade?")?;
         if !proceed {
             println!("{} upgrade cancelled", style("✗").red());
-            return Ok(());
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn calculate_upgrade_connections_map(
+    downloader: &Arc<BottleDownloader>,
+    formula_bottle_urls: &[(String, String)],
+) -> HashMap<String, usize> {
+    let probe_tasks: Vec<_> = formula_bottle_urls
+        .iter()
+        .map(|(name, url)| {
+            let dl = Arc::clone(downloader);
+            let url = url.clone();
+            let name = name.clone();
+            tokio::spawn(async move { (name, dl.probe_size(&url).await) })
+        })
+        .collect();
+
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    for task in probe_tasks {
+        if let Ok((name, size)) = task.await {
+            sizes.insert(name, size);
         }
     }
 
-    let formulae = cache.load_all_formulae().await?;
-
-    let total = outdated.len();
-
-    // Print plan summary
-    let names: Vec<String> = outdated
+    let total_size: u64 = sizes.values().sum();
+    let pool = BottleDownloader::GLOBAL_CONNECTION_POOL;
+    let n = formula_bottle_urls.len().max(1);
+    let min_conns = if pool / n >= 2 { 2usize } else { 1usize };
+    let mut allocs: Vec<(String, usize, f64)> = sizes
         .iter()
-        .map(|p| {
-            if p.is_cask {
-                format!("{} (cask)", p.name)
+        .map(|(name, &size)| {
+            if total_size == 0 {
+                let base = pool / n;
+                (name.clone(), base.max(min_conns), 0.0)
             } else {
-                p.name.clone()
+                let exact = pool as f64 * size as f64 / total_size as f64;
+                let base = (exact.floor() as usize).max(min_conns);
+                (name.clone(), base, exact - base as f64)
             }
         })
         .collect();
-    println!("upgrading {}\n", style(names.join(", ")).magenta());
-
-    let multi = MultiProgress::new();
-    let owns_multi_globals = crate::signal::clone_active_multi().is_none();
-    if owns_multi_globals {
-        set_active_multi(multi.clone());
+    let used: usize = allocs.iter().map(|(_, c, _)| *c).sum();
+    let mut remaining = pool.saturating_sub(used);
+    allocs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, c, _) in allocs.iter_mut() {
+        if remaining == 0 {
+            break;
+        }
+        *c += 1;
+        remaining -= 1;
     }
-    let _guard = UpgradeMultiGuard::new(owns_multi_globals);
+    allocs.into_iter().map(|(name, c, _)| (name, c)).collect()
+}
 
-    let (cask_packages, formula_packages): (Vec<OutdatedPackage>, Vec<OutdatedPackage>) =
-        outdated.into_iter().partition(|pkg| pkg.is_cask);
-    let formula_total = formula_packages.len();
+async fn upgrade_cask_packages(
+    cache: Cache,
+    multi: MultiProgress,
+    cask_packages: Vec<OutdatedPackage>,
+    cask_only_total_display: usize,
+) -> Result<(usize, usize, Vec<String>)> {
+    let mut c_succ = 0usize;
+    let mut c_fail = 0usize;
+    let mut c_failed: Vec<String> = Vec::new();
+    if !cask_packages.is_empty() {
+        check_cancelled()?;
+        let cask_names: Vec<String> = cask_packages.iter().map(|p| p.name.clone()).collect();
+        set_current_op(format!(
+            "upgrading {} casks",
+            cask_only_total_display.max(1)
+        ));
+        let r = install::install_quiet_force(&cache, &cask_names, true, false, false).await;
+        clear_current_op();
 
-    // --- Phase 0: pre-download all formula bottles concurrently ---
-    let platform = detect_platform();
-    let formula_by_name: HashMap<&str, &crate::api::Formula> =
-        formulae.iter().map(|f| (f.name.as_str(), f)).collect();
-
-    let upgrade_formulae: Arc<HashMap<String, crate::api::Formula>> = Arc::new(
-        formula_packages
-            .iter()
-            .filter_map(|p| {
-                formula_by_name
-                    .get(p.name.as_str())
-                    .map(|f| (p.name.clone(), (*f).clone()))
-            })
-            .collect(),
-    );
-
-    let downloader = Arc::new(BottleDownloader::new());
-
-    // Collect (name, url) for all formula bottles to be downloaded.
-    let formula_bottle_urls: Vec<(String, String)> = formula_packages
-        .iter()
-        .filter_map(|pkg| {
-            let formula = formula_by_name.get(pkg.name.as_str())?;
-            let bottle_info = formula.bottle.as_ref()?.stable.as_ref()?;
-            let bottle_file = bottle_info.file_for_platform(&platform)?;
-            Some((pkg.name.clone(), bottle_file.url.clone()))
-        })
-        .collect();
-
-    // Probe all bottle sizes concurrently, then allocate connections proportionally.
-    // All upgrades download simultaneously; limit only caps extreme scenarios.
-    let formula_upgrade_count = formula_bottle_urls.len().max(1);
-    let upgrade_concurrent_limit = formula_upgrade_count.min(32);
-    let upgrade_connections_map: HashMap<String, usize> = {
-        let probe_tasks: Vec<_> = formula_bottle_urls
-            .iter()
-            .map(|(name, url)| {
-                let dl = Arc::clone(&downloader);
-                let url = url.clone();
-                let name = name.clone();
-                tokio::spawn(async move { (name, dl.probe_size(&url).await) })
-            })
-            .collect();
-
-        let mut sizes: HashMap<String, u64> = HashMap::new();
-        for task in probe_tasks {
-            if let Ok((name, size)) = task.await {
-                sizes.insert(name, size);
+        match r {
+            Ok(()) => {
+                for pkg in cask_packages {
+                    c_succ += 1;
+                    let _ = multi.println(format!(
+                        "{} {} {} {} → {}",
+                        style("✓").green(),
+                        style(&pkg.name).magenta(),
+                        style("(cask)").yellow(),
+                        style(&pkg.installed_version).dim(),
+                        style(&pkg.latest_version).green()
+                    ));
+                }
             }
-        }
-
-        let total_size: u64 = sizes.values().sum();
-        let pool = BottleDownloader::GLOBAL_CONNECTION_POOL;
-        let n = formula_bottle_urls.len().max(1);
-        // Guarantee at least 2 connections per package when the pool allows it
-        // (multipart requires max_connections > 1 to activate).
-        let min_conns = if pool / n >= 2 { 2usize } else { 1usize };
-        let mut allocs: Vec<(String, usize, f64)> = sizes
-            .iter()
-            .map(|(name, &size)| {
-                if total_size == 0 {
-                    let base = pool / n;
-                    (name.clone(), base.max(min_conns), 0.0)
+            Err(e) => {
+                let failed_set = cask_failed_names_from_error(&e);
+                if failed_set.is_empty() {
+                    c_fail += cask_packages.len();
+                    for pkg in cask_packages {
+                        let _ = multi.println(format!(
+                            "{} {} failed: {}",
+                            style("✗").red(),
+                            style(&pkg.name).magenta(),
+                            e
+                        ));
+                        c_failed.push(pkg.name);
+                    }
                 } else {
-                    let exact = pool as f64 * size as f64 / total_size as f64;
-                    let base = (exact.floor() as usize).max(min_conns);
-                    (name.clone(), base, exact - base as f64)
+                    for pkg in cask_packages {
+                        if failed_set.contains(&pkg.name) {
+                            c_fail += 1;
+                            let _ = multi.println(format!(
+                                "{} {} failed: {}",
+                                style("✗").red(),
+                                style(&pkg.name).magenta(),
+                                e
+                            ));
+                            c_failed.push(pkg.name);
+                        } else {
+                            c_succ += 1;
+                            let _ = multi.println(format!(
+                                "{} {} {} {} → {}",
+                                style("✓").green(),
+                                style(&pkg.name).magenta(),
+                                style("(cask)").yellow(),
+                                style(&pkg.installed_version).dim(),
+                                style(&pkg.latest_version).green()
+                            ));
+                        }
+                    }
                 }
-            })
-            .collect();
-        // Distribute remaining connections by largest fractional part
-        let used: usize = allocs.iter().map(|(_, c, _)| *c).sum();
-        let mut remaining = pool.saturating_sub(used);
-        allocs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        for (_, c, _) in allocs.iter_mut() {
-            if remaining == 0 {
-                break;
             }
-            *c += 1;
-            remaining -= 1;
         }
-        allocs.into_iter().map(|(name, c, _)| (name, c)).collect()
-    };
+    }
+    Ok((c_succ, c_fail, c_failed))
+}
 
-    let semaphore = Arc::new(Semaphore::new(upgrade_concurrent_limit));
-    let temp_dir = Arc::new(TempDir::new()?);
-
-    let formula_totals = Arc::new(DownloadTotals::default());
-    let hide_formula_dl = Arc::new(AtomicBool::new(false));
-
-    let overall_formula_pb = if formula_bottle_urls.len() > 1 {
-        let pb = multi.insert(0, ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(PROGRESS_BAR_TEMPLATE)
-                .unwrap()
-                .progress_chars(PROGRESS_BAR_CHARS),
-        );
-        pb.set_message("All formula downloads");
-        Some(pb)
-    } else {
-        None
-    };
-
-    let update_formula_totals = if let Some(ref pb) = overall_formula_pb {
-        let totals = formula_totals.clone();
-        let hide = Arc::clone(&hide_formula_dl);
-        let pb = pb.clone();
-        Some(tokio::spawn(async move {
-            loop {
-                if hide.load(Ordering::Relaxed) {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                if hide.load(Ordering::Relaxed) {
-                    return;
-                }
-                let pos = totals.downloaded.load(Ordering::Relaxed);
-                let len = totals.expected.load(Ordering::Relaxed);
-                let cap = len.max(pos).max(1);
-                pb.set_length(cap);
-                pb.set_position(pos);
+async fn upgrade_formula_packages_consumer(
+    cache: Cache,
+    multi: MultiProgress,
+    platform: String,
+    install_mode_global: InstallMode,
+    install_state: InstallState,
+    mut rx: tokio::sync::mpsc::Receiver<FormulaUpgradeMsg>,
+    producer_handle: tokio::task::JoinHandle<Result<()>>,
+) -> Result<(usize, usize, Vec<String>)> {
+    let mut succ = 0usize;
+    let mut fail = 0usize;
+    let mut fails: Vec<String> = Vec::new();
+    while let Some(msg) = rx.recv().await {
+        check_cancelled()?;
+        match msg {
+            FormulaUpgradeMsg::DownloadFailed { name, err } => {
+                let _ = multi.println(format!(
+                    "{} {} download failed: {}",
+                    style("✗").red(),
+                    style(&name).magenta(),
+                    err
+                ));
+                fail += 1;
+                fails.push(name);
             }
-        }))
-    } else {
-        None
-    };
+            FormulaUpgradeMsg::Fallback(pkg) => {
+                match apply_one_formula_package_upgrade(
+                    &cache,
+                    &multi,
+                    &pkg,
+                    None,
+                    install_mode_global,
+                    &platform,
+                    &install_state,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let _ = multi.println(format!(
+                            "{} {} {} → {}",
+                            style("✓").green(),
+                            style(&pkg.name).magenta(),
+                            style(&pkg.installed_version).dim(),
+                            style(&pkg.latest_version).green()
+                        ));
+                        succ += 1;
+                    }
+                    Err(e) => {
+                        fail += 1;
+                        let _ = multi.println(format!(
+                            "{} {} failed: {}",
+                            style("✗").red(),
+                            style(&pkg.name).magenta(),
+                            e
+                        ));
+                        fails.push(pkg.name.clone());
+                    }
+                }
+            }
+            FormulaUpgradeMsg::Ready { pkg, pre } => {
+                match apply_one_formula_package_upgrade(
+                    &cache,
+                    &multi,
+                    &pkg,
+                    Some(pre),
+                    install_mode_global,
+                    &platform,
+                    &install_state,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let _ = multi.println(format!(
+                            "{} {} {} → {}",
+                            style("✓").green(),
+                            style(&pkg.name).magenta(),
+                            style(&pkg.installed_version).dim(),
+                            style(&pkg.latest_version).green()
+                        ));
+                        succ += 1;
+                    }
+                    Err(e) => {
+                        fail += 1;
+                        let _ = multi.println(format!(
+                            "{} {} failed: {}",
+                            style("✗").red(),
+                            style(&pkg.name).magenta(),
+                            e
+                        ));
+                        fails.push(pkg.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    producer_handle
+        .await
+        .map_err(|e| WaxError::InstallError(format!("formula upgrade producer task: {}", e)))??;
+    Ok((succ, fail, fails))
+}
 
-    let ch_cap = formula_total.clamp(1, 64);
-    let (tx, mut rx) = mpsc::channel::<FormulaUpgradeMsg>(ch_cap);
-
-    let install_state = InstallState::new()?;
-    let install_mode_global = InstallMode::detect();
-
-    let cask_only_total_display = total.saturating_sub(formula_total);
-
-    let hide_dl = Arc::clone(&hide_formula_dl);
-    let poller_task = update_formula_totals;
-    let overall_pb_done = overall_formula_pb.clone();
-
-    let connection_map_for_producer = upgrade_connections_map.clone();
-    let producer_tx = tx.clone();
-    let formula_packages_for_producer = formula_packages.clone();
-    let upgrade_formulae_for_producer = Arc::clone(&upgrade_formulae);
-    let platform_for_producer = platform.clone();
-    let multi_for_producer = multi.clone();
-    let producer_handle = tokio::spawn(async move {
-        let mut producer_js: JoinSet<std::result::Result<(), WaxError>> = JoinSet::new();
+fn spawn_formula_download_producer(
+    producer_tx: tokio::sync::mpsc::Sender<FormulaUpgradeMsg>,
+    formula_packages_for_producer: Vec<OutdatedPackage>,
+    upgrade_formulae_for_producer: Arc<HashMap<String, crate::api::Formula>>,
+    platform_for_producer: String,
+    multi_for_producer: MultiProgress,
+    connection_map_for_producer: HashMap<String, usize>,
+    semaphore: Arc<Semaphore>,
+    temp_dir: Arc<TempDir>,
+    downloader: Arc<BottleDownloader>,
+    formula_totals: Arc<DownloadTotals>,
+    hide_dl: Arc<AtomicBool>,
+    poller_task: Option<tokio::task::JoinHandle<()>>,
+    overall_pb_done: Option<ProgressBar>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let mut producer_js: JoinSet<Result<()>> = JoinSet::new();
         for pkg in formula_packages_for_producer.iter().cloned() {
             let tx = producer_tx.clone();
             let sem = Arc::clone(&semaphore);
@@ -711,182 +773,185 @@ async fn upgrade_all(
         }
 
         Ok::<(), WaxError>(())
-    });
+    })
+}
+async fn upgrade_all(
+    cache: &Cache,
+    dry_run: bool,
+    ask: bool,
+    start: std::time::Instant,
+    scope: Option<InstallMode>,
+) -> Result<()> {
+    let outdated = get_outdated_packages_scoped(cache, scope).await?;
+
+    if outdated.is_empty() {
+        println!("all packages are up to date");
+        if crate::timing::enabled() {
+            println!("\n{} done", crate::timing::elapsed_text(start.elapsed()));
+        }
+        return Ok(());
+    }
+
+    check_global_install_permissions(dry_run, &outdated)?;
+    if !print_upgrade_plan_and_confirm(dry_run, ask, &outdated)? {
+        return Ok(());
+    }
+
+    let formulae = cache.load_all_formulae().await?;
+    let total = outdated.len();
+
+    // Print plan summary
+    let names: Vec<String> = outdated
+        .iter()
+        .map(|p| {
+            if p.is_cask {
+                format!("{} (cask)", p.name)
+            } else {
+                p.name.clone()
+            }
+        })
+        .collect();
+    println!("upgrading {}\n", style(names.join(", ")).magenta());
+
+    let multi = MultiProgress::new();
+    let owns_multi_globals = crate::signal::clone_active_multi().is_none();
+    if owns_multi_globals {
+        set_active_multi(multi.clone());
+    }
+    let _guard = UpgradeMultiGuard::new(owns_multi_globals);
+
+    let (cask_packages, formula_packages): (Vec<OutdatedPackage>, Vec<OutdatedPackage>) =
+        outdated.into_iter().partition(|pkg| pkg.is_cask);
+    let formula_total = formula_packages.len();
+
+    let platform = detect_platform();
+    let formula_by_name: HashMap<&str, &crate::api::Formula> =
+        formulae.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    let upgrade_formulae: Arc<HashMap<String, crate::api::Formula>> = Arc::new(
+        formula_packages
+            .iter()
+            .filter_map(|p| {
+                formula_by_name
+                    .get(p.name.as_str())
+                    .map(|f| (p.name.clone(), (*f).clone()))
+            })
+            .collect(),
+    );
+
+    let downloader = Arc::new(BottleDownloader::new());
+
+    let formula_bottle_urls: Vec<(String, String)> = formula_packages
+        .iter()
+        .filter_map(|pkg| {
+            let formula = formula_by_name.get(pkg.name.as_str())?;
+            let bottle_info = formula.bottle.as_ref()?.stable.as_ref()?;
+            let bottle_file = bottle_info.file_for_platform(&platform)?;
+            Some((pkg.name.clone(), bottle_file.url.clone()))
+        })
+        .collect();
+
+    let formula_upgrade_count = formula_bottle_urls.len().max(1);
+    let upgrade_concurrent_limit = formula_upgrade_count.min(32);
+    let upgrade_connections_map =
+        calculate_upgrade_connections_map(&downloader, &formula_bottle_urls).await;
+
+    let semaphore = Arc::new(Semaphore::new(upgrade_concurrent_limit));
+    let temp_dir = Arc::new(TempDir::new()?);
+
+    let formula_totals = Arc::new(DownloadTotals::default());
+    let hide_formula_dl = Arc::new(AtomicBool::new(false));
+
+    let overall_formula_pb = if formula_bottle_urls.len() > 1 {
+        let pb = multi.insert(0, ProgressBar::new(0));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(PROGRESS_BAR_TEMPLATE)
+                .unwrap()
+                .progress_chars(PROGRESS_BAR_CHARS),
+        );
+        pb.set_message("All formula downloads");
+        Some(pb)
+    } else {
+        None
+    };
+
+    let update_formula_totals = if let Some(ref pb) = overall_formula_pb {
+        let totals = formula_totals.clone();
+        let hide = Arc::clone(&hide_formula_dl);
+        let pb = pb.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                if hide.load(Ordering::Relaxed) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                if hide.load(Ordering::Relaxed) {
+                    return;
+                }
+                let pos = totals.downloaded.load(Ordering::Relaxed);
+                let len = totals.expected.load(Ordering::Relaxed);
+                let cap = len.max(pos).max(1);
+                pb.set_length(cap);
+                pb.set_position(pos);
+            }
+        }))
+    } else {
+        None
+    };
+
+    let ch_cap = formula_total.clamp(1, 64);
+    let (tx, rx) = mpsc::channel::<FormulaUpgradeMsg>(ch_cap);
+
+    let install_state = InstallState::new()?;
+    let install_mode_global = InstallMode::detect();
+    let cask_only_total_display = total.saturating_sub(formula_total);
+
+    let hide_dl = Arc::clone(&hide_formula_dl);
+    let poller_task = update_formula_totals;
+    let overall_pb_done = overall_formula_pb.clone();
+
+    let connection_map_for_producer = upgrade_connections_map.clone();
+    let producer_tx = tx.clone();
+    let formula_packages_for_producer = formula_packages.clone();
+    let upgrade_formulae_for_producer = Arc::clone(&upgrade_formulae);
+    let platform_for_producer = platform.clone();
+    let multi_for_producer = multi.clone();
+
+    let producer_handle = spawn_formula_download_producer(
+        producer_tx,
+        formula_packages_for_producer,
+        upgrade_formulae_for_producer,
+        platform_for_producer,
+        multi_for_producer,
+        connection_map_for_producer,
+        semaphore,
+        temp_dir,
+        downloader,
+        formula_totals,
+        hide_dl,
+        poller_task,
+        overall_pb_done,
+    );
+
     drop(tx);
 
-    let formula_stats = {
-        let cache = cache.clone();
-        let multi = multi.clone();
-        let platform = platform.clone();
-        async move {
-            let mut succ = 0usize;
-            let mut fail = 0usize;
-            let mut fails: Vec<String> = Vec::new();
-            while let Some(msg) = rx.recv().await {
-                check_cancelled()?;
-                match msg {
-                    FormulaUpgradeMsg::DownloadFailed { name, err } => {
-                        let _ = multi.println(format!(
-                            "{} {} download failed: {}",
-                            style("✗").red(),
-                            style(&name).magenta(),
-                            err
-                        ));
-                        fail += 1;
-                        fails.push(name);
-                    }
-                    FormulaUpgradeMsg::Fallback(pkg) => {
-                        match apply_one_formula_package_upgrade(
-                            &cache,
-                            &multi,
-                            &pkg,
-                            None,
-                            install_mode_global,
-                            &platform,
-                            &install_state,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                let _ = multi.println(format!(
-                                    "{} {} {} → {}",
-                                    style("✓").green(),
-                                    style(&pkg.name).magenta(),
-                                    style(&pkg.installed_version).dim(),
-                                    style(&pkg.latest_version).green()
-                                ));
-                                succ += 1;
-                            }
-                            Err(e) => {
-                                fail += 1;
-                                let _ = multi.println(format!(
-                                    "{} {} failed: {}",
-                                    style("✗").red(),
-                                    style(&pkg.name).magenta(),
-                                    e
-                                ));
-                                fails.push(pkg.name.clone());
-                            }
-                        }
-                    }
-                    FormulaUpgradeMsg::Ready { pkg, pre } => {
-                        match apply_one_formula_package_upgrade(
-                            &cache,
-                            &multi,
-                            &pkg,
-                            Some(pre),
-                            install_mode_global,
-                            &platform,
-                            &install_state,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                let _ = multi.println(format!(
-                                    "{} {} {} → {}",
-                                    style("✓").green(),
-                                    style(&pkg.name).magenta(),
-                                    style(&pkg.installed_version).dim(),
-                                    style(&pkg.latest_version).green()
-                                ));
-                                succ += 1;
-                            }
-                            Err(e) => {
-                                fail += 1;
-                                let _ = multi.println(format!(
-                                    "{} {} failed: {}",
-                                    style("✗").red(),
-                                    style(&pkg.name).magenta(),
-                                    e
-                                ));
-                                fails.push(pkg.name.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            producer_handle.await.map_err(|e| {
-                WaxError::InstallError(format!("formula upgrade producer task: {}", e))
-            })??;
-            Ok::<_, WaxError>((succ, fail, fails))
-        }
-    };
+    let formula_stats = upgrade_formula_packages_consumer(
+        cache.clone(),
+        multi.clone(),
+        platform.clone(),
+        install_mode_global,
+        install_state,
+        rx,
+        producer_handle,
+    );
 
-    let cask_fut = {
-        let cache = cache.clone();
-        let multi = multi.clone();
-        async move {
-            let mut c_succ = 0usize;
-            let mut c_fail = 0usize;
-            let mut c_failed: Vec<String> = Vec::new();
-            if !cask_packages.is_empty() {
-                check_cancelled()?;
-                let cask_names: Vec<String> =
-                    cask_packages.iter().map(|p| p.name.clone()).collect();
-                set_current_op(format!(
-                    "upgrading {} casks",
-                    cask_only_total_display.max(1)
-                ));
-                let r = install::install_quiet_force(&cache, &cask_names, true, false, false).await;
-                clear_current_op();
-
-                match r {
-                    Ok(()) => {
-                        for pkg in cask_packages {
-                            c_succ += 1;
-                            let _ = multi.println(format!(
-                                "{} {} {} {} → {}",
-                                style("✓").green(),
-                                style(&pkg.name).magenta(),
-                                style("(cask)").yellow(),
-                                style(&pkg.installed_version).dim(),
-                                style(&pkg.latest_version).green()
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        let failed_set = cask_failed_names_from_error(&e);
-                        if failed_set.is_empty() {
-                            c_fail += cask_packages.len();
-                            for pkg in cask_packages {
-                                let _ = multi.println(format!(
-                                    "{} {} failed: {}",
-                                    style("✗").red(),
-                                    style(&pkg.name).magenta(),
-                                    e
-                                ));
-                                c_failed.push(pkg.name);
-                            }
-                        } else {
-                            for pkg in cask_packages {
-                                if failed_set.contains(&pkg.name) {
-                                    c_fail += 1;
-                                    let _ = multi.println(format!(
-                                        "{} {} failed: {}",
-                                        style("✗").red(),
-                                        style(&pkg.name).magenta(),
-                                        e
-                                    ));
-                                    c_failed.push(pkg.name);
-                                } else {
-                                    c_succ += 1;
-                                    let _ = multi.println(format!(
-                                        "{} {} {} {} → {}",
-                                        style("✓").green(),
-                                        style(&pkg.name).magenta(),
-                                        style("(cask)").yellow(),
-                                        style(&pkg.installed_version).dim(),
-                                        style(&pkg.latest_version).green()
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok::<_, WaxError>((c_succ, c_fail, c_failed))
-        }
-    };
+    let cask_fut = upgrade_cask_packages(
+        cache.clone(),
+        multi.clone(),
+        cask_packages,
+        cask_only_total_display,
+    );
 
     let ((mut success_count, mut fail_count, mut failed_names), (c_succ, c_fail, c_failed)) = {
         let _critical = CriticalSection::new();
