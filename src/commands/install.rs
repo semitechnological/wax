@@ -822,9 +822,9 @@ async fn install_impl(
                 remaining.push(spec.name);
             } else if spec.force.is_some() {
                 // scoop/, choco/, winget/ — handled by ecosystem_install
-                if crate::ecosystem_install::install_one_qualified(
-                    cache, name, dry_run, false,
-                ).await? {
+                if crate::ecosystem_install::install_one_qualified(cache, name, dry_run, false)
+                    .await?
+                {
                     continue;
                 }
                 // If ecosystem_install didn't handle it, try remaining as formula name
