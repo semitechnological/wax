@@ -244,37 +244,6 @@ pub fn sudo_symlink(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn get_current_user() -> String {
-    #[cfg(unix)]
-    {
-        let uid = nix::unistd::getuid();
-        if let Ok(Some(user)) = nix::unistd::User::from_uid(uid) {
-            return user.name;
-        }
-    }
-    std::env::var("USER").unwrap_or_else(|_| "root".to_string())
-}
-
-#[allow(dead_code)]
-pub fn sudo_chown_recursive(path: &Path) -> Result<()> {
-    acquire_sudo()?;
-    let path = normalize_path(path);
-    let user = get_current_user();
-
-    let status = Command::new("sudo")
-        .args(["chown", "-R", &format!("{}:admin", user), "--"])
-        .arg(&path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(WaxError::IoError)?;
-
-    if !status.success() {
-        debug!("sudo chown failed for {:?}, continuing", path);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{is_file_exists_error, is_permission_error, normalize_path, sudo_password_prompt};
