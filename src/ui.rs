@@ -171,7 +171,11 @@ pub mod dirs {
     }
 
     pub fn wax_logs_dir() -> Result<PathBuf> {
-        Ok(wax_dir()?.join("logs"))
+        let dir = wax_dir()?.join("logs");
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
+        }
+        Ok(dir)
     }
 }
 
@@ -299,5 +303,34 @@ mod tests {
             fs::read_to_string(dst.join("file1.txt")).unwrap(),
             "new content"
         );
+    }
+
+    #[test]
+    fn test_wax_logs_dir_creates_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let original_home = env::var_os("HOME");
+        let temp = tempdir().unwrap();
+        let dummy_home = temp.path().to_path_buf();
+        env::set_var("HOME", &dummy_home);
+
+        let expected_logs_dir = dummy_home.join(".wax").join("logs");
+
+        // Ensure the directory does not exist initially
+        assert!(!expected_logs_dir.exists());
+
+        // Call the function to test
+        let logs_dir = dirs::wax_logs_dir().unwrap();
+
+        // Verify the directory was created
+        assert_eq!(logs_dir, expected_logs_dir);
+        assert!(logs_dir.exists());
+        assert!(logs_dir.is_dir());
+
+        if let Some(h) = original_home {
+            env::set_var("HOME", h);
+        } else {
+            env::remove_var("HOME");
+        }
     }
 }
