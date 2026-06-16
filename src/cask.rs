@@ -1831,6 +1831,33 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_detect_artifact_type_from_disposition() {
+        // Standard unquoted
+        assert_eq!(detect_artifact_type_from_disposition("attachment; filename=app.dmg"), Some("dmg"));
+
+        // Standard quoted
+        assert_eq!(detect_artifact_type_from_disposition("attachment; filename=\"app.pkg\""), Some("pkg"));
+
+        // RFC 5987 encoded
+        assert_eq!(detect_artifact_type_from_disposition("attachment; filename*=UTF-8''app.zip"), Some("zip"));
+
+        // Complex case with both filename and filename*
+        assert_eq!(detect_artifact_type_from_disposition("attachment; filename=\"app-old.tar.gz\"; filename*=UTF-8''app-new.tar.gz"), Some("tar.gz"));
+
+        // Multiple parts and spaces
+        assert_eq!(detect_artifact_type_from_disposition("  attachment  ;  filename=\"my app.dmg\"  "), Some("dmg"));
+
+        // Unknown extension
+        assert_eq!(detect_artifact_type_from_disposition("attachment; filename=\"app.exe\""), None);
+
+        // Missing filename
+        assert_eq!(detect_artifact_type_from_disposition("attachment"), None);
+
+        // Empty string
+        assert_eq!(detect_artifact_type_from_disposition(""), None);
+    }
+
     #[tokio::test]
     async fn test_resolve_source_path() {
         let installer = CaskInstaller::new();
