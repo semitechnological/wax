@@ -1,5 +1,6 @@
 use crate::error::{Result, WaxError};
 use crate::signal;
+#[cfg(not(test))]
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -72,12 +73,21 @@ fn sudo_password_prompt() -> String {
     "[wax] Password for %p: ".to_string()
 }
 
+#[cfg(not(test))]
 fn interactive_terminal_available() -> bool {
     std::fs::OpenOptions::new()
         .read(true)
         .open("/dev/tty")
         .map(|f| f.is_terminal())
         .unwrap_or_else(|_| std::io::stdin().is_terminal())
+}
+
+#[cfg(test)]
+static MOCK_INTERACTIVE_TERMINAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn interactive_terminal_available() -> bool {
+    MOCK_INTERACTIVE_TERMINAL.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Prompt for administrator credentials when needed.
@@ -277,10 +287,143 @@ pub fn sudo_chown_recursive(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_file_exists_error, is_permission_error, normalize_path, sudo_password_prompt};
+    use super::{
+        acquire_sudo_for, is_file_exists_error, is_permission_error, is_running_as_root,
+        normalize_path, sudo_password_prompt, MOCK_INTERACTIVE_TERMINAL, SUDO_VALIDATED,
+    };
     use crate::error::WaxError;
+    use std::env;
+    use std::fs;
     use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        original_path: std::ffi::OsString,
+        original_sudo_state: bool,
+        original_mock_terminal: bool,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self {
+                original_path: env::var_os("PATH").unwrap_or_default(),
+                original_sudo_state: SUDO_VALIDATED.load(Ordering::SeqCst),
+                original_mock_terminal: MOCK_INTERACTIVE_TERMINAL.load(Ordering::SeqCst),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            env::set_var("PATH", &self.original_path);
+            SUDO_VALIDATED.store(self.original_sudo_state, Ordering::SeqCst);
+            MOCK_INTERACTIVE_TERMINAL.store(self.original_mock_terminal, Ordering::SeqCst);
+        }
+    }
+
+    fn setup_fake_sudo(dir: &Path, behavior: &str) {
+        let sudo_path = dir.join("sudo");
+        let script = match behavior {
+            "success" => {
+                r#"#!/bin/sh
+if [ "$1" = "-n" ] && [ "$2" = "true" ]; then
+    exit 1
+fi
+if [ "$1" = "-v" ]; then
+    exit 0
+fi
+exit 1
+"#
+            }
+            "failure" => {
+                r#"#!/bin/sh
+exit 1
+"#
+            }
+            _ => "#!/bin/sh\nexit 1\n",
+        };
+        fs::write(&sudo_path, script).unwrap();
+        let mut perms = fs::metadata(&sudo_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&sudo_path, perms).unwrap();
+    }
+
+    #[test]
+    fn test_acquire_sudo_for_cached() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env_guard = EnvGuard::new();
+
+        // Simulate sudo already being validated/cached
+        SUDO_VALIDATED.store(true, Ordering::SeqCst);
+
+        let result = acquire_sudo_for(None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_acquire_sudo_for_prompt_success() {
+        if is_running_as_root() {
+            return; // Test not applicable if already root
+        }
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env_guard = EnvGuard::new();
+
+        // Setup fake sudo and PATH
+        let temp_dir = tempdir().unwrap();
+        setup_fake_sudo(temp_dir.path(), "success");
+        let mut new_path = temp_dir.path().to_path_buf().into_os_string();
+        new_path.push(":");
+        new_path.push(&_env_guard.original_path);
+        env::set_var("PATH", new_path);
+
+        // Force cache false and terminal true
+        SUDO_VALIDATED.store(false, Ordering::SeqCst);
+        MOCK_INTERACTIVE_TERMINAL.store(true, Ordering::SeqCst);
+
+        let result = acquire_sudo_for(Some("test successful prompt"));
+        assert!(result.is_ok());
+        // Verify cache is updated after successful prompt
+        assert!(SUDO_VALIDATED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_acquire_sudo_for_prompt_failure() {
+        if is_running_as_root() {
+            return;
+        }
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env_guard = EnvGuard::new();
+
+        let temp_dir = tempdir().unwrap();
+        setup_fake_sudo(temp_dir.path(), "failure");
+        let mut new_path = temp_dir.path().to_path_buf().into_os_string();
+        new_path.push(":");
+        new_path.push(&_env_guard.original_path);
+        env::set_var("PATH", new_path);
+
+        SUDO_VALIDATED.store(false, Ordering::SeqCst);
+        MOCK_INTERACTIVE_TERMINAL.store(true, Ordering::SeqCst);
+
+        let result = acquire_sudo_for(Some("test failing prompt"));
+
+        match result {
+            Err(WaxError::InstallError(msg)) => {
+                assert!(msg.contains("sudo authentication failed or was cancelled"));
+            }
+            _ => panic!("Expected InstallError for failed sudo prompt"),
+        }
+
+        // Cache should not be updated
+        assert!(!SUDO_VALIDATED.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn sudo_password_prompt_is_wax_branded() {
