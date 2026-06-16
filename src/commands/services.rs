@@ -12,8 +12,6 @@ use tracing::instrument;
 struct ServiceInfo {
     name: String,
     status: ServiceStatus,
-    #[allow(dead_code)]
-    plist_path: Option<PathBuf>,
     pid: Option<u32>,
 }
 
@@ -137,7 +135,6 @@ pub async fn services_list() -> Result<()> {
             services.push(ServiceInfo {
                 name: name.clone(),
                 status,
-                plist_path: plist,
                 pid,
             });
         }
@@ -149,7 +146,6 @@ pub async fn services_list() -> Result<()> {
                 services.push(ServiceInfo {
                     name: name.clone(),
                     status,
-                    plist_path: None,
                     pid: None,
                 });
             }
