@@ -3,7 +3,6 @@ use crate::cask::CaskState;
 use crate::error::Result;
 use crate::install::InstallState;
 use console::style;
-use std::collections::HashSet;
 use tracing::instrument;
 
 #[cfg(target_os = "windows")]
@@ -119,8 +118,7 @@ pub async fn search(cache: &Cache, query: &str) -> Result<()> {
                 .iter()
                 .filter_map(|f| {
                     let name_score = calculate_match_score(&f.name, f.desc.as_deref(), q);
-                    let full_name_score =
-                        calculate_match_score(&f.full_name, f.desc.as_deref(), q);
+                    let full_name_score = calculate_match_score(&f.full_name, f.desc.as_deref(), q);
                     name_score.or(full_name_score).map(|score| (f, score))
                 })
                 .collect();
@@ -146,8 +144,7 @@ pub async fn search(cache: &Cache, query: &str) -> Result<()> {
             cask_matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.token.cmp(&b.0.token)));
         }
 
-        let formula_matches: Vec<_> =
-            formula_matches.iter().take(20).map(|(f, _)| f).collect();
+        let formula_matches: Vec<_> = formula_matches.iter().take(20).map(|(f, _)| f).collect();
         let tap_matches: Vec<_> = tap_matches.iter().take(10).map(|(f, _)| f).collect();
         let cask_matches: Vec<_> = cask_matches.iter().take(20).map(|(c, _)| c).collect();
 
@@ -336,8 +333,7 @@ pub async fn search(cache: &Cache, query: &str) -> Result<()> {
             .iter()
             .filter_map(|f| {
                 let name_score = calculate_match_score(&f.name, f.desc.as_deref(), query);
-                let full_name_score =
-                    calculate_match_score(&f.full_name, f.desc.as_deref(), query);
+                let full_name_score = calculate_match_score(&f.full_name, f.desc.as_deref(), query);
                 name_score.or(full_name_score).map(|score| (f, score))
             })
             .collect();
@@ -362,8 +358,7 @@ pub async fn search(cache: &Cache, query: &str) -> Result<()> {
         });
         cask_matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.token.cmp(&b.0.token)));
 
-        let formula_matches: Vec<_> =
-            formula_matches.iter().take(20).map(|(f, _)| f).collect();
+        let formula_matches: Vec<_> = formula_matches.iter().take(20).map(|(f, _)| f).collect();
         let tap_matches: Vec<_> = tap_matches.iter().take(10).map(|(f, _)| f).collect();
         let cask_matches: Vec<_> = cask_matches.iter().take(20).map(|(c, _)| c).collect();
 

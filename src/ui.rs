@@ -8,7 +8,7 @@ use std::ffi::CString;
 use std::io::{self, IsTerminal, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use tracing::debug;
 
