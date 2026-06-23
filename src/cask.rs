@@ -1443,12 +1443,23 @@ impl CaskInstaller {
                 .output()
                 .await?;
 
-            if !verify_output.status.success() {
-                let err_msg = String::from_utf8_lossy(&verify_output.stderr);
-                let err_msg = if err_msg.trim().is_empty() {
-                    String::from_utf8_lossy(&verify_output.stdout)
+            let stdout_str = String::from_utf8_lossy(&verify_output.stdout);
+            let stderr_str = String::from_utf8_lossy(&verify_output.stderr);
+
+            // pkgutil may exit with 0 even if the package is unsigned.
+            // We must explicitly check the output for an invalid signature status.
+            let is_unsigned = stdout_str.contains("Status: no signature")
+                || stdout_str.contains("Status: unsigned")
+                || stdout_str.contains("invalid signature")
+                || stderr_str.contains("Status: no signature")
+                || stderr_str.contains("Status: unsigned")
+                || stderr_str.contains("invalid signature");
+
+            if !verify_output.status.success() || is_unsigned {
+                let err_msg = if stderr_str.trim().is_empty() {
+                    stdout_str.into_owned()
                 } else {
-                    err_msg
+                    stderr_str.into_owned()
                 };
                 return Err(WaxError::InstallError(format!(
                     "PKG signature verification failed: {}",
@@ -2235,5 +2246,68 @@ mod tests {
             None
         );
         assert_eq!(detect_artifact_type_from_content_type(""), None);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn test_install_pkg_rejects_unsigned() {
+        use std::env;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        let installer = CaskInstaller::new();
+        let temp = tempdir().unwrap();
+        let staging_root = temp.path().to_path_buf();
+
+        let source_rel = "test.pkg";
+        let source_path = staging_root.join(source_rel);
+        fs::write(&source_path, "dummy pkg content").unwrap();
+
+        let staging = StagingContext {
+            staging_root: staging_root.clone(),
+            mount_point: None,
+            _temp_dir: None,
+        };
+        let mut rollback = RollbackContext::new();
+
+        // Create mock pkgutil
+        let mock_bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&mock_bin_dir).unwrap();
+        let mock_pkgutil = mock_bin_dir.join("pkgutil");
+        let mock_script = r#"#!/bin/sh
+if [ "$1" = "--check-signature" ]; then
+    echo 'Package "test.pkg":'
+    echo '   Status: no signature'
+    exit 0
+fi
+"#;
+        fs::write(&mock_pkgutil, mock_script).unwrap();
+        let mut perms = fs::metadata(&mock_pkgutil).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mock_pkgutil, perms).unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_path = env::var_os("PATH").unwrap_or_default();
+        let mut new_path = mock_bin_dir.into_os_string();
+        new_path.push(":");
+        new_path.push(&old_path);
+        env::set_var("PATH", new_path);
+
+        let res = installer
+            .install_pkg(&staging, &mut rollback, source_rel)
+            .await;
+
+        env::set_var("PATH", old_path);
+
+        assert!(res.is_err(), "install_pkg should reject unsigned PKG");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Status: no signature")
+                || err_msg.contains("signature verification failed"),
+            "Error message should mention signature failure, got: {}",
+            err_msg
+        );
     }
 }
