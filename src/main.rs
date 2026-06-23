@@ -639,24 +639,13 @@ fn print_error_and_exit(err: error::WaxError) -> ! {
     std::process::exit(1);
 }
 
-async fn run() -> Result<()> {
-    let action_timer = Instant::now();
-    let cli = Cli::parse();
-
-    if should_refresh_state(&cli.command) {
-        refresh_state_in_child_process().await;
-    }
-
-    signal::install_handler();
-    init_logging(cli.verbose)?;
-
-    let command = cli.command;
-    let command_prints_own_timing = command_prints_timing(&command);
-    let api_client = ApiClient::new();
-    let cache = Cache::new()?;
-    timing::set_enabled(cli.time_to_action);
-
-    let result = match command {
+async fn execute_command(
+    command: Commands,
+    cli_yes: bool,
+    api_client: &ApiClient,
+    cache: &Cache,
+) -> Result<()> {
+    match command {
         Commands::Update {
             action,
             mut update_self,
@@ -683,7 +672,7 @@ async fn run() -> Result<()> {
             if update_self {
                 run_self_update(nightly, force, clean, no_clean).await
             } else {
-                commands::update::update(&api_client, &cache).await
+                commands::update::update(api_client, cache).await
             }
         }
         Commands::SelfUpdate {
@@ -692,15 +681,15 @@ async fn run() -> Result<()> {
             clean,
             no_clean,
         } => run_self_update(nightly, force, clean, no_clean).await,
-        Commands::Search { query } => commands::search::search(&cache, &query).await,
+        Commands::Search { query } => commands::search::search(cache, &query).await,
         Commands::Info { formula, cask } => {
-            commands::info::info(&api_client, &cache, &formula, cask).await
+            commands::info::info(api_client, cache, &formula, cask).await
         }
         Commands::List {
             query,
             user,
             global,
-        } => commands::list::list(&cache, query, install_scope(user, global)?).await,
+        } => commands::list::list(cache, query, install_scope(user, global)?).await,
         Commands::Install {
             packages,
             dry_run,
@@ -714,13 +703,13 @@ async fn run() -> Result<()> {
         } => {
             if packages.is_empty() && !cask {
                 // No packages specified — sync from lockfile like `npm install`
-                commands::sync::sync(&cache).await
+                commands::sync::sync(cache).await
             } else {
                 commands::install::install(
-                    &cache,
+                    cache,
                     &packages,
                     dry_run,
-                    ask && !cli.yes,
+                    ask && !cli_yes,
                     cask,
                     user,
                     global,
@@ -740,10 +729,10 @@ async fn run() -> Result<()> {
             no_script,
         } => {
             commands::install::install(
-                &cache,
+                cache,
                 &packages,
                 dry_run,
-                ask && !cli.yes,
+                ask && !cli_yes,
                 true,
                 user,
                 global,
@@ -758,17 +747,17 @@ async fn run() -> Result<()> {
             dry_run,
             cask,
             all,
-        } => commands::uninstall::uninstall(&cache, &formulae, dry_run, cask, cli.yes, all).await,
+        } => commands::uninstall::uninstall(cache, &formulae, dry_run, cask, cli_yes, all).await,
         Commands::Reinstall {
             packages,
             cask,
             all,
-        } => commands::reinstall::reinstall(&cache, &packages, cask, all).await,
+        } => commands::reinstall::reinstall(cache, &packages, cask, all).await,
         Commands::Postinstall {
             formulae,
             user,
             global,
-        } => commands::install::postinstall(&cache, &formulae, user, global).await,
+        } => commands::install::postinstall(cache, &formulae, user, global).await,
         Commands::Upgrade {
             packages,
             upgrade_self,
@@ -789,10 +778,10 @@ async fn run() -> Result<()> {
             let explicit_packages_requested = !packages.is_empty();
 
             commands::upgrade::upgrade(
-                &cache,
+                cache,
                 &packages,
                 dry_run,
-                ask && !cli.yes,
+                ask && !cli_yes,
                 install_scope(user, global)?,
             )
             .await?;
@@ -830,34 +819,34 @@ async fn run() -> Result<()> {
             }
         },
         Commands::Outdated { user, global } => {
-            commands::outdated::outdated(&cache, install_scope(user, global)?).await
+            commands::outdated::outdated(cache, install_scope(user, global)?).await
         }
         Commands::Link { packages } => commands::link::link(&packages).await,
         Commands::Unlink { packages } => commands::link::unlink(&packages).await,
         Commands::Cleanup { dry_run } => commands::cleanup::cleanup(dry_run).await,
-        Commands::Leaves => commands::leaves::leaves(&cache).await,
+        Commands::Leaves => commands::leaves::leaves(cache).await,
         Commands::Uses { formula, installed } => {
-            commands::uses::uses(&cache, &formula, installed).await
+            commands::uses::uses(cache, &formula, installed).await
         }
         Commands::Deps {
             formula,
             tree,
             installed,
-        } => commands::show_deps::deps(&cache, &formula, tree, installed).await,
+        } => commands::show_deps::deps(cache, &formula, tree, installed).await,
         Commands::Pin { packages } => commands::pin::pin(&packages).await,
         Commands::Unpin { packages } => commands::pin::unpin(&packages).await,
-        Commands::Lock => commands::lock::lock(&cache).await,
-        Commands::__RefreshState => commands::refresh::refresh(&cache).await,
-        Commands::Sync => commands::sync::sync(&cache).await,
-        Commands::Tap { action, repair } => commands::tap::tap(action, repair, Some(&cache)).await,
-        Commands::Doctor { fix, full } => commands::doctor::doctor(&cache, fix, full).await,
+        Commands::Lock => commands::lock::lock(cache).await,
+        Commands::__RefreshState => commands::refresh::refresh(cache).await,
+        Commands::Sync => commands::sync::sync(cache).await,
+        Commands::Tap { action, repair } => commands::tap::tap(action, repair, Some(cache)).await,
+        Commands::Doctor { fix, full } => commands::doctor::doctor(cache, fix, full).await,
         Commands::Bundle {
             file,
             dry_run,
             action,
         } => match action {
-            Some(BundleAction::Dump) => commands::bundle::bundle_dump(&cache).await,
-            None => commands::bundle::bundle(&cache, file.as_deref(), dry_run).await,
+            Some(BundleAction::Dump) => commands::bundle::bundle_dump(cache).await,
+            None => commands::bundle::bundle(cache, file.as_deref(), dry_run).await,
         },
         Commands::Services { action } => match action {
             Some(ServicesAction::List) | None => commands::services::services_list().await,
@@ -871,13 +860,31 @@ async fn run() -> Result<()> {
                 commands::services::services_restart(&formula, nice).await
             }
         },
-        Commands::Source { formula } => commands::source::source(&cache, &formula).await,
+        Commands::Source { formula } => commands::source::source(cache, &formula).await,
         Commands::Completions { shell, print } => commands::completions::completions(shell, print),
-        Commands::Why { formula } => {
-            commands::info::info(&api_client, &cache, &formula, false).await
-        }
-        Commands::Audit => commands::audit::audit(&cache).await,
-    };
+        Commands::Why { formula } => commands::info::info(api_client, cache, &formula, false).await,
+        Commands::Audit => commands::audit::audit(cache).await,
+    }
+}
+
+async fn run() -> Result<()> {
+    let action_timer = Instant::now();
+    let cli = Cli::parse();
+
+    if should_refresh_state(&cli.command) {
+        refresh_state_in_child_process().await;
+    }
+
+    signal::install_handler();
+    init_logging(cli.verbose)?;
+
+    let command = cli.command;
+    let command_prints_own_timing = command_prints_timing(&command);
+    let api_client = ApiClient::new();
+    let cache = Cache::new()?;
+    timing::set_enabled(cli.time_to_action);
+
+    let result = execute_command(command, cli.yes, &api_client, &cache).await;
 
     result?;
 
