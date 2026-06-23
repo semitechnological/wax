@@ -53,6 +53,67 @@ pub async fn info(api_client: &ApiClient, cache: &Cache, name: &str, cask: bool)
         .find(|f| f.name == name || f.full_name == name)
         .ok_or_else(|| WaxError::FormulaNotFound(name.to_string()))?;
 
+    print_formula_details(formula);
+
+    print_formula_installation_state(name, formula, &formulae).await?;
+
+    Ok(())
+}
+
+async fn print_formula_installation_state(
+    name: &str,
+    formula: &crate::api::Formula,
+    formulae: &[crate::api::Formula],
+) -> Result<()> {
+    // Show "why installed" section if the package is installed locally
+    let state = InstallState::new()?;
+    let installed_packages = state.load().await?;
+    let installed_pkg = installed_packages
+        .get(name)
+        .or_else(|| installed_packages.get(formula.full_name.as_str()))
+        .or_else(|| installed_packages.get(&formula.name));
+    if let Some(pkg) = installed_pkg {
+        println!();
+        let installed_names: HashSet<String> = installed_packages.keys().cloned().collect();
+        let dependents: Vec<&str> = formulae
+            .iter()
+            .filter(|f| {
+                installed_names.contains(&f.name)
+                    && f.dependencies
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|d| d == name)
+            })
+            .map(|f| f.name.as_str())
+            .collect();
+
+        if dependents.is_empty() {
+            println!("{} installed explicitly", style("installed:").dim());
+        } else {
+            println!("{} required by:", style("installed:").dim());
+            for dep in &dependents {
+                println!("  {} {}", style("←").dim(), style(dep).cyan());
+            }
+        }
+
+        if pkg.from_source {
+            println!("  built from source");
+        }
+        if pkg.pinned {
+            println!("  {}", style("pinned").yellow());
+        }
+
+        let cellar_path = pkg.install_mode.cellar_path()?;
+        let package_path = cellar_path.join(&pkg.name).join(&pkg.version);
+        println!();
+        println!("{} {}", style("path:").dim(), package_path.display());
+    }
+
+    Ok(())
+}
+
+fn print_formula_details(formula: &crate::api::Formula) {
     let installed_suffix = if let Some(installed) = &formula.installed {
         if !installed.is_empty() {
             let installed_versions: Vec<_> = installed.iter().map(|i| i.version.as_str()).collect();
@@ -115,53 +176,6 @@ pub async fn info(api_client: &ApiClient, cache: &Cache, name: &str, cask: bool)
         println!();
         println!("no precompiled bottle available (will build from source)");
     }
-
-    // Show "why installed" section if the package is installed locally
-    let state = InstallState::new()?;
-    let installed_packages = state.load().await?;
-    let installed_pkg = installed_packages
-        .get(name)
-        .or_else(|| installed_packages.get(formula.full_name.as_str()))
-        .or_else(|| installed_packages.get(&formula.name));
-    if let Some(pkg) = installed_pkg {
-        println!();
-        let installed_names: HashSet<String> = installed_packages.keys().cloned().collect();
-        let dependents: Vec<&str> = formulae
-            .iter()
-            .filter(|f| {
-                installed_names.contains(&f.name)
-                    && f.dependencies
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|d| d == name)
-            })
-            .map(|f| f.name.as_str())
-            .collect();
-
-        if dependents.is_empty() {
-            println!("{} installed explicitly", style("installed:").dim());
-        } else {
-            println!("{} required by:", style("installed:").dim());
-            for dep in &dependents {
-                println!("  {} {}", style("←").dim(), style(dep).cyan());
-            }
-        }
-
-        if pkg.from_source {
-            println!("  built from source");
-        }
-        if pkg.pinned {
-            println!("  {}", style("pinned").yellow());
-        }
-
-        let cellar_path = pkg.install_mode.cellar_path()?;
-        let package_path = cellar_path.join(&pkg.name).join(&pkg.version);
-        println!();
-        println!("{} {}", style("path:").dim(), package_path.display());
-    }
-
-    Ok(())
 }
 
 #[instrument(skip(api_client, cache))]
