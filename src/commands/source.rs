@@ -4,6 +4,14 @@ use console::style;
 use std::collections::HashMap;
 use tracing::instrument;
 
+fn is_safe_url(url_str: &str) -> bool {
+    if let Ok(url) = reqwest::Url::parse(url_str) {
+        matches!(url.scheme(), "http" | "https")
+    } else {
+        false
+    }
+}
+
 #[instrument(skip(cache))]
 pub async fn source(cache: &Cache, formula_name: &str) -> Result<()> {
     cache.ensure_fresh().await?;
@@ -23,6 +31,14 @@ pub async fn source(cache: &Cache, formula_name: &str) -> Result<()> {
 
     if let Some(formula) = formula_index.get(formula_name) {
         let homepage = &formula.homepage;
+
+        if !is_safe_url(homepage) {
+            return Err(WaxError::InvalidInput(format!(
+                "Invalid or unsafe homepage URL: {}",
+                homepage
+            )));
+        }
+
         println!(
             "{} → {}",
             style(formula_name).magenta(),
@@ -44,6 +60,14 @@ pub async fn source(cache: &Cache, formula_name: &str) -> Result<()> {
 
     if let Some(cask) = cask_index.get(formula_name) {
         let homepage = &cask.homepage;
+
+        if !is_safe_url(homepage) {
+            return Err(WaxError::InvalidInput(format!(
+                "Invalid or unsafe homepage URL: {}",
+                homepage
+            )));
+        }
+
         println!(
             "{} {} → {}",
             style(formula_name).magenta(),
@@ -65,4 +89,22 @@ pub async fn source(cache: &Cache, formula_name: &str) -> Result<()> {
     }
 
     Err(WaxError::FormulaNotFound(formula_name.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_url() {
+        assert!(is_safe_url("http://example.com"));
+        assert!(is_safe_url("https://example.com/path?query=1"));
+
+        assert!(!is_safe_url("file:///etc/passwd"));
+        assert!(!is_safe_url("ftp://example.com"));
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("-a Terminal"));
+        assert!(!is_safe_url("/usr/bin/local"));
+        assert!(!is_safe_url("example.com")); // Missing scheme
+    }
 }
