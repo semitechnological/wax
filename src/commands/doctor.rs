@@ -78,6 +78,28 @@ struct Check {
     run: BoxFuture<'static, DiagResult>,
 }
 
+impl Check {
+    fn new_sync<F>(title: &'static str, f: F) -> Self
+    where
+        F: FnOnce() -> DiagResult + Send + 'static,
+    {
+        Self {
+            title,
+            run: Box::pin(async move { tokio::task::spawn_blocking(f).await.unwrap() }),
+        }
+    }
+
+    fn new_async<Fut>(title: &'static str, fut: Fut) -> Self
+    where
+        Fut: std::future::Future<Output = DiagResult> + Send + 'static,
+    {
+        Self {
+            title,
+            run: Box::pin(fut),
+        }
+    }
+}
+
 async fn check_wax_update(fix: bool) -> DiagResult {
     let mut d = DiagResult::new(fix);
     match tokio::time::timeout(
@@ -124,105 +146,35 @@ fn build_checks(cache: &Cache, fix: bool, run_full_checks: bool) -> Vec<Check> {
     let cache_for_check = cache.clone();
     let cache_for_cask_metadata = cache.clone();
     let mut checks: Vec<Check> = vec![
-        Check {
-            title: "platform",
-            run: Box::pin(async move {
-                tokio::task::spawn_blocking(move || check_platform(fix))
-                    .await
-                    .unwrap()
-            }),
-        },
-        Check {
-            title: "prefix",
-            run: Box::pin(async move {
-                tokio::task::spawn_blocking(move || check_prefix(fix))
-                    .await
-                    .unwrap()
-            }),
-        },
-        Check {
-            title: "cellar",
-            run: Box::pin(async move { check_cellar(fix).await }),
-        },
-        Check {
-            title: "symlink dirs",
-            run: Box::pin(async move { check_symlink_dirs(fix).await }),
-        },
-        Check {
-            title: "cache",
-            run: Box::pin(async move { check_cache(&cache_for_check, fix).await }),
-        },
-        Check {
-            title: "install state",
-            run: Box::pin(async move { check_install_state(fix).await }),
-        },
-        Check {
-            title: "cask state",
-            run: Box::pin(async move { check_cask_state(fix).await }),
-        },
-        Check {
-            title: "cask metadata",
-            run: Box::pin(async move { check_cask_metadata(&cache_for_cask_metadata, fix).await }),
-        },
-        Check {
-            title: "state consistency",
-            run: Box::pin(async move { check_state_consistency(fix).await }),
-        },
-        Check {
-            title: "broken symlinks",
-            run: Box::pin(async move { check_broken_symlinks(fix).await }),
-        },
-        Check {
-            title: "opt symlinks",
-            run: Box::pin(async move { check_opt_symlinks(fix).await }),
-        },
-        Check {
-            title: "tools",
-            run: Box::pin(async move {
-                tokio::task::spawn_blocking(move || check_tools(fix))
-                    .await
-                    .unwrap()
-            }),
-        },
-        Check {
-            title: "glibc",
-            run: Box::pin(async move {
-                tokio::task::spawn_blocking(move || check_glibc_version(fix))
-                    .await
-                    .unwrap()
-            }),
-        },
-        Check {
-            title: "gpu",
-            run: Box::pin(async move {
-                tokio::task::spawn_blocking(move || check_metal_toolchain(fix))
-                    .await
-                    .unwrap()
-            }),
-        },
+        Check::new_sync("platform", move || check_platform(fix)),
+        Check::new_sync("prefix", move || check_prefix(fix)),
+        Check::new_async("cellar", check_cellar(fix)),
+        Check::new_async("symlink dirs", check_symlink_dirs(fix)),
+        Check::new_async(
+            "cache",
+            async move { check_cache(&cache_for_check, fix).await },
+        ),
+        Check::new_async("install state", check_install_state(fix)),
+        Check::new_async("cask state", check_cask_state(fix)),
+        Check::new_async("cask metadata", async move {
+            check_cask_metadata(&cache_for_cask_metadata, fix).await
+        }),
+        Check::new_async("state consistency", check_state_consistency(fix)),
+        Check::new_async("broken symlinks", check_broken_symlinks(fix)),
+        Check::new_async("opt symlinks", check_opt_symlinks(fix)),
+        Check::new_sync("tools", move || check_tools(fix)),
+        Check::new_sync("glibc", move || check_glibc_version(fix)),
+        Check::new_sync("gpu", move || check_metal_toolchain(fix)),
     ];
 
     if run_full_checks {
-        checks.push(Check {
-            title: "wax update",
-            run: Box::pin(async move { check_wax_update(fix).await }),
-        });
-        checks.push(Check {
-            title: "unrelocated bottles",
-            run: Box::pin(async move {
-                tokio::task::spawn_blocking(move || check_unrelocated_bottles(fix))
-                    .await
-                    .unwrap()
-            }),
-        });
-        checks.push(Check {
-            title: "code signatures",
-            run: Box::pin(async move {
-                tokio::task::spawn_blocking(move || check_invalid_signatures(fix))
-                    .await
-                    .unwrap()
-            }),
-        });
+        checks.push(Check::new_async("wax update", check_wax_update(fix)));
+        checks.push(Check::new_sync("unrelocated bottles", move || {
+            check_unrelocated_bottles(fix)
+        }));
+        checks.push(Check::new_sync("code signatures", move || {
+            check_invalid_signatures(fix)
+        }));
     }
 
     checks
