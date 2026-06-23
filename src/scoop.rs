@@ -10,6 +10,7 @@
 use crate::bottle::BottleDownloader;
 use crate::error::{Result, WaxError};
 use crate::package_spec::Ecosystem;
+use crate::ui::copy_dir_all;
 use crate::windows_state::{self, WindowsPackageManifest};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
@@ -322,8 +323,42 @@ pub async fn install_from_bucket(package: &str, bucket_base: Option<&str>) -> Re
     };
     let archive_path = tmp.path().join(format!("download.{ext}"));
 
+    download_scoop_artifact(
+        &resolved.download_url,
+        &archive_path,
+        package,
+        &resolved.version,
+    )
+    .await?;
+
+    BottleDownloader::verify_checksum(&archive_path, &resolved.sha256)?;
+
+    let version_dir =
+        extract_and_stage_scoop_artifact(&archive_path, kind, tmp.path(), package, &resolved)?;
+
+    let bin_dir = windows_state::wax_bin_dir()?;
+    let bin_links = setup_scoop_binaries(&version_dir, &bin_dir, package, &resolved)?;
+
+    save_scoop_manifest(package, &resolved, &version_dir, bin_links)?;
+
+    println!(
+        "Installed {} {} (Scoop manifest) — add to PATH if needed:\n  {}",
+        package,
+        resolved.version,
+        bin_dir.display()
+    );
+
+    Ok(())
+}
+
+async fn download_scoop_artifact(
+    download_url: &str,
+    archive_path: &Path,
+    package: &str,
+    version: &str,
+) -> Result<()> {
     let dl = BottleDownloader::new();
-    let size = dl.probe_size(&resolved.download_url).await;
+    let size = dl.probe_size(download_url).await;
     let conns =
         BottleDownloader::num_connections(size, BottleDownloader::MAX_CONNECTIONS_PER_DOWNLOAD);
     let pb = ProgressBar::new(0);
@@ -333,25 +368,84 @@ pub async fn install_from_bucket(package: &str, bucket_base: Option<&str>) -> Re
             .unwrap()
             .progress_chars("=>-"),
     );
-    pb.set_message(format!("{} {}", package, resolved.version));
+    pb.set_message(format!("{} {}", package, version));
 
-    dl.download(
-        &resolved.download_url,
-        &archive_path,
-        Some(&pb),
-        conns,
-        None,
-    )
-    .await?;
+    dl.download(download_url, archive_path, Some(&pb), conns, None)
+        .await?;
     pb.finish_and_clear();
 
-    BottleDownloader::verify_checksum(&archive_path, &resolved.sha256)?;
+    Ok(())
+}
 
-    let extract_root = tmp.path().join("extract");
+fn save_scoop_manifest(
+    package: &str,
+    resolved: &ResolvedScoopPackage,
+    version_dir: &Path,
+    bin_links: Vec<PathBuf>,
+) -> Result<()> {
+    let mut files = windows_state::collect_files(version_dir)?;
+    files.extend(bin_links.iter().cloned());
+    WindowsPackageManifest::new(
+        Ecosystem::Scoop,
+        package,
+        resolved.version.clone(),
+        resolved.download_url.clone(),
+        version_dir.to_path_buf(),
+        bin_links,
+        files,
+    )
+    .save()?;
+    Ok(())
+}
+
+fn setup_scoop_binaries(
+    version_dir: &Path,
+    bin_dir: &Path,
+    package: &str,
+    resolved: &ResolvedScoopPackage,
+) -> Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(bin_dir)?;
+
+    let mut copy_actions = Vec::new();
+    for rel in &resolved.bin_paths {
+        let src = join_under_root(version_dir, rel)?;
+        if !src.exists() {
+            return Err(WaxError::InstallError(format!(
+                "Expected binary missing after extract: {}",
+                src.display()
+            )));
+        }
+        let file_name = src
+            .file_name()
+            .ok_or_else(|| WaxError::InstallError("Invalid bin path".into()))?;
+        let dest = bin_dir.join(file_name);
+        copy_actions.push((src, dest));
+    }
+    let bin_links: Vec<PathBuf> = copy_actions.iter().map(|(_, dest)| dest.clone()).collect();
+    windows_state::validate_bin_links_available(Ecosystem::Scoop, package, &bin_links)?;
+
+    for (src, dest) in copy_actions {
+        if dest.exists() {
+            std::fs::remove_file(&dest)?;
+        }
+        std::fs::copy(&src, &dest)?;
+    }
+
+    Ok(bin_links)
+}
+
+fn extract_and_stage_scoop_artifact(
+    archive_path: &Path,
+    kind: &str,
+    tmp_path: &Path,
+    package: &str,
+    resolved: &ResolvedScoopPackage,
+) -> Result<PathBuf> {
+    let extract_root = tmp_path.join("extract");
     std::fs::create_dir_all(&extract_root)?;
     match kind {
-        "zip" => extract_zip_file(&archive_path, &extract_root)?,
-        "tar.gz" => extract_tar_gz(&archive_path, &extract_root)?,
+        "zip" => extract_zip_file(archive_path, &extract_root)?,
+        "tar.gz" => extract_tar_gz(archive_path, &extract_root)?,
         _ => unreachable!(),
     }
 
@@ -375,55 +469,7 @@ pub async fn install_from_bucket(package: &str, bucket_base: Option<&str>) -> Re
     // Move extract_root contents: copy `source_tree` -> `version_dir`
     copy_dir_all(&source_tree, &version_dir)?;
 
-    let bin_dir = windows_state::wax_bin_dir()?;
-    std::fs::create_dir_all(&bin_dir)?;
-
-    let mut copy_actions = Vec::new();
-    for rel in &resolved.bin_paths {
-        let src = join_under_root(&version_dir, rel)?;
-        if !src.exists() {
-            return Err(WaxError::InstallError(format!(
-                "Expected binary missing after extract: {}",
-                src.display()
-            )));
-        }
-        let file_name = src
-            .file_name()
-            .ok_or_else(|| WaxError::InstallError("Invalid bin path".into()))?;
-        let dest = bin_dir.join(file_name);
-        copy_actions.push((src, dest));
-    }
-    let bin_links: Vec<PathBuf> = copy_actions.iter().map(|(_, dest)| dest.clone()).collect();
-    windows_state::validate_bin_links_available(Ecosystem::Scoop, package, &bin_links)?;
-
-    for (src, dest) in copy_actions {
-        if dest.exists() {
-            std::fs::remove_file(&dest)?;
-        }
-        std::fs::copy(&src, &dest)?;
-    }
-
-    let mut files = windows_state::collect_files(&version_dir)?;
-    files.extend(bin_links.iter().cloned());
-    WindowsPackageManifest::new(
-        Ecosystem::Scoop,
-        package,
-        resolved.version.clone(),
-        resolved.download_url.clone(),
-        version_dir.clone(),
-        bin_links,
-        files,
-    )
-    .save()?;
-
-    println!(
-        "Installed {} {} (Scoop manifest) — add to PATH if needed:\n  {}",
-        package,
-        resolved.version,
-        bin_dir.display()
-    );
-
-    Ok(())
+    Ok(version_dir)
 }
 
 fn wax_user_root() -> Result<PathBuf> {
