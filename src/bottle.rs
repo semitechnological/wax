@@ -561,100 +561,10 @@ impl BottleDownloader {
 
             match entry.header().entry_type() {
                 t if t.is_symlink() => {
-                    #[cfg(unix)]
-                    {
-                        let link_name = entry.link_name()?.ok_or_else(|| {
-                            WaxError::InstallError(format!(
-                                "Symlink entry has no link name: {}",
-                                path.display()
-                            ))
-                        })?;
-                        // Validate symlink target: reject absolute paths and
-                        // parent-dir traversals that could escape the dest.
-                        let target = Path::new(&*link_name);
-                        if target.is_absolute() {
-                            return Err(WaxError::InstallError(format!(
-                                "Symlink target is absolute (path traversal): {}",
-                                link_name.display()
-                            )));
-                        }
-                        // Resolve the symlink target relative to the entry's
-                        // parent and ensure it stays within canonical_dest.
-                        if let Some(parent) = full_path.parent() {
-                            let resolved = parent.join(&*link_name);
-                            let mut normalized = PathBuf::new();
-                            for component in resolved.components() {
-                                match component {
-                                    std::path::Component::CurDir => {}
-                                    std::path::Component::ParentDir => {
-                                        if !normalized.pop() {
-                                            return Err(WaxError::InstallError(format!(
-                                                "Symlink target escapes destination via parent traversal: {} -> {}",
-                                                path.display(),
-                                                link_name.display()
-                                            )));
-                                        }
-                                    }
-                                    _ => normalized.push(component),
-                                }
-                            }
-                            if !normalized.starts_with(&canonical_dest) {
-                                tracing::warn!(
-                                    "Skipping symlink that points outside bottle: {} -> {}",
-                                    path.display(),
-                                    link_name.display()
-                                );
-                            } else {
-                                std::fs::create_dir_all(parent)?;
-                                if full_path.symlink_metadata().is_ok() {
-                                    std::fs::remove_file(&full_path)?;
-                                }
-                                std::os::unix::fs::symlink(&*link_name, &full_path)?;
-                            }
-                        } else {
-                            if full_path.symlink_metadata().is_ok() {
-                                std::fs::remove_file(&full_path)?;
-                            }
-                            std::os::unix::fs::symlink(&*link_name, &full_path)?;
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        return Err(WaxError::InstallError(format!(
-                            "Symlinks not supported on this platform: {}",
-                            path.display()
-                        )));
-                    }
+                    Self::extract_symlink(&entry, &path, &full_path, &canonical_dest)?;
                 }
                 t if t.is_hard_link() => {
-                    let link_name = entry.link_name()?.ok_or_else(|| {
-                        WaxError::InstallError(format!(
-                            "Hard link entry has no link name: {}",
-                            path.display()
-                        ))
-                    })?;
-                    let target = Path::new(&*link_name);
-                    if target.is_absolute()
-                        || target
-                            .components()
-                            .any(|c| c == std::path::Component::ParentDir)
-                    {
-                        return Err(WaxError::InstallError(format!(
-                            "Hard link target escapes destination: {}",
-                            link_name.display()
-                        )));
-                    }
-                    let link_target = canonical_dest.join(&*link_name);
-                    if !link_target.starts_with(&canonical_dest) {
-                        return Err(WaxError::InstallError(format!(
-                            "Hard link target escapes destination: {}",
-                            link_name.display()
-                        )));
-                    }
-                    if let Some(parent) = full_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::hard_link(&link_target, &full_path)?;
+                    Self::extract_hard_link(&entry, &path, &full_path, &canonical_dest)?;
                 }
                 _ if entry.header().entry_type().is_dir() => {
                     std::fs::create_dir_all(&full_path)?;
@@ -669,6 +579,116 @@ impl BottleDownloader {
         }
 
         debug!("Extraction complete");
+        Ok(())
+    }
+
+    fn extract_symlink<R: std::io::Read>(
+        #[cfg(unix)] entry: &tar::Entry<'_, R>,
+        path: &Path,
+        #[cfg(unix)] full_path: &Path,
+        #[cfg(unix)] canonical_dest: &Path,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let link_name = entry.link_name()?.ok_or_else(|| {
+                WaxError::InstallError(format!(
+                    "Symlink entry has no link name: {}",
+                    path.display()
+                ))
+            })?;
+            // Validate symlink target: reject absolute paths and
+            // parent-dir traversals that could escape the dest.
+            let target = Path::new(&*link_name);
+            if target.is_absolute() {
+                return Err(WaxError::InstallError(format!(
+                    "Symlink target is absolute (path traversal): {}",
+                    link_name.display()
+                )));
+            }
+            // Resolve the symlink target relative to the entry's
+            // parent and ensure it stays within canonical_dest.
+            if let Some(parent) = full_path.parent() {
+                let resolved = parent.join(&*link_name);
+                let mut normalized = PathBuf::new();
+                for component in resolved.components() {
+                    match component {
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            if !normalized.pop() {
+                                return Err(WaxError::InstallError(format!(
+                                    "Symlink target escapes destination via parent traversal: {} -> {}",
+                                    path.display(),
+                                    link_name.display()
+                                )));
+                            }
+                        }
+                        _ => normalized.push(component),
+                    }
+                }
+                if !normalized.starts_with(canonical_dest) {
+                    tracing::warn!(
+                        "Skipping symlink that points outside bottle: {} -> {}",
+                        path.display(),
+                        link_name.display()
+                    );
+                } else {
+                    std::fs::create_dir_all(parent)?;
+                    if full_path.symlink_metadata().is_ok() {
+                        std::fs::remove_file(full_path)?;
+                    }
+                    std::os::unix::fs::symlink(&*link_name, full_path)?;
+                }
+            } else {
+                if full_path.symlink_metadata().is_ok() {
+                    std::fs::remove_file(full_path)?;
+                }
+                std::os::unix::fs::symlink(&*link_name, full_path)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(WaxError::InstallError(format!(
+                "Symlinks not supported on this platform: {}",
+                path.display()
+            )));
+        }
+    }
+
+    fn extract_hard_link<R: std::io::Read>(
+        entry: &tar::Entry<'_, R>,
+        path: &Path,
+        full_path: &Path,
+        canonical_dest: &Path,
+    ) -> Result<()> {
+        let link_name = entry.link_name()?.ok_or_else(|| {
+            WaxError::InstallError(format!(
+                "Hard link entry has no link name: {}",
+                path.display()
+            ))
+        })?;
+        let target = Path::new(&*link_name);
+        if target.is_absolute()
+            || target
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(WaxError::InstallError(format!(
+                "Hard link target escapes destination: {}",
+                link_name.display()
+            )));
+        }
+        let link_target = canonical_dest.join(&*link_name);
+        if !link_target.starts_with(canonical_dest) {
+            return Err(WaxError::InstallError(format!(
+                "Hard link target escapes destination: {}",
+                link_name.display()
+            )));
+        }
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::hard_link(&link_target, full_path)?;
         Ok(())
     }
 
