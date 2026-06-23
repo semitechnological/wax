@@ -794,10 +794,8 @@ fn collect_broken_symlinks_recursive(dir: &Path) -> Vec<std::path::PathBuf> {
     broken
 }
 
-async fn check_opt_symlinks(fix: bool) -> DiagResult {
-    let mut d = DiagResult::new(fix);
+fn find_missing_opt_symlinks() -> Vec<(String, std::path::PathBuf, InstallMode)> {
     let mut missing_opt = Vec::new();
-    let mut relinked = 0usize;
 
     for mode in &[InstallMode::Global, InstallMode::User] {
         let cellar = match mode.cellar_path() {
@@ -843,6 +841,56 @@ async fn check_opt_symlinks(fix: bool) -> DiagResult {
             }
         }
     }
+    missing_opt
+}
+
+async fn fix_missing_opt_symlinks(
+    missing_opt: &[(String, std::path::PathBuf, InstallMode)],
+    d: &mut DiagResult,
+) -> usize {
+    let mut relinked = 0usize;
+    for (name, pkg_dir, mode) in missing_opt {
+        // Find the latest version directory
+        let versions: Vec<String> = match std::fs::read_dir(pkg_dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect(),
+            Err(_) => continue,
+        };
+        if versions.is_empty() {
+            continue;
+        }
+        let mut sorted = versions;
+        crate::version::sort_versions(&mut sorted);
+        let Some(version) = sorted.last().cloned() else {
+            continue;
+        };
+
+        let cellar = match mode.cellar_path() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        match create_symlinks(name, &version, &cellar, false, *mode).await {
+            Ok(_) => {
+                relinked += 1;
+                if relinked <= 10 {
+                    d.fixed(&format!("relinked {}@{}", name, version));
+                }
+            }
+            Err(e) => {
+                d.fail(&format!("failed to relink {}: {}", name, e));
+            }
+        }
+    }
+    relinked
+}
+
+async fn check_opt_symlinks(fix: bool) -> DiagResult {
+    let mut d = DiagResult::new(fix);
+    let missing_opt = find_missing_opt_symlinks();
 
     if missing_opt.is_empty() {
         d.pass("all cellar packages have opt/ symlinks");
@@ -851,42 +899,7 @@ async fn check_opt_symlinks(fix: bool) -> DiagResult {
             "{} packages missing opt/ symlinks — relinking...",
             missing_opt.len()
         ));
-        for (name, pkg_dir, mode) in &missing_opt {
-            // Find the latest version directory
-            let versions: Vec<String> = match std::fs::read_dir(pkg_dir) {
-                Ok(entries) => entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect(),
-                Err(_) => continue,
-            };
-            if versions.is_empty() {
-                continue;
-            }
-            let mut sorted = versions;
-            crate::version::sort_versions(&mut sorted);
-            let Some(version) = sorted.last().cloned() else {
-                continue;
-            };
-
-            let cellar = match mode.cellar_path() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            match create_symlinks(name, &version, &cellar, false, *mode).await {
-                Ok(_) => {
-                    relinked += 1;
-                    if relinked <= 10 {
-                        d.fixed(&format!("relinked {}@{}", name, version));
-                    }
-                }
-                Err(e) => {
-                    d.fail(&format!("failed to relink {}: {}", name, e));
-                }
-            }
-        }
+        let relinked = fix_missing_opt_symlinks(&missing_opt, &mut d).await;
         if relinked > 10 {
             d.fixed(&format!("... and {} more packages relinked", relinked - 10));
         }
