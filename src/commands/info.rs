@@ -187,15 +187,7 @@ async fn info_cask(api_client: &ApiClient, cache: &Cache, name: &str) -> Result<
         .or_else(|| installed_casks.get(&cask_summary.token))
         .map(|i| &i.version);
 
-    let installed_suffix = if let Some(installed_ver) = installed_version {
-        if installed_ver == &cask.version {
-            " · installed".to_string()
-        } else {
-            format!(" · installed ({})", installed_ver)
-        }
-    } else {
-        String::new()
-    };
+    let installed_suffix = format_installed_cask_suffix(installed_version, &cask.version);
 
     println!();
     println!(
@@ -221,32 +213,7 @@ async fn info_cask(api_client: &ApiClient, cache: &Cache, name: &str) -> Result<
     println!("{}", &cask.url);
 
     if let Some(artifacts) = &cask.artifacts {
-        let artifact_types: Vec<String> = artifacts
-            .iter()
-            .map(|a| match a {
-                crate::api::CaskArtifact::App { .. } => "app".to_string(),
-                crate::api::CaskArtifact::Pkg { .. } => "pkg".to_string(),
-                crate::api::CaskArtifact::Binary { .. } => "binary".to_string(),
-                crate::api::CaskArtifact::Font { .. } => "font".to_string(),
-                crate::api::CaskArtifact::Manpage { .. } => "manpage".to_string(),
-                crate::api::CaskArtifact::Dictionary { .. } => "dictionary".to_string(),
-                crate::api::CaskArtifact::Colorpicker { .. } => "colorpicker".to_string(),
-                crate::api::CaskArtifact::Prefpane { .. } => "prefpane".to_string(),
-                crate::api::CaskArtifact::Qlplugin { .. } => "qlplugin".to_string(),
-                crate::api::CaskArtifact::ScreenSaver { .. } => "screen_saver".to_string(),
-                crate::api::CaskArtifact::Service { .. } => "service".to_string(),
-                crate::api::CaskArtifact::Suite { .. } => "suite".to_string(),
-                crate::api::CaskArtifact::Artifact { .. } => "artifact".to_string(),
-                crate::api::CaskArtifact::BashCompletion { .. } => "bash_completion".to_string(),
-                crate::api::CaskArtifact::ZshCompletion { .. } => "zsh_completion".to_string(),
-                crate::api::CaskArtifact::FishCompletion { .. } => "fish_completion".to_string(),
-                crate::api::CaskArtifact::Uninstall { .. } => "uninstall".to_string(),
-                crate::api::CaskArtifact::Zap { .. } => "zap".to_string(),
-                crate::api::CaskArtifact::Preflight { .. } => "preflight".to_string(),
-                crate::api::CaskArtifact::Postflight { .. } => "postflight".to_string(),
-                crate::api::CaskArtifact::Other(_) => "other".to_string(),
-            })
-            .collect();
+        let artifact_types = format_cask_artifacts(artifacts);
 
         if !artifact_types.is_empty() {
             println!();
@@ -270,6 +237,47 @@ async fn info_cask(api_client: &ApiClient, cache: &Cache, name: &str) -> Result<
     }
 
     Ok(())
+}
+
+fn format_installed_cask_suffix(installed_version: Option<&String>, cask_version: &str) -> String {
+    if let Some(installed_ver) = installed_version {
+        if installed_ver == cask_version {
+            " · installed".to_string()
+        } else {
+            format!(" · installed ({})", installed_ver)
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn format_cask_artifacts(artifacts: &[crate::api::CaskArtifact]) -> Vec<String> {
+    artifacts
+        .iter()
+        .map(|a| match a {
+            crate::api::CaskArtifact::App { .. } => "app".to_string(),
+            crate::api::CaskArtifact::Pkg { .. } => "pkg".to_string(),
+            crate::api::CaskArtifact::Binary { .. } => "binary".to_string(),
+            crate::api::CaskArtifact::Font { .. } => "font".to_string(),
+            crate::api::CaskArtifact::Manpage { .. } => "manpage".to_string(),
+            crate::api::CaskArtifact::Dictionary { .. } => "dictionary".to_string(),
+            crate::api::CaskArtifact::Colorpicker { .. } => "colorpicker".to_string(),
+            crate::api::CaskArtifact::Prefpane { .. } => "prefpane".to_string(),
+            crate::api::CaskArtifact::Qlplugin { .. } => "qlplugin".to_string(),
+            crate::api::CaskArtifact::ScreenSaver { .. } => "screen_saver".to_string(),
+            crate::api::CaskArtifact::Service { .. } => "service".to_string(),
+            crate::api::CaskArtifact::Suite { .. } => "suite".to_string(),
+            crate::api::CaskArtifact::Artifact { .. } => "artifact".to_string(),
+            crate::api::CaskArtifact::BashCompletion { .. } => "bash_completion".to_string(),
+            crate::api::CaskArtifact::ZshCompletion { .. } => "zsh_completion".to_string(),
+            crate::api::CaskArtifact::FishCompletion { .. } => "fish_completion".to_string(),
+            crate::api::CaskArtifact::Uninstall { .. } => "uninstall".to_string(),
+            crate::api::CaskArtifact::Zap { .. } => "zap".to_string(),
+            crate::api::CaskArtifact::Preflight { .. } => "preflight".to_string(),
+            crate::api::CaskArtifact::Postflight { .. } => "postflight".to_string(),
+            crate::api::CaskArtifact::Other(_) => "other".to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
