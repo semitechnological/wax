@@ -1,3 +1,9 @@
+> [!WARNING]
+> This repository is no longer the primary upstream for Wax and has been archived.
+> Development has been merged back into the main project at [plyght/wax](https://github.com/plyght/wax).
+> This fork is retained for historical purposes and may not receive future updates.
+> Please use the upstream repository for new issues, pull requests, and releases.
+
 <div align="center">
   <img src="/assets/images/Halftone Dots2x.png" alt="Wax Logo" width="200" />
 </div>
