@@ -50,6 +50,8 @@ static RE_VERSION: OnceLock<Regex> = OnceLock::new();
 static RE_HEAD: OnceLock<Regex> = OnceLock::new();
 static RE_CASK_URL: OnceLock<Regex> = OnceLock::new();
 static RE_CASK_SHA: OnceLock<Regex> = OnceLock::new();
+static RE_BIN_INSTALL: OnceLock<Regex> = OnceLock::new();
+static RE_DIR_BIN_INSTALL: OnceLock<Regex> = OnceLock::new();
 
 /// Linux artifact extracted from a Homebrew cask's `on_linux` block.
 #[derive(Debug, Clone)]
@@ -330,9 +332,12 @@ impl FormulaParser {
     }
 
     pub(crate) fn extract_bin_install_targets(install_block: &str) -> Vec<BinInstall> {
-        let re = Regex::new(r#"bin\.install\s+"([^"]+)"(?:\s*=>\s*"([^"]+)")?"#).unwrap();
-        let dir_re =
-            Regex::new(r#"bin\.install\s+Dir\["([^"]+)"\]\.first(?:\s*=>\s*"([^"]+)")?"#).unwrap();
+        let re = RE_BIN_INSTALL.get_or_init(|| {
+            Regex::new(r#"bin\.install\s+"([^"]+)"(?:\s*=>\s*"([^"]+)")?"#).unwrap()
+        });
+        let dir_re = RE_DIR_BIN_INSTALL.get_or_init(|| {
+            Regex::new(r#"bin\.install\s+Dir\["([^"]+)"\]\.first(?:\s*=>\s*"([^"]+)")?"#).unwrap()
+        });
         let mut targets: Vec<BinInstall> = Vec::new();
         for line in install_block.lines() {
             targets.extend(re.captures_iter(line).map(|c| {
