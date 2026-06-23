@@ -6,6 +6,13 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::instrument;
 
+#[derive(Default)]
+pub struct BundleStats {
+    pub success: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Waxfile {
     #[serde(default)]
@@ -239,6 +246,150 @@ fn parse_brewfile_args(rest: &str) -> Result<Vec<String>> {
     Ok(values)
 }
 
+async fn process_taps(taps: &[String], stats: &mut BundleStats) {
+    for tap in taps {
+        println!();
+        println!("{} tap {}", style("+").green(), style(tap).magenta());
+        match add_tap(tap).await {
+            Ok(true) => stats.success += 1,
+            Ok(false) => stats.skipped += 1,
+            Err(e) => {
+                eprintln!(
+                    "{} tap {} failed: {}",
+                    style("✗").red(),
+                    style(tap).magenta(),
+                    e
+                );
+                stats.failed += 1;
+            }
+        }
+    }
+}
+
+async fn process_brew(cache: &Cache, brew: &[BundleEntry], stats: &mut BundleStats) {
+    if brew.is_empty() {
+        return;
+    }
+    let names: Vec<String> = brew.iter().map(|e| e.name().to_string()).collect();
+    println!();
+    println!(
+        "{} installing {} formulae",
+        style("→").cyan().bold(),
+        names.len()
+    );
+    match crate::commands::install::install(
+        cache, &names, false, false, false, false, false, false, false, true,
+    )
+    .await
+    {
+        Ok(()) => stats.success += names.len(),
+        Err(e) => {
+            eprintln!("{} brew install failed: {}", style("✗").red(), e);
+            stats.failed += names.len();
+        }
+    }
+}
+
+async fn process_casks(cache: &Cache, casks: &[BundleEntry], stats: &mut BundleStats) {
+    if casks.is_empty() {
+        return;
+    }
+    let names: Vec<String> = casks.iter().map(|e| e.name().to_string()).collect();
+    println!();
+    println!(
+        "{} installing {} casks",
+        style("→").cyan().bold(),
+        names.len()
+    );
+    match crate::commands::install::install(
+        cache, &names, false, false, true, false, false, false, false, true,
+    )
+    .await
+    {
+        Ok(()) => stats.success += names.len(),
+        Err(e) => {
+            eprintln!("{} cask install failed: {}", style("✗").red(), e);
+            stats.failed += names.len();
+        }
+    }
+}
+
+async fn process_cargo(cargo: &[BundleEntry], stats: &mut BundleStats) {
+    if cargo.is_empty() {
+        return;
+    }
+    println!();
+    for entry in cargo {
+        let name = entry.name();
+        print!(
+            "{} cargo install {}",
+            style("→").cyan(),
+            style(name).magenta()
+        );
+
+        if is_cargo_installed(name).await {
+            println!(" {}", style("(already installed)").dim());
+            stats.skipped += 1;
+            continue;
+        }
+        println!();
+
+        match cargo_install(entry).await {
+            Ok(()) => {
+                println!("{} cargo {}", style("✓").green(), style(name).magenta());
+                stats.success += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} cargo {} failed: {}",
+                    style("✗").red(),
+                    style(name).magenta(),
+                    e
+                );
+                stats.failed += 1;
+            }
+        }
+    }
+}
+
+async fn process_uv(uv: &[BundleEntry], stats: &mut BundleStats) {
+    if uv.is_empty() {
+        return;
+    }
+    println!();
+    for entry in uv {
+        let name = entry.name();
+        print!(
+            "{} uv tool install {}",
+            style("→").cyan(),
+            style(name).magenta()
+        );
+
+        if is_uv_tool_installed(name).await {
+            println!(" {}", style("(already installed)").dim());
+            stats.skipped += 1;
+            continue;
+        }
+        println!();
+
+        match uv_tool_install(entry).await {
+            Ok(()) => {
+                println!("{} uv {}", style("✓").green(), style(name).magenta());
+                stats.success += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} uv {} failed: {}",
+                    style("✗").red(),
+                    style(name).magenta(),
+                    e
+                );
+                stats.failed += 1;
+            }
+        }
+    }
+}
+
 #[instrument(skip(cache))]
 pub async fn bundle(cache: &Cache, waxfile_path: Option<&str>, dry_run: bool) -> Result<()> {
     let start = std::time::Instant::now();
@@ -282,155 +433,29 @@ pub async fn bundle(cache: &Cache, waxfile_path: Option<&str>, dry_run: bool) ->
         return Ok(());
     }
 
-    let mut success = 0usize;
-    let mut failed = 0usize;
-    let mut skipped = 0usize;
+    let mut stats = BundleStats::default();
 
-    for tap in &waxfile.tap {
-        println!();
-        println!("{} tap {}", style("+").green(), style(tap).magenta());
-        match add_tap(tap).await {
-            Ok(true) => success += 1,
-            Ok(false) => skipped += 1,
-            Err(e) => {
-                eprintln!(
-                    "{} tap {} failed: {}",
-                    style("✗").red(),
-                    style(tap).magenta(),
-                    e
-                );
-                failed += 1;
-            }
-        }
-    }
-
-    if !waxfile.brew.is_empty() {
-        let names: Vec<String> = waxfile.brew.iter().map(|e| e.name().to_string()).collect();
-        println!();
-        println!(
-            "{} installing {} formulae",
-            style("→").cyan().bold(),
-            names.len()
-        );
-        match crate::commands::install::install(
-            cache, &names, false, false, false, false, false, false, false, true,
-        )
-        .await
-        {
-            Ok(()) => success += names.len(),
-            Err(e) => {
-                eprintln!("{} brew install failed: {}", style("✗").red(), e);
-                failed += names.len();
-            }
-        }
-    }
-
-    if !waxfile.cask.is_empty() {
-        let names: Vec<String> = waxfile.cask.iter().map(|e| e.name().to_string()).collect();
-        println!();
-        println!(
-            "{} installing {} casks",
-            style("→").cyan().bold(),
-            names.len()
-        );
-        match crate::commands::install::install(
-            cache, &names, false, false, true, false, false, false, false, true,
-        )
-        .await
-        {
-            Ok(()) => success += names.len(),
-            Err(e) => {
-                eprintln!("{} cask install failed: {}", style("✗").red(), e);
-                failed += names.len();
-            }
-        }
-    }
-
-    if !waxfile.cargo.is_empty() {
-        println!();
-        for entry in &waxfile.cargo {
-            let name = entry.name();
-            print!(
-                "{} cargo install {}",
-                style("→").cyan(),
-                style(name).magenta()
-            );
-
-            if is_cargo_installed(name).await {
-                println!(" {}", style("(already installed)").dim());
-                skipped += 1;
-                continue;
-            }
-            println!();
-
-            match cargo_install(entry).await {
-                Ok(()) => {
-                    println!("{} cargo {}", style("✓").green(), style(name).magenta());
-                    success += 1;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{} cargo {} failed: {}",
-                        style("✗").red(),
-                        style(name).magenta(),
-                        e
-                    );
-                    failed += 1;
-                }
-            }
-        }
-    }
-
-    if !waxfile.uv.is_empty() {
-        println!();
-        for entry in &waxfile.uv {
-            let name = entry.name();
-            print!(
-                "{} uv tool install {}",
-                style("→").cyan(),
-                style(name).magenta()
-            );
-
-            if is_uv_tool_installed(name).await {
-                println!(" {}", style("(already installed)").dim());
-                skipped += 1;
-                continue;
-            }
-            println!();
-
-            match uv_tool_install(entry).await {
-                Ok(()) => {
-                    println!("{} uv {}", style("✓").green(), style(name).magenta());
-                    success += 1;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{} uv {} failed: {}",
-                        style("✗").red(),
-                        style(name).magenta(),
-                        e
-                    );
-                    failed += 1;
-                }
-            }
-        }
-    }
+    process_taps(&waxfile.tap, &mut stats).await;
+    process_brew(cache, &waxfile.brew, &mut stats).await;
+    process_casks(cache, &waxfile.cask, &mut stats).await;
+    process_cargo(&waxfile.cargo, &mut stats).await;
+    process_uv(&waxfile.uv, &mut stats).await;
 
     let elapsed = start.elapsed();
     println!();
-    if failed == 0 {
+    if stats.failed == 0 {
         println!(
             "{} installed, {} skipped{}",
-            style(success).green(),
-            style(skipped).dim(),
+            style(stats.success).green(),
+            style(stats.skipped).dim(),
             crate::timing::elapsed_suffix(elapsed)
         );
     } else {
         println!(
             "{} installed, {} failed, {} skipped{}",
-            style(success).green(),
-            style(failed).red(),
-            style(skipped).dim(),
+            style(stats.success).green(),
+            style(stats.failed).red(),
+            style(stats.skipped).dim(),
             crate::timing::elapsed_suffix(elapsed)
         );
     }
