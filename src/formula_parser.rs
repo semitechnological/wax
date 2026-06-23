@@ -605,6 +605,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_ruby_formula() {
+        let formula = r#"
+class Fastfetch < Formula
+  desc "Like neofetch, but much faster"
+  homepage "https://github.com/fastfetch-cli/fastfetch"
+  url "https://github.com/fastfetch-cli/fastfetch/archive/refs/tags/2.11.2.tar.gz"
+  sha256 "0f24ce73295b9c512033c46e01766a5035e076735e160eafebbdc86db254bdba"
+  license "MIT"
+
+  depends_on "cmake" => :build
+  depends_on "pkg-config" => :build
+  depends_on "glib"
+  depends_on "vulkan-loader"
+
+  def install
+    args = %W[
+      -DCMAKE_INSTALL_SYSCONFDIR=#{etc}
+      -DBUILD_FLASHFETCH=OFF
+      -DENABLE_SYSTEM_YYJSON=ON
+    ]
+    system "cmake", "-S", ".", "-B", "build", *args, *std_cmake_args
+    system "cmake", "--build", "build"
+    system "cmake", "--install", "build"
+    bash_completion.install share/"bash-completion/completions/fastfetch"
+  end
+end
+        "#;
+
+        let parsed = FormulaParser::parse_ruby_formula("fastfetch", formula).unwrap();
+
+        assert_eq!(parsed.name, "fastfetch");
+        assert_eq!(
+            parsed.desc.as_deref(),
+            Some("Like neofetch, but much faster")
+        );
+        assert_eq!(
+            parsed.homepage.as_deref(),
+            Some("https://github.com/fastfetch-cli/fastfetch")
+        );
+        assert_eq!(parsed.license.as_deref(), Some("MIT"));
+        assert_eq!(
+            parsed.source.url,
+            "https://github.com/fastfetch-cli/fastfetch/archive/refs/tags/2.11.2.tar.gz"
+        );
+        assert_eq!(
+            parsed.source.sha256,
+            "0f24ce73295b9c512033c46e01766a5035e076735e160eafebbdc86db254bdba"
+        );
+        assert_eq!(parsed.source.version, "2.11.2");
+        assert!(parsed.head_url.is_none());
+
+        assert_eq!(parsed.build_dependencies, vec!["cmake", "pkg-config"]);
+        assert_eq!(parsed.runtime_dependencies, vec!["glib", "vulkan-loader"]);
+        assert_eq!(parsed.build_system, BuildSystem::CMake);
+        // Note: interpolated arg -DCMAKE_INSTALL_SYSCONFDIR=#{etc} is skipped in extract_configure_args
+        assert_eq!(
+            parsed.configure_args,
+            vec!["-DBUILD_FLASHFETCH=OFF", "-DENABLE_SYSTEM_YYJSON=ON"]
+        );
+    }
+
+    #[test]
+    fn test_parse_ruby_formula_no_url_or_head() {
+        let formula = r#"
+class Fastfetch < Formula
+  desc "Like neofetch, but much faster"
+  homepage "https://github.com/fastfetch-cli/fastfetch"
+  license "MIT"
+end
+        "#;
+
+        let result = FormulaParser::parse_ruby_formula("fastfetch", formula);
+        assert!(
+            result.is_err(),
+            "Expected error when formula lacks both url and head"
+        );
+    }
+
+    #[test]
+    fn test_parse_ruby_formula_with_head_fallback() {
+        let formula = r#"
+class DriftWallpaper < Formula
+  desc "Fluid live wallpaper"
+  head "https://github.com/undivisible/drift-wallpaper.git", branch: "m"
+
+  def install
+    system "cargo", "build", "--release"
+  end
+end
+        "#;
+
+        let parsed = FormulaParser::parse_ruby_formula("drift-wallpaper", formula).unwrap();
+        assert_eq!(parsed.name, "drift-wallpaper");
+        assert_eq!(parsed.desc.as_deref(), Some("Fluid live wallpaper"));
+        assert!(
+            parsed.source.url.is_empty(),
+            "URL should be empty string for HEAD-only formula"
+        );
+        assert!(
+            parsed.source.sha256.is_empty(),
+            "SHA256 should be empty string for HEAD-only formula"
+        );
+        assert_eq!(parsed.source.version, "HEAD");
+        assert_eq!(
+            parsed.head_url.as_deref(),
+            Some("https://github.com/undivisible/drift-wallpaper.git")
+        );
+        assert_eq!(parsed.build_system, BuildSystem::Cargo);
+    }
+
+    #[test]
     fn test_extract_version_from_url() {
         let url = "https://github.com/example/tree/archive/refs/tags/2.2.1.tar.gz";
         let version = FormulaParser::extract_version_from_url(url);
