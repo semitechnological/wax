@@ -71,28 +71,7 @@ pub async fn install_portable_tools(id: &str) -> Result<()> {
     debug!("Chocolatey nupkg {}", nupkg_url);
 
     let tmp = TempDir::new()?;
-    let nupkg_path = tmp.path().join("pkg.nupkg");
-
-    let dl = BottleDownloader::new();
-    let size = dl.probe_size(&nupkg_url).await;
-    let conns =
-        BottleDownloader::num_connections(size, BottleDownloader::MAX_CONNECTIONS_PER_DOWNLOAD);
-    let pb = ProgressBar::new(0);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.cyan} {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    pb.set_message(id.to_string());
-
-    dl.download(&nupkg_url, &nupkg_path, Some(&pb), conns, None)
-        .await?;
-    pb.finish_and_clear();
-
-    let extract_root = tmp.path().join("nupkg");
-    std::fs::create_dir_all(&extract_root)?;
-    scoop::extract_zip_file(&nupkg_path, &extract_root)?;
+    let extract_root = download_and_extract_nupkg(id, &nupkg_url, tmp.path()).await?;
 
     let tools_dir = extract_root.join("tools");
     if !tools_dir.is_dir() {
@@ -112,6 +91,23 @@ pub async fn install_portable_tools(id: &str) -> Result<()> {
         ));
     }
 
+    let bin_dir = stage_and_link_executables(id, nupkg_url, &tools_dir, &exes)?;
+
+    println!(
+        "Installed {} from Chocolatey .nupkg (tools/*.exe) — binaries under:\n  {}",
+        id,
+        bin_dir.display()
+    );
+
+    Ok(())
+}
+
+fn stage_and_link_executables(
+    id: &str,
+    nupkg_url: String,
+    tools_dir: &Path,
+    exes: &[PathBuf],
+) -> Result<PathBuf> {
     let bin_dir = windows_state::wax_bin_dir()?;
     std::fs::create_dir_all(&bin_dir)?;
 
@@ -121,10 +117,10 @@ pub async fn install_portable_tools(id: &str) -> Result<()> {
     if staging.exists() {
         let _ = std::fs::remove_dir_all(&staging);
     }
-    crate::ui::copy_dir_all(&tools_dir, &staging)?;
+    crate::ui::copy_dir_all(tools_dir, &staging)?;
 
     let mut copy_actions = Vec::new();
-    for src in &exes {
+    for src in exes {
         let file_name = src
             .file_name()
             .ok_or_else(|| WaxError::InstallError("invalid exe path".into()))?;
@@ -154,13 +150,34 @@ pub async fn install_portable_tools(id: &str) -> Result<()> {
     )
     .save()?;
 
-    println!(
-        "Installed {} from Chocolatey .nupkg (tools/*.exe) — binaries under:\n  {}",
-        id,
-        bin_dir.display()
-    );
+    Ok(bin_dir)
+}
 
-    Ok(())
+async fn download_and_extract_nupkg(id: &str, nupkg_url: &str, tmp_path: &Path) -> Result<PathBuf> {
+    let nupkg_path = tmp_path.join("pkg.nupkg");
+
+    let dl = BottleDownloader::new();
+    let size = dl.probe_size(nupkg_url).await;
+    let conns =
+        BottleDownloader::num_connections(size, BottleDownloader::MAX_CONNECTIONS_PER_DOWNLOAD);
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.cyan} {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    pb.set_message(id.to_string());
+
+    dl.download(nupkg_url, &nupkg_path, Some(&pb), conns, None)
+        .await?;
+    pb.finish_and_clear();
+
+    let extract_root = tmp_path.join("nupkg");
+    std::fs::create_dir_all(&extract_root)?;
+    scoop::extract_zip_file(&nupkg_path, &extract_root)?;
+
+    Ok(extract_root)
 }
 
 fn collect_exe_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32, max_depth: u32) -> Result<()> {
