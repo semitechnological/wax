@@ -503,6 +503,10 @@ fn find_app_in_caskroom(cask_name: &str, version: &str) -> Option<String> {
     None
 }
 
+fn sanitize_version_string(version: &str) -> String {
+    version.chars().filter(|c| !c.is_control()).collect()
+}
+
 async fn read_app_version_from_plist(path: &Path) -> Option<String> {
     let plist = path.join("Contents/Info.plist");
     if !plist.exists() {
@@ -524,7 +528,7 @@ async fn read_app_version_from_plist(path: &Path) -> Option<String> {
         return None;
     }
 
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let value = sanitize_version_string(String::from_utf8_lossy(&output.stdout).trim());
     if value.is_empty() {
         None
     } else {
@@ -591,5 +595,13 @@ mod tests {
     fn test_find_app_in_caskroom_nonexistent() {
         let result = find_app_in_caskroom("nonexistent", "1.0.0");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_sanitize_version_string() {
+        assert_eq!(sanitize_version_string("1.2.3"), "1.2.3");
+        assert_eq!(sanitize_version_string("1.0.0\x1b[31m"), "1.0.0[31m");
+        assert_eq!(sanitize_version_string("v2.0-rc1\n"), "v2.0-rc1");
+        assert_eq!(sanitize_version_string("\t 3.1.4 \r"), " 3.1.4 ");
     }
 }
