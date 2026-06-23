@@ -363,13 +363,7 @@ fn run_native_command(command: &str, args: &[String]) -> Result<()> {
     }
 }
 
-pub async fn install_winget_package(package_id: &str) -> Result<()> {
-    if !cfg!(target_os = "windows") {
-        return Err(WaxError::PlatformNotSupported(
-            "winget install is only supported on Windows".into(),
-        ));
-    }
-
+async fn fetch_latest_winget_manifest(package_id: &str) -> Result<(String, WingetInstallerDoc)> {
     let rel = package_id_to_content_path(package_id)?;
     let list_url = format!("{WINGET_PKGS_REPO_CONTENTS}/{rel}?ref=master");
     let entries = gh_get_json(&list_url).await?;
@@ -416,18 +410,16 @@ pub async fn install_winget_package(package_id: &str) -> Result<()> {
     let doc: WingetInstallerDoc =
         serde_yaml::from_str(&yaml_text).map_err(|e| WaxError::ParseError(e.to_string()))?;
 
-    let inst = pick_installer(&doc)?;
-    let inst_type = installer_type_for(&doc, inst);
-    let nested = doc.nested_installer_type.as_deref().unwrap_or("");
-    let sha_expected = inst.installer_sha256.trim().to_ascii_lowercase();
+    Ok((latest, doc))
+}
 
-    let tmp = TempDir::new()?;
-    let archive_name = Path::new(&inst.installer_url)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("winget-installer.bin");
-    let archive_path = tmp.path().join(archive_name);
-
+async fn download_winget_installer(
+    package_id: &str,
+    latest: &str,
+    inst: &WingetInstallerEntry,
+    archive_path: &Path,
+    sha_expected: &str,
+) -> Result<()> {
     let dl = BottleDownloader::new();
     let size = dl.probe_size(&inst.installer_url).await;
     let conns =
@@ -441,19 +433,25 @@ pub async fn install_winget_package(package_id: &str) -> Result<()> {
     );
     pb.set_message(format!("{} {}", package_id, latest));
 
-    dl.download(&inst.installer_url, &archive_path, Some(&pb), conns, None)
+    dl.download(&inst.installer_url, archive_path, Some(&pb), conns, None)
         .await?;
     pb.finish_and_clear();
 
-    BottleDownloader::verify_checksum(&archive_path, &sha_expected)?;
+    BottleDownloader::verify_checksum(archive_path, sha_expected)?;
+    Ok(())
+}
 
-    if !inst_type.eq_ignore_ascii_case("zip") || !nested.eq_ignore_ascii_case("portable") {
-        return install_native_winget_package(package_id, &latest, &doc, inst, &archive_path).await;
-    }
-
+fn install_portable_winget_package(
+    package_id: &str,
+    latest: &str,
+    doc: &WingetInstallerDoc,
+    inst: &WingetInstallerEntry,
+    archive_path: &Path,
+    tmp: &TempDir,
+) -> Result<()> {
     let extract_root = tmp.path().join("extract");
     std::fs::create_dir_all(&extract_root)?;
-    scoop::extract_zip_file(&archive_path, &extract_root)?;
+    scoop::extract_zip_file(archive_path, &extract_root)?;
 
     let bin_dir = windows_state::wax_bin_dir()?;
     std::fs::create_dir_all(&bin_dir)?;
@@ -497,7 +495,7 @@ pub async fn install_winget_package(package_id: &str) -> Result<()> {
     let staging = windows_state::wax_windows_root()?
         .join("winget-apps")
         .join(package_id.replace('.', "_"))
-        .join(&latest);
+        .join(latest);
     if staging.exists() {
         let _ = std::fs::remove_dir_all(&staging);
     }
@@ -509,7 +507,7 @@ pub async fn install_winget_package(package_id: &str) -> Result<()> {
     WindowsPackageManifest::new(
         Ecosystem::Winget,
         package_id,
-        latest.clone(),
+        latest.to_string(),
         inst.installer_url.clone(),
         staging.clone(),
         bin_links,
@@ -525,6 +523,36 @@ pub async fn install_winget_package(package_id: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+pub async fn install_winget_package(package_id: &str) -> Result<()> {
+    if !cfg!(target_os = "windows") {
+        return Err(WaxError::PlatformNotSupported(
+            "winget install is only supported on Windows".into(),
+        ));
+    }
+
+    let (latest, doc) = fetch_latest_winget_manifest(package_id).await?;
+
+    let inst = pick_installer(&doc)?;
+    let inst_type = installer_type_for(&doc, inst);
+    let nested = doc.nested_installer_type.as_deref().unwrap_or("");
+    let sha_expected = inst.installer_sha256.trim().to_ascii_lowercase();
+
+    let tmp = TempDir::new()?;
+    let archive_name = Path::new(&inst.installer_url)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("winget-installer.bin");
+    let archive_path = tmp.path().join(archive_name);
+
+    download_winget_installer(package_id, &latest, inst, &archive_path, &sha_expected).await?;
+
+    if !inst_type.eq_ignore_ascii_case("zip") || !nested.eq_ignore_ascii_case("portable") {
+        return install_native_winget_package(package_id, &latest, &doc, inst, &archive_path).await;
+    }
+
+    install_portable_winget_package(package_id, &latest, &doc, inst, &archive_path, &tmp)
 }
 
 async fn install_native_winget_package(
