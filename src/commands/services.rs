@@ -207,121 +207,13 @@ pub async fn services_start(formula_name: &str, nice: Option<i32>) -> Result<()>
 
     #[cfg(target_os = "macos")]
     {
-        let plist = find_service_plist(formula_name).ok_or_else(|| {
-            WaxError::ServiceError(format!(
-                "{} does not have a service definition (no plist found)",
-                formula_name
-            ))
-        })?;
-
-        let target_dir = launchctl_plist_dir();
-        std::fs::create_dir_all(&target_dir)?;
-
-        let plist_name = plist
-            .file_name()
-            .ok_or_else(|| {
-                WaxError::ServiceError(format!(
-                    "{} service definition path has no file name",
-                    formula_name
-                ))
-            })?
-            .to_string_lossy()
-            .to_string();
-        let target_plist = target_dir.join(&plist_name);
-
-        let mut plist_content = std::fs::read_to_string(&plist)?;
-
-        if let Some(priority) = nice {
-            if !(-20..=20).contains(&priority) {
-                return Err(WaxError::ServiceError(
-                    "Nice priority must be between -20 and 20".to_string(),
-                ));
-            }
-            if !plist_content.contains("<key>Nice</key>") {
-                let nice_entry = format!(
-                    "\t<key>Nice</key>\n\t<integer>{}</integer>\n</dict>",
-                    priority
-                );
-                plist_content = plist_content.replace("</dict>", &nice_entry);
-            }
-        }
-
-        if !plist_content.contains("<key>ThrottleInterval</key>") {
-            let throttle = "\t<key>ThrottleInterval</key>\n\t<integer>60</integer>\n</dict>";
-            plist_content = plist_content.replace("</dict>", throttle);
-        }
-
-        std::fs::write(&target_plist, &plist_content)?;
-
-        let _label = plist_name.trim_end_matches(".plist");
-        let output = Command::new("launchctl")
-            .args(["load", "-w"])
-            .arg(&target_plist)
-            .output()
-            .await
-            .map_err(|e| WaxError::ServiceError(format!("launchctl failed: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("already loaded") {
-                return Err(WaxError::ServiceError(format!(
-                    "launchctl load failed: {}",
-                    stderr
-                )));
-            }
-        }
-
-        println!(
-            "{} {} started",
-            style("✓").green(),
-            style(formula_name).magenta()
-        );
+        start_launchctl(formula_name, nice).await?;
     }
 
     #[cfg(target_os = "linux")]
     {
-        let unit = find_systemd_unit(formula_name).ok_or_else(|| {
-            WaxError::ServiceError(format!(
-                "{} does not have a systemd service unit",
-                formula_name
-            ))
-        })?;
-
-        let systemd_user_dir =
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/systemd/user");
-        std::fs::create_dir_all(&systemd_user_dir)?;
-
-        let unit_name = unit
-            .file_name()
-            .ok_or_else(|| {
-                WaxError::ServiceError(format!(
-                    "{} service unit path has no file name",
-                    formula_name
-                ))
-            })?
-            .to_string_lossy()
-            .to_string();
-        let target_unit = systemd_user_dir.join(&unit_name);
-        std::fs::copy(&unit, &target_unit)?;
-
-        let output = Command::new("systemctl")
-            .args(["--user", "enable", "--now", &unit_name])
-            .output()
-            .await
-            .map_err(|e| WaxError::ServiceError(format!("systemctl failed: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(WaxError::ServiceError(format!(
-                "systemctl enable failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-
-        println!(
-            "{} {} started",
-            style("✓").green(),
-            style(formula_name).magenta()
-        );
+        start_systemd(formula_name).await?;
+        let _ = nice;
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -386,6 +278,129 @@ pub async fn services_stop(formula_name: &str) -> Result<()> {
     Err(WaxError::ServiceError(
         "Service management not supported on this platform".to_string(),
     ))
+}
+
+#[cfg(target_os = "macos")]
+async fn start_launchctl(formula_name: &str, nice: Option<i32>) -> Result<()> {
+    let plist = find_service_plist(formula_name).ok_or_else(|| {
+        WaxError::ServiceError(format!(
+            "{} does not have a service definition (no plist found)",
+            formula_name
+        ))
+    })?;
+
+    let target_dir = launchctl_plist_dir();
+    std::fs::create_dir_all(&target_dir)?;
+
+    let plist_name = plist
+        .file_name()
+        .ok_or_else(|| {
+            WaxError::ServiceError(format!(
+                "{} service definition path has no file name",
+                formula_name
+            ))
+        })?
+        .to_string_lossy()
+        .to_string();
+    let target_plist = target_dir.join(&plist_name);
+
+    let mut plist_content = std::fs::read_to_string(&plist)?;
+
+    if let Some(priority) = nice {
+        if !(-20..=20).contains(&priority) {
+            return Err(WaxError::ServiceError(
+                "Nice priority must be between -20 and 20".to_string(),
+            ));
+        }
+        if !plist_content.contains("<key>Nice</key>") {
+            let nice_entry = format!(
+                "\t<key>Nice</key>\n\t<integer>{}</integer>\n</dict>",
+                priority
+            );
+            plist_content = plist_content.replace("</dict>", &nice_entry);
+        }
+    }
+
+    if !plist_content.contains("<key>ThrottleInterval</key>") {
+        let throttle = "\t<key>ThrottleInterval</key>\n\t<integer>60</integer>\n</dict>";
+        plist_content = plist_content.replace("</dict>", throttle);
+    }
+
+    std::fs::write(&target_plist, &plist_content)?;
+
+    let _label = plist_name.trim_end_matches(".plist");
+    let output = Command::new("launchctl")
+        .args(["load", "-w"])
+        .arg(&target_plist)
+        .output()
+        .await
+        .map_err(|e| WaxError::ServiceError(format!("launchctl failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("already loaded") {
+            return Err(WaxError::ServiceError(format!(
+                "launchctl load failed: {}",
+                stderr
+            )));
+        }
+    }
+
+    println!(
+        "{} {} started",
+        style("✓").green(),
+        style(formula_name).magenta()
+    );
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn start_systemd(formula_name: &str) -> Result<()> {
+    let unit = find_systemd_unit(formula_name).ok_or_else(|| {
+        WaxError::ServiceError(format!(
+            "{} does not have a systemd service unit",
+            formula_name
+        ))
+    })?;
+
+    let systemd_user_dir =
+        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/systemd/user");
+    std::fs::create_dir_all(&systemd_user_dir)?;
+
+    let unit_name = unit
+        .file_name()
+        .ok_or_else(|| {
+            WaxError::ServiceError(format!(
+                "{} service unit path has no file name",
+                formula_name
+            ))
+        })?
+        .to_string_lossy()
+        .to_string();
+    let target_unit = systemd_user_dir.join(&unit_name);
+    std::fs::copy(&unit, &target_unit)?;
+
+    let output = Command::new("systemctl")
+        .args(["--user", "enable", "--now", &unit_name])
+        .output()
+        .await
+        .map_err(|e| WaxError::ServiceError(format!("systemctl failed: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(WaxError::ServiceError(format!(
+            "systemctl enable failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    println!(
+        "{} {} started",
+        style("✓").green(),
+        style(formula_name).magenta()
+    );
+
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
