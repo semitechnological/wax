@@ -1,4 +1,4 @@
-use crate::api::ApiClient;
+use crate::api::{ApiClient, Cask, FetchResult, Formula};
 use crate::cache::{Cache, CacheMetadata};
 use crate::error::Result;
 use crate::signal::check_cancelled;
@@ -7,65 +7,56 @@ use crate::ui::create_spinner;
 use console::style;
 use tracing::instrument;
 
-#[instrument(skip(api_client, cache))]
-pub async fn update(api_client: &ApiClient, cache: &Cache) -> Result<()> {
-    let spinner = create_spinner("Updating package index...");
-
-    let start = std::time::Instant::now();
-
-    let metadata = cache.load_metadata().await?;
-
-    let (formulae_etag, formulae_last_modified) = metadata
-        .as_ref()
-        .map(|m| {
-            (
-                m.formulae_etag.as_deref(),
-                m.formulae_last_modified.as_deref(),
-            )
-        })
-        .unwrap_or((None, None));
-
-    let (casks_etag, casks_last_modified) = metadata
-        .as_ref()
-        .map(|m| (m.casks_etag.as_deref(), m.casks_last_modified.as_deref()))
-        .unwrap_or((None, None));
-
-    let (formulae_result, casks_result) = tokio::join!(
-        api_client.fetch_formulae_conditional(formulae_etag, formulae_last_modified),
-        api_client.fetch_casks_conditional(casks_etag, casks_last_modified)
-    );
-
-    let formulae_fetch = formulae_result?;
-    let casks_fetch = casks_result?;
-
-    let (_formulae, formula_count) = if formulae_fetch.not_modified {
+async fn process_formulae(cache: &Cache, fetch: &mut FetchResult<Vec<Formula>>) -> Result<usize> {
+    if fetch.not_modified {
         let cached = cache.load_formulae().await?;
-        let count = cached.len();
-        (cached, count)
-    } else if let Some(data) = formulae_fetch.data {
+        Ok(cached.len())
+    } else if let Some(data) = fetch.data.take() {
         let count = data.len();
         cache.save_formulae(&data).await?;
-        (data, count)
+        Ok(count)
     } else {
         let cached = cache.load_formulae().await?;
-        let count = cached.len();
-        (cached, count)
-    };
+        Ok(cached.len())
+    }
+}
 
-    let (_casks, cask_count) = if casks_fetch.not_modified {
-        let cached = cache.load_casks().await?;
-        let count = cached.len();
-        (cached, count)
-    } else if let Some(data) = casks_fetch.data {
-        let count = data.len();
-        cache.save_casks(&data).await?;
-        (data, count)
-    } else {
-        let cached = cache.load_casks().await?;
-        let count = cached.len();
-        (cached, count)
+async fn save_new_metadata(
+    cache: &Cache,
+    old_metadata: Option<&CacheMetadata>,
+    formula_count: usize,
+    cask_count: usize,
+    formulae_fetch: &FetchResult<Vec<Formula>>,
+    casks_fetch: &FetchResult<Vec<Cask>>,
+) -> Result<()> {
+    let new_metadata = CacheMetadata {
+        last_updated: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        formula_count,
+        cask_count,
+        formulae_etag: formulae_fetch
+            .etag
+            .clone()
+            .or_else(|| old_metadata.and_then(|m| m.formulae_etag.clone())),
+        formulae_last_modified: formulae_fetch
+            .last_modified
+            .clone()
+            .or_else(|| old_metadata.and_then(|m| m.formulae_last_modified.clone())),
+        casks_etag: casks_fetch
+            .etag
+            .clone()
+            .or_else(|| old_metadata.and_then(|m| m.casks_etag.clone())),
+        casks_last_modified: casks_fetch
+            .last_modified
+            .clone()
+            .or_else(|| old_metadata.and_then(|m| m.casks_last_modified.clone())),
     };
+    cache.save_metadata(&new_metadata).await
+}
 
+async fn update_taps(cache: &Cache) -> Result<usize> {
     let mut tap_manager = TapManager::new()?;
     tap_manager.load().await?;
     let taps = tap_manager
@@ -91,40 +82,36 @@ pub async fn update(api_client: &ApiClient, cache: &Cache) -> Result<()> {
         }
     }
 
-    let new_metadata = CacheMetadata {
-        last_updated: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        formula_count,
-        cask_count,
-        formulae_etag: formulae_fetch
-            .etag
-            .or_else(|| metadata.as_ref().and_then(|m| m.formulae_etag.clone())),
-        formulae_last_modified: formulae_fetch.last_modified.or_else(|| {
-            metadata
-                .as_ref()
-                .and_then(|m| m.formulae_last_modified.clone())
-        }),
-        casks_etag: casks_fetch
-            .etag
-            .or_else(|| metadata.as_ref().and_then(|m| m.casks_etag.clone())),
-        casks_last_modified: casks_fetch.last_modified.or_else(|| {
-            metadata
-                .as_ref()
-                .and_then(|m| m.casks_last_modified.clone())
-        }),
-    };
-    cache.save_metadata(&new_metadata).await?;
+    Ok(tap_count)
+}
 
-    spinner.finish_and_clear();
+async fn process_casks(cache: &Cache, fetch: &mut FetchResult<Vec<Cask>>) -> Result<usize> {
+    if fetch.not_modified {
+        let cached = cache.load_casks().await?;
+        Ok(cached.len())
+    } else if let Some(data) = fetch.data.take() {
+        let count = data.len();
+        cache.save_casks(&data).await?;
+        Ok(count)
+    } else {
+        let cached = cache.load_casks().await?;
+        Ok(cached.len())
+    }
+}
 
-    let elapsed = start.elapsed();
-    let core_status = if formulae_fetch.not_modified && casks_fetch.not_modified {
+fn print_update_status(
+    formulae_not_modified: bool,
+    casks_not_modified: bool,
+    formula_count: usize,
+    cask_count: usize,
+    tap_count: usize,
+    elapsed: std::time::Duration,
+) {
+    let core_status = if formulae_not_modified && casks_not_modified {
         "up to date"
-    } else if formulae_fetch.not_modified {
+    } else if formulae_not_modified {
         "updated casks"
-    } else if casks_fetch.not_modified {
+    } else if casks_not_modified {
         "updated formulae"
     } else {
         "updated"
@@ -151,6 +138,71 @@ pub async fn update(api_client: &ApiClient, cache: &Cache) -> Result<()> {
             crate::timing::elapsed_suffix(elapsed)
         );
     }
+}
+
+async fn fetch_indices(
+    api_client: &ApiClient,
+    metadata: Option<&CacheMetadata>,
+) -> Result<(FetchResult<Vec<Formula>>, FetchResult<Vec<Cask>>)> {
+    let (formulae_etag, formulae_last_modified) = metadata
+        .as_ref()
+        .map(|m| {
+            (
+                m.formulae_etag.as_deref(),
+                m.formulae_last_modified.as_deref(),
+            )
+        })
+        .unwrap_or((None, None));
+
+    let (casks_etag, casks_last_modified) = metadata
+        .as_ref()
+        .map(|m| (m.casks_etag.as_deref(), m.casks_last_modified.as_deref()))
+        .unwrap_or((None, None));
+
+    let (formulae_result, casks_result) = tokio::join!(
+        api_client.fetch_formulae_conditional(formulae_etag, formulae_last_modified),
+        api_client.fetch_casks_conditional(casks_etag, casks_last_modified)
+    );
+
+    Ok((formulae_result?, casks_result?))
+}
+
+#[instrument(skip(api_client, cache))]
+pub async fn update(api_client: &ApiClient, cache: &Cache) -> Result<()> {
+    let spinner = create_spinner("Updating package index...");
+
+    let start = std::time::Instant::now();
+
+    let metadata = cache.load_metadata().await?;
+
+    let (mut formulae_fetch, mut casks_fetch) =
+        fetch_indices(api_client, metadata.as_ref()).await?;
+
+    let formula_count = process_formulae(cache, &mut formulae_fetch).await?;
+    let cask_count = process_casks(cache, &mut casks_fetch).await?;
+
+    let tap_count = update_taps(cache).await?;
+
+    save_new_metadata(
+        cache,
+        metadata.as_ref(),
+        formula_count,
+        cask_count,
+        &formulae_fetch,
+        &casks_fetch,
+    )
+    .await?;
+
+    spinner.finish_and_clear();
+
+    print_update_status(
+        formulae_fetch.not_modified,
+        casks_fetch.not_modified,
+        formula_count,
+        cask_count,
+        tap_count,
+        start.elapsed(),
+    );
 
     Ok(())
 }
